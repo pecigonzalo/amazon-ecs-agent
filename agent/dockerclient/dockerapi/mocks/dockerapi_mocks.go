@@ -375,17 +375,17 @@ func (mr *MockDockerClientMockRecorder) StartContainer(arg0, arg1, arg2 interfac
 }
 
 // StartContainerExec mocks base method
-func (m *MockDockerClient) StartContainerExec(arg0 context.Context, arg1 string, arg2 time.Duration) error {
+func (m *MockDockerClient) StartContainerExec(arg0 context.Context, arg1 string, arg2 types.ExecStartCheck, arg3 time.Duration) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "StartContainerExec", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "StartContainerExec", arg0, arg1, arg2, arg3)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // StartContainerExec indicates an expected call of StartContainerExec
-func (mr *MockDockerClientMockRecorder) StartContainerExec(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockDockerClientMockRecorder) StartContainerExec(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartContainerExec", reflect.TypeOf((*MockDockerClient)(nil).StartContainerExec), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartContainerExec", reflect.TypeOf((*MockDockerClient)(nil).StartContainerExec), arg0, arg1, arg2, arg3)
 }
 
 // Stats mocks base method
@@ -429,6 +429,20 @@ func (m *MockDockerClient) SupportedVersions() []dockerclient.DockerVersion {
 func (mr *MockDockerClientMockRecorder) SupportedVersions() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SupportedVersions", reflect.TypeOf((*MockDockerClient)(nil).SupportedVersions))
+}
+
+// SystemPing mocks base method
+func (m *MockDockerClient) SystemPing(arg0 context.Context, arg1 time.Duration) dockerapi.PingResponse {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SystemPing", arg0, arg1)
+	ret0, _ := ret[0].(dockerapi.PingResponse)
+	return ret0
+}
+
+// SystemPing indicates an expected call of SystemPing
+func (mr *MockDockerClientMockRecorder) SystemPing(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SystemPing", reflect.TypeOf((*MockDockerClient)(nil).SystemPing), arg0, arg1)
 }
 
 // TopContainer mocks base method

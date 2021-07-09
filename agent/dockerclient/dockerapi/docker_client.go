@@ -152,7 +152,7 @@ type DockerClient interface {
 
 	// StartContainerExec starts an exec process already created in the docker host. A timeout value
 	// and a context should be provided for the request.
-	StartContainerExec(ctx context.Context, execID string, timeout time.Duration) error
+	StartContainerExec(ctx context.Context, execID string, execStartCheck types.ExecStartCheck, timeout time.Duration) error
 
 	// InspectContainerExec returns information about a specific exec process on the docker host. A timeout value
 	// and a context should be provided for the request.
@@ -161,6 +161,9 @@ type DockerClient interface {
 	// ListContainers returns the set of containers known to the Docker daemon. A timeout value and a context
 	// should be provided for the request.
 	ListContainers(context.Context, bool, time.Duration) ListContainersResponse
+
+	// SystemPing returns the Ping response from Docker's SystemPing API
+	SystemPing(context.Context, time.Duration) PingResponse
 
 	// ListImages returns the set of the images known to the Docker daemon
 	ListImages(context.Context, time.Duration) ListImagesResponse
@@ -750,7 +753,11 @@ func (dg *dockerGoClient) stopContainer(ctx context.Context, dockerID string, ti
 	metadata := dg.containerMetadata(ctx, dockerID)
 	if err != nil {
 		seelog.Errorf("DockerGoClient: error stopping container ID=%s: %v", dockerID, err)
-		if metadata.Error == nil {
+		if metadata.Error != nil {
+			// Wrap metadata.Error in CannotStopContainerError in order to make the whole stopContainer operation
+			// retryable.
+			metadata.Error = CannotStopContainerError{metadata.Error}
+		} else {
 			if strings.Contains(err.Error(), "No such container") {
 				err = NoSuchContainerError{dockerID}
 			}
@@ -1097,6 +1104,42 @@ func (dg *dockerGoClient) listImages(ctx context.Context) ListImagesResponse {
 		imageRepoTags = append(imageRepoTags, image.RepoTags...)
 	}
 	return ListImagesResponse{ImageIDs: imageIDs, RepoTags: imageRepoTags, Error: nil}
+}
+
+func (dg *dockerGoClient) SystemPing(ctx context.Context, timeout time.Duration) PingResponse {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Buffered channel so in the case of timeout it takes one write, never gets
+	// read, and can still be GC'd
+	response := make(chan PingResponse, 1)
+	go func() { response <- dg.systemPing(ctx) }()
+	select {
+	case resp := <-response:
+		return resp
+	case <-ctx.Done():
+		// Context has either expired or canceled. If it has timed out,
+		// send back the DockerTimeoutError
+		err := ctx.Err()
+		if err == context.DeadlineExceeded {
+			return PingResponse{Error: &DockerTimeoutError{timeout, "listing"}}
+		}
+		return PingResponse{Error: err}
+	}
+}
+
+func (dg *dockerGoClient) systemPing(ctx context.Context) PingResponse {
+	client, err := dg.sdkDockerClient()
+	if err != nil {
+		return PingResponse{Error: err}
+	}
+
+	pingResponse, err := client.Ping(ctx)
+	if err != nil {
+		return PingResponse{Error: err}
+	}
+
+	return PingResponse{Response: &pingResponse}
 }
 
 func (dg *dockerGoClient) SupportedVersions() []dockerclient.DockerVersion {
@@ -1588,14 +1631,14 @@ func (dg *dockerGoClient) createContainerExec(ctx context.Context, containerID s
 	return &execIDResponse, nil
 }
 
-func (dg *dockerGoClient) StartContainerExec(ctx context.Context, execID string, timeout time.Duration) error {
+func (dg *dockerGoClient) StartContainerExec(ctx context.Context, execID string, execStartCheck types.ExecStartCheck, timeout time.Duration) error {
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	defer metrics.MetricsEngineGlobal.RecordDockerMetric("START_CONTAINER_EXEC")()
 	response := make(chan error, 1)
 	go func() {
-		err := dg.startContainerExec(ctx, execID)
+		err := dg.startContainerExec(ctx, execID, execStartCheck)
 		response <- err
 	}()
 
@@ -1611,15 +1654,10 @@ func (dg *dockerGoClient) StartContainerExec(ctx context.Context, execID string,
 	}
 }
 
-func (dg *dockerGoClient) startContainerExec(ctx context.Context, execID string) error {
+func (dg *dockerGoClient) startContainerExec(ctx context.Context, execID string, execStartCheck types.ExecStartCheck) error {
 	client, err := dg.sdkDockerClient()
 	if err != nil {
 		return err
-	}
-
-	execStartCheck := types.ExecStartCheck{
-		Detach: true,
-		Tty:    false,
 	}
 
 	err = client.ContainerExecStart(ctx, execID, execStartCheck)

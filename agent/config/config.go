@@ -226,6 +226,14 @@ func NewConfig(ec2client ec2.EC2MetadataClient) (*Config, error) {
 	}
 	config := &envConfig
 
+	if config.External.Enabled() {
+		if config.AWSRegion == "" {
+			return nil, errors.New("AWS_DEFAULT_REGION has to be set when running on external capacity")
+		}
+		// Use fake ec2 metadata client if on prem config is set.
+		ec2client = ec2.NewBlackholeEC2MetadataClient()
+	}
+
 	if config.complete() {
 		// No need to do file / network IO
 		return config, nil
@@ -429,8 +437,11 @@ func (cfg *Config) complete() bool {
 }
 
 func fileConfig() (Config, error) {
-	fileName := utils.DefaultIfBlank(os.Getenv("ECS_AGENT_CONFIG_FILE_PATH"), defaultConfigFileName)
 	cfg := Config{}
+	fileName, err := getConfigFileName()
+	if err != nil {
+		return cfg, nil
+	}
 
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -577,6 +588,7 @@ func environmentConfig() (Config, error) {
 		GMSACapable:                         parseGMSACapability(),
 		VolumePluginCapabilities:            parseVolumePluginCapabilities(),
 		FSxWindowsFileServerCapable:         parseFSxWindowsFileServerCapability(),
+		External:                            parseBooleanDefaultFalseConfig("ECS_EXTERNAL"),
 	}, err
 }
 

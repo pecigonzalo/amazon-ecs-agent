@@ -1,0 +1,10 @@
+version: 2
+updates:
+- package-ecosystem: gomod
+  directory: "/agent"
+  schedule:
+    interval: weekly
+    time: "11:06"
+  open-pull-requests-limit: 1
+  target-branch: "dev",
+

@@ -23,8 +23,6 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
-	"github.com/aws/amazon-ecs-agent/agent/ecscni"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
@@ -73,6 +71,7 @@ const (
 	capabilityExecBinRelativePath               = "bin"
 	capabilityExecConfigRelativePath            = "config"
 	capabilityExecCertsRelativePath             = "certs"
+	capabilityExternal                          = "external"
 )
 
 var (
@@ -110,6 +109,23 @@ var (
 
 	pathExists        = defaultPathExists
 	getSubDirectories = defaultGetSubDirectories
+
+	// List of capabilities that are not supported on external capacity.
+	externalUnsupportedCapabilities = []string{
+		attributePrefix + taskENIAttributeSuffix,
+		attributePrefix + cniPluginVersionSuffix,
+		attributePrefix + taskENIIPv6AttributeSuffix,
+		attributePrefix + taskENIBlockInstanceMetadataAttributeSuffix,
+		attributePrefix + taskENITrunkingAttributeSuffix,
+		attributePrefix + appMeshAttributeSuffix,
+		attributePrefix + taskEIAAttributeSuffix,
+		attributePrefix + taskEIAWithOptimizedCPU,
+	}
+	// List of capabilities that are only supported on external capaciity. Currently only one but keep as a list
+	// for future proof and also align with externalUnsupportedCapabilities.
+	externalSpecificCapabilities = []string{
+		attributePrefix + capabilityExternal,
+	}
 )
 
 // capabilities returns the supported capabilities of this agent / docker-client pair.
@@ -160,6 +176,7 @@ var (
 //    ecs.capability.env-files.s3
 //    ecs.capability.fsxWindowsFileServer
 //    ecs.capability.execute-command
+//    ecs.capability.external
 func (agent *ecsAgent) capabilities() ([]*ecs.Attribute, error) {
 	var capabilities []*ecs.Attribute
 
@@ -250,6 +267,14 @@ func (agent *ecsAgent) capabilities() ([]*ecs.Attribute, error) {
 	capabilities, err = agent.appendExecCapabilities(capabilities)
 	if err != nil {
 		return nil, err
+	}
+
+	if agent.cfg.External.Enabled() {
+		// Add external specific capability; remove external unsupported capabilities.
+		for _, cap := range externalSpecificCapabilities {
+			capabilities = appendNameOnlyAttribute(capabilities, cap)
+		}
+		capabilities = removeAttributesByNames(capabilities, externalUnsupportedCapabilities)
 	}
 
 	return capabilities, nil
@@ -473,29 +498,23 @@ func defaultPathExists(path string, shouldBeDirectory bool) (bool, error) {
 	return (isDirectory && shouldBeDirectory) || (!isDirectory && !shouldBeDirectory), nil
 }
 
-// getTaskENIPluginVersionAttribute returns the version information of the ECS
-// CNI plugins. It just executes the ENI plugin as the assumption is that these
-// plugins are packaged with the ECS Agent, which means all of the other plugins
-// should also emit the same version information. Also, the version information
-// doesn't contribute to placement decisions and just serves as additional
-// debugging information
-func (agent *ecsAgent) getTaskENIPluginVersionAttribute() (*ecs.Attribute, error) {
-	version, err := agent.cniClient.Version(ecscni.ECSENIPluginName)
-	if err != nil {
-		seelog.Warnf(
-			"Unable to determine the version of the plugin '%s': %v",
-			ecscni.ECSENIPluginName, err)
-		return nil, err
-	}
-
-	return &ecs.Attribute{
-		Name:  aws.String(attributePrefix + cniPluginVersionSuffix),
-		Value: aws.String(version),
-	}, nil
-}
-
 func appendNameOnlyAttribute(attributes []*ecs.Attribute, name string) []*ecs.Attribute {
 	return append(attributes, &ecs.Attribute{
 		Name: aws.String(name),
 	})
+}
+
+func removeAttributesByNames(attributes []*ecs.Attribute, names []string) []*ecs.Attribute {
+	nameMap := make(map[string]struct{})
+	for _, name := range names {
+		nameMap[name] = struct{}{}
+	}
+
+	var ret []*ecs.Attribute
+	for _, attr := range attributes {
+		if _, ok := nameMap[aws.StringValue(attr.Name)]; !ok {
+			ret = append(ret, attr)
+		}
+	}
+	return ret
 }

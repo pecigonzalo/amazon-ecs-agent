@@ -1,4 +1,33 @@
 # Changelog
+## 1.54.0
+* Feature - ECS EC2 task networking for Windows tasks [#2915](https://github.com/aws/amazon-ecs-agent/pull/2915)
+* Bug - Upgrading the amazon-vpc-cni plugins submodule to address a bug on Windows Server 2004 and Windows Server 20H2 platforms [#2930](https://github.com/aws/amazon-ecs-agent/pull/2930)
+
+## 1.53.1
+* Bug - Fix broken DataDir/Checkpoint file configuration [#2897](https://github.com/aws/amazon-ecs-agent/pull/2897)
+* Enhancement - Update Docker Library to v19.03.11 [#2905](https://github.com/aws/amazon-ecs-agent/pull/2905)
+
+## 1.53.0
+* Bug - Revert change that registered Windows ECS Instances using specific OSFamilyType [#2859](https://github.com/aws/amazon-ecs-agent/pull/2859) to address [#2881](https://github.com/aws/amazon-ecs-agent/issues/2881)
+* Bug - Fix an edge case that could incorrectly mark a task as STOPPED when Docker crashes while stopping a container [#2885](https://github.com/aws/amazon-ecs-agent/pull/2885)
+
+## 1.52.2
+* Enhancement - validate agent config file path permission on Windows [#2866](https://github.com/aws/amazon-ecs-agent/pull/2866)
+* Bug - fix potential goroutine leak when closing websocket connections [#2854](https://github.com/aws/amazon-ecs-agent/pull/2854)
+* Bug - fixes a bug where a task can be stuck in RUNNING indefinitely when a container can't be stopped due to an unresolved docker [bug](https://github.com/moby/moby/issues/41587) (see also the open [PR](https://github.com/moby/moby/pull/41588) in moby to fix the bug).
+
+## 1.52.1
+* Enhancement - Register Windows ECS Instances using specific OSFamilyType [#2859](https://github.com/aws/amazon-ecs-agent/pull/2859)
+* Enhancement - Add retries while retrieving instance-id using EC2 Instance metadata service api [#2861](https://github.com/aws/amazon-ecs-agent/pull/2861)
+
+## 1.52.0
+* Enhancement - Support for ECS EXTERNAL launch type (ECS Anywhere) [#2849](https://github.com/aws/amazon-ecs-agent/pull/2849)
+* Enhancement - Add support for ECS agent to acknowledge server heartbeat messages [#2837](https://github.com/aws/amazon-ecs-agent/pull/2837)
+
+## 1.51.0
+* Enhancement - Add configurable agent healthcheck localhost ip env var. [#2834](https://github.com/aws/amazon-ecs-agent/pull/2834)
+* Bug - Fix bug that could incorrectly clean up pause container before other containers. [#2838](https://github.com/aws/amazon-ecs-agent/pull/2838)
+* Bug - Fix task's network stats by omitting pause container in the network metrics calculation. [#2836](https://github.com/aws/amazon-ecs-agent/pull/2836)
 
 ## 1.50.3
 * Enhancement - Eliminate benign docker stats "context canceled" warning messages from logs [#2813](https://github.com/aws/amazon-ecs-agent/pull/2813)

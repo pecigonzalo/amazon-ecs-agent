@@ -20,6 +20,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/amazon-ecs-agent/agent/eni/watcher"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+
+	"github.com/aws/amazon-ecs-agent/agent/credentials/instancecreds"
 	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
 	"github.com/aws/amazon-ecs-agent/agent/metrics"
 
@@ -41,7 +45,6 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/eni/pause"
-	"github.com/aws/amazon-ecs-agent/agent/eni/udevwrapper"
 	"github.com/aws/amazon-ecs-agent/agent/eventhandler"
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
@@ -53,10 +56,10 @@ import (
 	tcshandler "github.com/aws/amazon-ecs-agent/agent/tcs/handler"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/aws/amazon-ecs-agent/agent/utils/mobypkgwrapper"
+	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
 	"github.com/aws/amazon-ecs-agent/agent/version"
 	"github.com/aws/aws-sdk-go/aws"
 	aws_credentials "github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/cihub/seelog"
 	"github.com/pborman/uuid"
 )
@@ -70,6 +73,14 @@ const (
 
 	vpcIDAttributeName    = "ecs.vpc-id"
 	subnetIDAttributeName = "ecs.subnet-id"
+
+	blackholed = "blackholed"
+
+	instanceIdBackoffMin      = time.Second
+	instanceIdBackoffMax      = time.Second * 5
+	instanceIdBackoffJitter   = 0.2
+	instanceIdBackoffMultiple = 1.3
+	instanceIdMaxRetryCount   = 3
 )
 
 var (
@@ -107,7 +118,7 @@ type ecsAgent struct {
 	stateManagerFactory         factory.StateManager
 	saveableOptionFactory       factory.SaveableOption
 	pauseLoader                 pause.Loader
-	udevMonitor                 udevwrapper.Udev
+	eniWatcher                  *watcher.ENIWatcher
 	cniClient                   ecscni.CNIClient
 	vpc                         string
 	subnet                      string
@@ -143,6 +154,12 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 	}
 	seelog.Infof("Amazon ECS agent Version: %s, Commit: %s", version.Version, version.GitShortHash)
 	seelog.Debugf("Loaded config: %s", cfg.String())
+
+	if cfg.External.Enabled() {
+		seelog.Info("Running in external mode.")
+		ec2MetadataClient = ec2.NewBlackholeEC2MetadataClient()
+		cfg.NoIID = true
+	}
 
 	ec2Client := ec2.NewClientImpl(cfg.AWSRegion)
 	dockerClient, err := dockerapi.NewDockerGoClient(sdkclientfactory.NewFactory(ctx, cfg.DockerEndpoint), cfg, ctx)
@@ -186,7 +203,7 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		// We instantiate our own credentialProvider for use in acs/tcs. This tries
 		// to mimic roughly the way it's instantiated by the SDK for a default
 		// session.
-		credentialProvider:          defaults.CredChain(defaults.Config(), defaults.Handlers()),
+		credentialProvider:          instancecreds.GetCredentials(),
 		stateManagerFactory:         factory.NewStateManager(),
 		saveableOptionFactory:       factory.NewSaveableOption(),
 		pauseLoader:                 pause.New(),
@@ -448,11 +465,21 @@ func (agent *ecsAgent) setClusterInConfig(previousCluster string) error {
 
 // getEC2InstanceID gets the EC2 instance ID from the metadata service
 func (agent *ecsAgent) getEC2InstanceID() string {
-	instanceID, err := agent.ec2MetadataClient.InstanceID()
+	var instanceID string
+	var err error
+	backoff := retry.NewExponentialBackoff(instanceIdBackoffMin, instanceIdBackoffMax, instanceIdBackoffJitter, instanceIdBackoffMultiple)
+	for i := 0; i < instanceIdMaxRetryCount; i++ {
+		instanceID, err = agent.ec2MetadataClient.InstanceID()
+		if err == nil || err.Error() == blackholed {
+			return instanceID
+		}
+		if i < instanceIdMaxRetryCount-1 {
+			time.Sleep(backoff.Duration())
+		}
+	}
 	if err != nil {
 		seelog.Warnf(
 			"Unable to access EC2 Metadata service to determine EC2 ID: %v", err)
-		return ""
 	}
 	return instanceID
 }
@@ -810,4 +837,53 @@ func (agent *ecsAgent) saveMetadata(key, val string) {
 	if err != nil {
 		seelog.Errorf("Failed to save agent metadata to disk (key: [%s], value: [%s]): %v", key, val, err)
 	}
+}
+
+// setVPCSubnet sets the vpc and subnet ids for the agent by querying the
+// instance metadata service
+func (agent *ecsAgent) setVPCSubnet() (error, bool) {
+	mac, err := agent.ec2MetadataClient.PrimaryENIMAC()
+	if err != nil {
+		return fmt.Errorf("unable to get mac address of instance's primary ENI from instance metadata: %v", err), false
+	}
+
+	vpcID, err := agent.ec2MetadataClient.VPCID(mac)
+	if err != nil {
+		if isInstanceLaunchedInVPC(err) {
+			return fmt.Errorf("unable to get vpc id from instance metadata: %v", err), true
+		}
+		return instanceNotLaunchedInVPCError, false
+	}
+
+	subnetID, err := agent.ec2MetadataClient.SubnetID(mac)
+	if err != nil {
+		return fmt.Errorf("unable to get subnet id from instance metadata: %v", err), false
+	}
+
+	agent.vpc = vpcID
+	agent.subnet = subnetID
+	agent.mac = mac
+
+	return nil, false
+}
+
+// isInstanceLaunchedInVPC returns false when the awserr returned is an EC2MetadataError
+// when querying the vpc id from instance metadata
+func isInstanceLaunchedInVPC(err error) bool {
+	if aerr, ok := err.(awserr.Error); ok &&
+		aerr.Code() == "EC2MetadataError" {
+		return false
+	}
+	return true
+}
+
+// contains is a comparision function which checks if the target string is present in the array
+func contains(capabilities []string, capability string) bool {
+	for _, cap := range capabilities {
+		if cap == capability {
+			return true
+		}
+	}
+
+	return false
 }

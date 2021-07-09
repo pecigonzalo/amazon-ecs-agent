@@ -517,7 +517,7 @@ func TestStartContainerExecTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
-	err := client.StartContainerExec(ctx, "id", xContainerShortTimeout)
+	err := client.StartContainerExec(ctx, "id", types.ExecStartCheck{Detach: true, Tty: false}, xContainerShortTimeout)
 	assert.NotNil(t, err, "Expected error for start container exec")
 	assert.Equal(t, "DockerTimeoutError", err.(apierrors.NamedError).ErrorName(), "Wrong error type")
 	wait.Done()
@@ -538,7 +538,7 @@ func TestStartContainerExec(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
-	err := client.StartContainerExec(ctx, "id", dockerclient.ContainerExecStartTimeout)
+	err := client.StartContainerExec(ctx, "id", types.ExecStartCheck{Detach: true, Tty: false}, dockerclient.ContainerExecStartTimeout)
 	assert.NoError(t, err)
 }
 
@@ -1006,6 +1006,34 @@ func TestDockerVersion(t *testing.T) {
 	str, err := client.Version(ctx, dockerclient.VersionTimeout)
 	assert.NoError(t, err)
 	assert.Equal(t, "1.6.0", str, "Got unexpected version string: "+str)
+}
+
+func TestSystemPing(t *testing.T) {
+	mockDockerSDK, client, _, _, _, done := dockerClientSetup(t)
+	defer done()
+
+	mockDockerSDK.EXPECT().Ping(gomock.Any()).Return(types.Ping{APIVersion: "test_docker_api"}, nil)
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	pingResponse := client.SystemPing(ctx, dockerclient.InfoTimeout)
+
+	assert.NoError(t, pingResponse.Error)
+	assert.Equal(t, "test_docker_api", pingResponse.Response.APIVersion)
+}
+
+func TestSystemPingError(t *testing.T) {
+	mockDockerSDK, client, _, _, _, done := dockerClientSetup(t)
+	defer done()
+
+	mockDockerSDK.EXPECT().Ping(gomock.Any()).Return(types.Ping{}, errors.New("test error"))
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	pingResponse := client.SystemPing(ctx, dockerclient.InfoTimeout)
+
+	assert.Error(t, pingResponse.Error)
+	assert.Nil(t, pingResponse.Response)
 }
 
 func TestDockerInfo(t *testing.T) {

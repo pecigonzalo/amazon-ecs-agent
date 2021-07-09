@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/amazon-ecs-agent/agent/credentials/instancecreds"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -38,6 +39,7 @@ const (
 	PrivateIPv4Resource                       = "local-ipv4"
 	PublicIPv4Resource                        = "public-ipv4"
 	OutpostARN                                = "outpost-arn"
+	PrimaryIPV4VPCCIDRResourceFormat          = "network/interfaces/macs/%s/vpc-ipv4-cidr-block"
 )
 
 const (
@@ -89,9 +91,10 @@ type ec2MetadataClientImpl struct {
 // NewEC2MetadataClient creates an ec2metadata client to retrieve metadata
 func NewEC2MetadataClient(client HttpClient) EC2MetadataClient {
 	if client == nil {
+		config := aws.NewConfig().WithMaxRetries(metadataRetries)
+		config.Credentials = instancecreds.GetCredentials()
 		return &ec2MetadataClientImpl{
-			client: ec2metadata.New(
-				session.New(), aws.NewConfig().WithMaxRetries(metadataRetries)),
+			client: ec2metadata.New(session.New(), config),
 		}
 	} else {
 		return &ec2MetadataClientImpl{client: client}
