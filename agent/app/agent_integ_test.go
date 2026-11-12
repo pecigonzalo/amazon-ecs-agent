@@ -21,7 +21,8 @@ import (
 	"testing"
 
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers/exitcodes"
-	"github.com/aws/aws-sdk-go/aws"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -29,7 +30,7 @@ func TestNewAgent(t *testing.T) {
 	os.Setenv("AWS_DEFAULT_REGION", "us-west-2")
 	defer os.Unsetenv("AWS_DEFAULT_REGION")
 
-	agent, err := newAgent(true, aws.Bool(true))
+	agent, err := newAgent(false, aws.Bool(false))
 
 	assert.NoError(t, err)
 	// printECSAttributes should ensure that agent's cfg is set with

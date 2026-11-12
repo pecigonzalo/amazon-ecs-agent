@@ -17,17 +17,21 @@
 package container
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/container/restart"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/docker/docker/api/types"
 
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type configPair struct {
@@ -96,7 +100,10 @@ func TestIsKnownSteadyState(t *testing.T) {
 func TestGetNextStateProgression(t *testing.T) {
 	// This creates a container with `iota` ContainerStatus (NONE)
 	container := &Container{}
-	// NONE should transition to PULLED
+	// NONE should transition to MANIFEST_PULLED
+	assert.Equal(t, container.GetNextKnownStateProgression(), apicontainerstatus.ContainerManifestPulled)
+	container.SetKnownStatus(apicontainerstatus.ContainerManifestPulled)
+	// MANIFEST_PULLED should transition to PULLED
 	assert.Equal(t, container.GetNextKnownStateProgression(), apicontainerstatus.ContainerPulled)
 	container.SetKnownStatus(apicontainerstatus.ContainerPulled)
 	// PULLED should transition to CREATED
@@ -130,15 +137,55 @@ func TestIsInternal(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("IsInternal shoukd return %t for %s", tc.internal, tc.container.String()),
+		t.Run(fmt.Sprintf("IsInternal should return %t for %s", tc.internal, tc.container.String()),
 			func(t *testing.T) {
 				assert.Equal(t, tc.internal, tc.container.IsInternal())
 			})
 	}
 }
 
+func TestIsManagedDaemonContainer(t *testing.T) {
+	testCases := []struct {
+		container       *Container
+		internal        bool
+		isManagedDaemon bool
+	}{
+		{&Container{}, false, false},
+		{&Container{Type: ContainerNormal, Image: "someImage:latest"}, false, false},
+		{&Container{Type: ContainerManagedDaemon, Image: "someImage:latest"}, true, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("IsManagedDaemonContainer should return %t for %s", tc.isManagedDaemon, tc.container.String()),
+			func(t *testing.T) {
+				assert.Equal(t, tc.internal, tc.container.IsInternal())
+				ok := tc.container.IsManagedDaemonContainer()
+				assert.Equal(t, tc.isManagedDaemon, ok)
+			})
+	}
+}
+
+func TestGetImageName(t *testing.T) {
+	testCases := []struct {
+		container *Container
+		imageName string
+	}{
+		{&Container{}, ""},
+		{&Container{Image: "someImage:latest"}, "someImage"},
+		{&Container{Image: "someImage"}, "someImage"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("GetImageName should return %s for %s", tc.imageName, tc.container.String()),
+			func(t *testing.T) {
+				imageName := tc.container.GetImageName()
+				assert.Equal(t, tc.imageName, imageName)
+			})
+	}
+}
+
 // TestSetupExecutionRoleFlag tests whether or not the container appropriately
-//sets the flag for using execution roles
+// sets the flag for using execution roles
 func TestSetupExecutionRoleFlag(t *testing.T) {
 	testCases := []struct {
 		container *Container
@@ -705,6 +752,48 @@ func TestGetNetworkModeFromHostConfig(t *testing.T) {
 	}
 }
 
+func TestGetMemoryReservationFromHostConfig(t *testing.T) {
+	getContainer := func(hostConfig *string) *Container {
+		c := &Container{
+			Name: "c",
+		}
+		c.DockerConfig.HostConfig = hostConfig
+		return c
+	}
+
+	getStrPtr := func(s string) *string {
+		return &s
+	}
+
+	testCases := []struct {
+		name           string
+		container      *Container
+		expectedOutput int64
+	}{
+		{
+			name:           "happy case",
+			container:      getContainer(getStrPtr("{\"MemoryReservation\":268435456}")),
+			expectedOutput: 256,
+		},
+		{
+			name:           "invalid case",
+			container:      getContainer(getStrPtr("invalid")),
+			expectedOutput: 0,
+		},
+		{
+			name:           "nil case",
+			container:      getContainer(nil),
+			expectedOutput: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedOutput, tc.container.GetMemoryReservationFromHostConfig())
+		})
+	}
+}
+
 func TestShouldCreateWithEnvfiles(t *testing.T) {
 	cases := []struct {
 		in  Container
@@ -969,4 +1058,515 @@ func TestUpdateManagedAgentSentStatus(t *testing.T) {
 
 		})
 	}
+}
+
+func TestRequiresAnyCredentialSpec(t *testing.T) {
+	testCases := []struct {
+		name           string
+		container      *Container
+		expectedOutput bool
+	}{
+		{
+			name:           "hostconfig_nil",
+			container:      &Container{},
+			expectedOutput: false,
+		},
+		{
+			name:           "invalid_case",
+			container:      getContainer("invalid", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "empty_sec_opt",
+			container:      getContainer("{\"NetworkMode\":\"bridge\"}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "missing_credentialspec",
+			container:      getContainer("{\"SecurityOpt\": [\"invalid-sec-opt\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "wrong_prefix",
+			container:      getContainer("{\"SecurityOpt\": [\"credential2spec:file://gmsa_gmsa-acct.json\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_file",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:file://gmsa_gmsa-acct.json\"]}", nil),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_s3",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}\"]}", nil),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_ssm",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/parameter_name\"]}", nil),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_file_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspec:file://gmsa-acct.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_file_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:file://gmsa-acct.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_s3_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_s3_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:s3:::${BucketName}/${ObjectName}"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_ssm_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_ssm_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "host_config_credentialspecs_file",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:file://hostconfig.json\"]}", []string{"credentialspecdomainless:file://credentialspecs.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "host_config_credentialspecs_s3",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::hostconfig.json\"]}", []string{"credentialspec:arn:aws:s3:::credentialspecs.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "host_config_credentialspecs_ssm",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/hostconfig.json\"]}", []string{"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/credentialspecs.json"}),
+			expectedOutput: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedOutput, tc.container.RequiresAnyCredentialSpec())
+		})
+	}
+}
+
+func TestRequiresDomainlessCredentialSpec(t *testing.T) {
+	testCases := []struct {
+		name           string
+		container      *Container
+		expectedOutput bool
+	}{
+		{
+			name:           "hostconfig_nil",
+			container:      &Container{},
+			expectedOutput: false,
+		},
+		{
+			name:           "invalid_case",
+			container:      getContainer("invalid", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "empty_sec_opt",
+			container:      getContainer("{\"NetworkMode\":\"bridge\"}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "missing_credentialspec",
+			container:      getContainer("{\"SecurityOpt\": [\"invalid-sec-opt\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "wrong_prefix",
+			container:      getContainer("{\"SecurityOpt\": [\"credential2spec:file://gmsa_gmsa-acct.json\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_file",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:file://gmsa_gmsa-acct.json\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_s3",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_ssm",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/parameter_name\"]}", nil),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_file_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspec:file://gmsa-acct.json"}),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_file_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:file://gmsa-acct.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_s3_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}"}),
+			expectedOutput: false,
+		},
+		{
+			name:           "valid_credentialspec_s3_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:s3:::${BucketName}/${ObjectName}"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_ssm_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "valid_credentialspec_ssm_domainless_not_hostconfig",
+			container:      getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "host_config_credentialspecs_file",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:file://hostconfig.json\"]}", []string{"credentialspecdomainless:file://credentialspecs.json"}),
+			expectedOutput: true,
+		},
+		{
+			name:           "host_config_credentialspecs_s3",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::hostconfig.json\"]}", []string{"credentialspec:arn:aws:s3:::credentialspecs.json"}),
+			expectedOutput: false,
+		},
+		{
+			name:           "host_config_credentialspecs_ssm",
+			container:      getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/hostconfig.json\"]}", []string{"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/credentialspecs.json"}),
+			expectedOutput: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedOutput, tc.container.RequiresDomainlessCredentialSpec())
+		})
+	}
+}
+
+func TestGetCredentialSpecErr(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		container            *Container
+		expectedOutputString string
+		expectedErrorString  string
+	}{
+		{
+			name:                 "hostconfig_nil",
+			container:            &Container{},
+			expectedOutputString: "",
+			expectedErrorString:  "unable to obtain credentialspec from both hostConfig and credentialSpecs",
+		},
+		{
+			name:                 "invalid_case",
+			container:            getContainer("invalid", nil),
+			expectedOutputString: "",
+			expectedErrorString:  "unable to obtain credentialspec from both hostConfig and credentialSpecs",
+		},
+		{
+			name:                 "empty_sec_opt",
+			container:            getContainer("{\"NetworkMode\":\"bridge\"}", nil),
+			expectedOutputString: "",
+			expectedErrorString:  "unable to obtain credentialspec from both hostConfig and credentialSpecs",
+		},
+		{
+			name:                 "missing_credentialspec",
+			container:            getContainer("{\"SecurityOpt\": [\"invalid-sec-opt\"]}", nil),
+			expectedOutputString: "",
+			expectedErrorString:  "unable to obtain credentialspec from both hostConfig and credentialSpecs",
+		},
+		{
+			name:                 "invalid_case_credential_specs",
+			container:            getContainer("{\"NetworkMode\":\"bridge\"}", []string{"invalid"}),
+			expectedOutputString: "",
+			expectedErrorString:  "unable to obtain credentialspec from both hostConfig and credentialSpecs",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedOutputStr, err := tc.container.GetCredentialSpec()
+			assert.Equal(t, tc.expectedOutputString, expectedOutputStr)
+			assert.EqualError(t, err, tc.expectedErrorString)
+		})
+	}
+}
+
+func TestGetCredentialSpec(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		container            *Container
+		expectedOutputString string
+	}{
+		{
+			name:                 "hostconfig_file",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:file://gmsa_gmsa-acct.json\"]}", nil),
+			expectedOutputString: "credentialspec:file://gmsa_gmsa-acct.json",
+		},
+		{
+			name:                 "hostconfig_file_multiple",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:file://gmsa_gmsa-acct.json\", \"credentialspec:file://gmsa_gmsa-acct2.json\"]}", nil),
+			expectedOutputString: "credentialspec:file://gmsa_gmsa-acct.json",
+		},
+		{
+			name:                 "hostconfig_s3",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}\"]}", nil),
+			expectedOutputString: "credentialspec:arn:aws:s3:::${BucketName}/${ObjectName}",
+		},
+		{
+			name:                 "hostconfig_ssm",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/parameter_name\"]}", nil),
+			expectedOutputString: "credentialspec:arn:aws:ssm:region:aws_account_id:parameter/parameter_name",
+		},
+		{
+			name:                 "credentialspecs_file",
+			container:            getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:file://gmsa_gmsa-acct.json"}),
+			expectedOutputString: "credentialspecdomainless:file://gmsa_gmsa-acct.json",
+		},
+		{
+			name:                 "credentialspecs_file_multiple",
+			container:            getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:file://gmsa_gmsa-acct.json", "credentialspecdomainless:file://gmsa_gmsa-acct2.json"}),
+			expectedOutputString: "credentialspecdomainless:file://gmsa_gmsa-acct.json",
+		},
+		{
+			name:                 "credentialspecs_s3",
+			container:            getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:s3:::${BucketName}/${ObjectName}"}),
+			expectedOutputString: "credentialspecdomainless:arn:aws:s3:::${BucketName}/${ObjectName}",
+		},
+		{
+			name:                 "credentialspecs_ssm",
+			container:            getContainer("{\"SecurityOpt\": []}", []string{"credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name"}),
+			expectedOutputString: "credentialspecdomainless:arn:aws:ssm:region:aws_account_id:parameter/parameter_name",
+		},
+		{
+			name:                 "host_config_credentialspecs_file",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:file://hostconfig.json\"]}", []string{"credentialspecdomainless:file://credentialspecs.json"}),
+			expectedOutputString: "credentialspecdomainless:file://credentialspecs.json",
+		},
+		{
+			name:                 "host_config_credentialspecs_s3",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:s3:::hostconfig.json\"]}", []string{"credentialspec:arn:aws:s3:::credentialspecs.json"}),
+			expectedOutputString: "credentialspec:arn:aws:s3:::credentialspecs.json",
+		},
+		{
+			name:                 "host_config_credentialspecs_ssm",
+			container:            getContainer("{\"SecurityOpt\": [\"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/hostconfig.json\"]}", []string{"credentialspec:arn:aws:ssm:region:aws_account_id:parameter/credentialspecs.json"}),
+			expectedOutputString: "credentialspec:arn:aws:ssm:region:aws_account_id:parameter/credentialspecs.json",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedOutputStr, err := tc.container.GetCredentialSpec()
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedOutputString, expectedOutputStr)
+		})
+	}
+}
+
+func TestRestartPolicy(t *testing.T) {
+	testCases := []struct {
+		name            string
+		container       *Container
+		restartCount    int
+		expectedEnabled bool
+	}{
+		{
+			name: "nil restart policy",
+			container: &Container{
+				RestartPolicy: nil,
+			},
+			restartCount:    0,
+			expectedEnabled: false,
+		},
+		{
+			name: "not enabled restart policy",
+			container: &Container{
+				RestartPolicy: &restart.RestartPolicy{},
+			},
+			restartCount:    0,
+			expectedEnabled: false,
+		},
+		{
+			name: "explicitly not enabled restart policy",
+			container: &Container{
+				RestartPolicy: &restart.RestartPolicy{
+					Enabled: false,
+				},
+			},
+			restartCount:    0,
+			expectedEnabled: false,
+		},
+		{
+			name: "enabled restart policy",
+			container: &Container{
+				RestartPolicy: &restart.RestartPolicy{
+					Enabled: true,
+				},
+			},
+			restartCount:    0,
+			expectedEnabled: true,
+		},
+		{
+			name: "enabled restart policy, record 5 restarts",
+			container: &Container{
+				RestartPolicy: &restart.RestartPolicy{
+					Enabled: true,
+				},
+			},
+			restartCount:    5,
+			expectedEnabled: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		require.Equal(t, tc.expectedEnabled, tc.container.RestartPolicyEnabled())
+		if tc.container.RestartPolicyEnabled() {
+			tc.container.RestartTracker = restart.NewRestartTracker(*tc.container.RestartPolicy)
+			for i := 0; i < tc.restartCount; i++ {
+				tc.container.RestartTracker.RecordRestart()
+			}
+			require.Equal(t, tc.restartCount, tc.container.RestartTracker.GetRestartCount())
+		}
+	}
+}
+
+func TestGetAndSetStartedAt(t *testing.T) {
+	testTime := time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC)
+	c := &Container{}
+
+	// Test getting started at time when it has never been set is the zero value of time.
+	require.True(t, c.GetStartedAt().IsZero())
+
+	// Test setting started at time sets the started at time.
+	c.SetStartedAt(testTime)
+	require.Equal(t, testTime, c.GetStartedAt())
+
+	// Test setting started at time after it has already been set does not change the originally set started at time.
+	c.SetStartedAt(time.Now())
+	require.Equal(t, testTime, c.GetStartedAt())
+}
+
+func TestGetAndSetRestartAggregationDataForStats(t *testing.T) {
+	testTime := time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC)
+	testStatsJSON := types.StatsJSON{
+		Stats: types.Stats{
+			CPUStats: types.CPUStats{
+				CPUUsage: types.CPUUsage{
+					TotalUsage: 100,
+				},
+			},
+			MemoryStats: types.MemoryStats{
+				MaxUsage: 200,
+			},
+		},
+	}
+	testRestartAggregationDataForStats := ContainerRestartAggregationDataForStats{
+		LastRestartDetectedAt:     testTime,
+		LastStatBeforeLastRestart: testStatsJSON,
+	}
+	c := &Container{}
+
+	// Test getting restart aggregation data for stats when it has never been set is the zero value of the
+	// ContainerRestartAggregationDataForStats struct.
+	require.Equal(t, ContainerRestartAggregationDataForStats{}, c.GetRestartAggregationDataForStats())
+
+	// Test setting restart aggregation data for stats sets the restart aggregation data for stats.
+	c.SetRestartAggregationDataForStats(testRestartAggregationDataForStats)
+	require.Equal(t, testRestartAggregationDataForStats, c.GetRestartAggregationDataForStats())
+}
+
+func getContainer(hostConfig string, credentialSpecs []string) *Container {
+	c := &Container{
+		Name: "c",
+	}
+	c.DockerConfig.HostConfig = &hostConfig
+	c.CredentialSpecs = credentialSpecs
+	return c
+}
+
+func TestDigestResolved(t *testing.T) {
+	t.Run("never resolved for internal container", func(t *testing.T) {
+		assert.False(t, (&Container{Type: ContainerServiceConnectRelay}).DigestResolved())
+	})
+	t.Run("digest resolved if it is populated", func(t *testing.T) {
+		assert.True(t, (&Container{ImageDigest: "digest"}).DigestResolved())
+	})
+	t.Run("digest not resolved if it is not populated", func(t *testing.T) {
+		assert.False(t, (&Container{}).DigestResolved())
+	})
+	t.Run("never resolved for container if digest found in image reference", func(t *testing.T) {
+		image := "ubuntu@sha256:ed6d2c43c8fbcd3eaa44c9dab6d94cb346234476230dc1681227aa72d07181ee"
+		imageDigest := "sha256:ed6d2c43c8fbcd3eaa44c9dab6d94cb346234476230dc1681227aa72d07181ee"
+		assert.False(t, (&Container{Image: image, ImageDigest: imageDigest}).DigestResolved())
+	})
+}
+
+func TestGetUser(t *testing.T) {
+	tests := []struct {
+		name         string
+		dockerConfig string
+		expectedUser string
+	}{
+		{
+			name: "Valid user configuration",
+			dockerConfig: func() string {
+				config := &dockercontainer.Config{
+					User: "12345",
+				}
+				configBytes, _ := json.Marshal(config)
+				return string(configBytes)
+			}(),
+			expectedUser: "12345",
+		},
+		{
+			name:         "Empty config",
+			dockerConfig: "",
+			expectedUser: "",
+		},
+		{
+			name:         "Invalid JSON config",
+			dockerConfig: "invalid-json",
+			expectedUser: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			container := &Container{
+				Name: "foo",
+			}
+
+			if tc.dockerConfig != "" {
+				container.DockerConfig.Config = &tc.dockerConfig
+			}
+
+			result := container.GetUser()
+			assert.Equal(t, tc.expectedUser, result)
+		})
+	}
+}
+
+func TestUsesMPS(t *testing.T) {
+	noMPS := &Container{}
+	assert.False(t, noMPS.UsesMPS(), "container with no MPSConfig should not use MPS")
+
+	withMPS := &Container{MPSConfig: &MPSConfig{Memory: 8192}}
+	assert.True(t, withMPS.UsesMPS(), "container with MPSConfig should use MPS")
 }

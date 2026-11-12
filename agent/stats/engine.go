@@ -18,28 +18,35 @@ package stats
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/logger"
-	"github.com/aws/amazon-ecs-agent/agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/agent/data"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils"
 
 	"github.com/cihub/seelog"
 	"github.com/pborman/uuid"
 	"github.com/pkg/errors"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	ecsengine "github.com/aws/amazon-ecs-agent/agent/engine"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/stats/resolver"
-	"github.com/aws/amazon-ecs-agent/agent/tcs/model/ecstcs"
-	"github.com/aws/aws-sdk-go/aws"
+	taskresourcevolume "github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/csiclient"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/stats"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tcs/model/ecstcs"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/docker/docker/api/types"
 )
 
@@ -48,6 +55,9 @@ const (
 	queueResetThreshold    = 2 * dockerclient.StatsInactivityTimeout
 	hostNetworkMode        = "host"
 	noneNetworkMode        = "none"
+	// defaultPublishServiceConnectTicker is every 3rd time service connect metrics will be sent to the backend
+	// Task metrics are published at 20s interval, thus task's service metrics will be published 60s.
+	defaultPublishServiceConnectTicker = 3
 )
 
 var (
@@ -68,9 +78,12 @@ type DockerContainerMetadataResolver struct {
 // Engine defines methods to be implemented by the engine struct. It is
 // defined to make testing easier.
 type Engine interface {
-	GetInstanceMetrics() (*ecstcs.MetricsMetadata, []*ecstcs.TaskMetric, error)
-	ContainerDockerStats(taskARN string, containerID string) (*types.StatsJSON, *NetworkStatsPerSec, error)
+	GetInstanceMetrics(includeServiceConnectStats bool) (*ecstcs.MetricsMetadata, []*ecstcs.TaskMetric, error)
+	ContainerDockerStats(taskARN string, containerID string) (*types.StatsJSON, *stats.NetworkStatsPerSec, error)
 	GetTaskHealthMetrics() (*ecstcs.HealthMetadata, []*ecstcs.TaskHealth, error)
+	GetPublishServiceConnectTickerInterval() int32
+	SetPublishServiceConnectTickerInterval(int32)
+	GetPublishMetricsTicker() *time.Ticker
 }
 
 // DockerStatsEngine is used to monitor docker container events and to report
@@ -91,8 +104,17 @@ type DockerStatsEngine struct {
 	// tasksToHealthCheckContainers map task arns to the containers that has health check enabled
 	tasksToHealthCheckContainers map[string]map[string]*StatsContainer
 	// tasksToDefinitions maps task arns to task definition name and family metadata objects.
-	tasksToDefinitions map[string]*taskDefinition
-	taskToTaskStats    map[string]*StatsTask
+	tasksToDefinitions                  map[string]*taskDefinition
+	taskToTaskStats                     map[string]*StatsTask
+	taskToServiceConnectStats           map[string]*ServiceConnectStats
+	publishServiceConnectTickerInterval int32
+	publishMetricsTicker                *time.Ticker
+	// channels to send metrics to TACS Client
+	metricsChannel chan<- ecstcs.TelemetryMessage
+	healthChannel  chan<- ecstcs.HealthMessage
+
+	csiClient  csiclient.CSIClient
+	dataClient data.Client
 }
 
 // ResolveTask resolves the api task object, given container id.
@@ -135,16 +157,21 @@ func (resolver *DockerContainerMetadataResolver) ResolveContainer(dockerID strin
 
 // NewDockerStatsEngine creates a new instance of the DockerStatsEngine object.
 // MustInit() must be called to initialize the fields of the new event listener.
-func NewDockerStatsEngine(cfg *config.Config, client dockerapi.DockerClient, containerChangeEventStream *eventstream.EventStream) *DockerStatsEngine {
+func NewDockerStatsEngine(cfg *config.Config, client dockerapi.DockerClient, containerChangeEventStream *eventstream.EventStream, metricsChannel chan<- ecstcs.TelemetryMessage, healthChannel chan<- ecstcs.HealthMessage, dataClient data.Client) *DockerStatsEngine {
 	return &DockerStatsEngine{
-		client:                       client,
-		resolver:                     nil,
-		config:                       cfg,
-		tasksToContainers:            make(map[string]map[string]*StatsContainer),
-		tasksToHealthCheckContainers: make(map[string]map[string]*StatsContainer),
-		tasksToDefinitions:           make(map[string]*taskDefinition),
-		taskToTaskStats:              make(map[string]*StatsTask),
-		containerChangeEventStream:   containerChangeEventStream,
+		client:                              client,
+		resolver:                            nil,
+		config:                              cfg,
+		tasksToContainers:                   make(map[string]map[string]*StatsContainer),
+		tasksToHealthCheckContainers:        make(map[string]map[string]*StatsContainer),
+		tasksToDefinitions:                  make(map[string]*taskDefinition),
+		taskToTaskStats:                     make(map[string]*StatsTask),
+		taskToServiceConnectStats:           make(map[string]*ServiceConnectStats),
+		containerChangeEventStream:          containerChangeEventStream,
+		publishServiceConnectTickerInterval: 0,
+		metricsChannel:                      metricsChannel,
+		healthChannel:                       healthChannel,
+		dataClient:                          dataClient,
 	}
 }
 
@@ -218,6 +245,7 @@ func (engine *DockerStatsEngine) MustInit(ctx context.Context, taskEngine ecseng
 	logger.Info("Initializing stats engine")
 	engine.cluster = cluster
 	engine.containerInstanceArn = containerInstanceArn
+	engine.publishMetricsTicker = time.NewTicker(config.DefaultContainerMetricsPublishInterval)
 
 	var err error
 	engine.resolver, err = newDockerContainerMetadataResolver(taskEngine)
@@ -259,6 +287,9 @@ func (engine *DockerStatsEngine) waitToStop() {
 	logger.Debug("Event stream closed, stop listening to the event stream")
 	engine.containerChangeEventStream.Unsubscribe(containerChangeHandler)
 	engine.removeAll()
+	if engine.publishMetricsTicker != nil {
+		engine.publishMetricsTicker.Stop()
+	}
 }
 
 // removeAll stops the periodic usage data collection for all containers
@@ -305,6 +336,18 @@ func (engine *DockerStatsEngine) addToStatsTaskMapUnsafe(task *apitask.Task, doc
 	}
 }
 
+func (engine *DockerStatsEngine) addTaskToServiceConnectStatsUnsafe(taskArn string) {
+	_, taskExists := engine.taskToServiceConnectStats[taskArn]
+	if !taskExists {
+		serviceConnectStats, err := newServiceConnectStats()
+		if err != nil {
+			seelog.Errorf("Error adding task %s to the service connect stats watchlist : %v", taskArn, err)
+			return
+		}
+		engine.taskToServiceConnectStats[taskArn] = serviceConnectStats
+	}
+}
+
 // addContainerUnsafe adds a container to the map of containers being watched.
 func (engine *DockerStatsEngine) addContainerUnsafe(dockerID string) (*StatsContainer, *StatsTask, error) {
 	// Make sure that this container belongs to a task and that the task
@@ -322,7 +365,7 @@ func (engine *DockerStatsEngine) addContainerUnsafe(dockerID string) (*StatsCont
 		return nil, nil, errors.Errorf("stats add container: task is terminal, ignoring container: %s, task: %s", dockerID, task.Arn)
 	}
 
-	statsContainer, err := newStatsContainer(dockerID, engine.client, engine.resolver, engine.config)
+	statsContainer, err := newStatsContainer(dockerID, engine.client, engine.resolver, engine.config, engine.dataClient)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "could not map docker container ID to container, ignoring container: %s", dockerID)
 	}
@@ -349,6 +392,10 @@ func (engine *DockerStatsEngine) addContainerUnsafe(dockerID string) (*StatsCont
 		// Track the container health status
 		engine.addToStatsContainerMapUnsafe(task.Arn, dockerID, statsContainer, engine.healthCheckContainerMapUnsafe)
 		seelog.Debugf("Adding container to stats health check watch list, id: %s, task: %s", dockerID, task.Arn)
+	}
+
+	if errResolveContainer == nil && task.GetServiceConnectContainer() == dockerContainer.Container {
+		engine.addTaskToServiceConnectStatsUnsafe(task.Arn)
 	}
 
 	if !watchStatsContainer {
@@ -393,9 +440,83 @@ func (engine *DockerStatsEngine) addToStatsContainerMapUnsafe(
 	return true
 }
 
+// StartMetricsPublish starts to collect and publish task and health metrics
+func (engine *DockerStatsEngine) StartMetricsPublish() {
+	if engine.publishMetricsTicker == nil {
+		seelog.Debug("Skipping reporting metrics through channel. Publish ticker is uninitialized")
+		return
+	}
+
+	// Publish metrics immediately after we start the loop and wait for ticks. This makes sure TACS side has correct
+	// TaskCount metrics in CX account (especially for short living tasks)
+	engine.publishMetrics(false)
+	engine.publishHealth()
+
+	for {
+		var includeServiceConnectStats bool
+		metricCounter := engine.GetPublishServiceConnectTickerInterval()
+		metricCounter++
+		if metricCounter == defaultPublishServiceConnectTicker {
+			includeServiceConnectStats = true
+			metricCounter = 0
+		}
+		engine.SetPublishServiceConnectTickerInterval(metricCounter)
+		select {
+		case <-engine.publishMetricsTicker.C:
+			seelog.Debugf("publishMetricsTicker triggered. Sending telemetry messages to tcsClient through channel")
+			if includeServiceConnectStats {
+				seelog.Debugf("service connect metrics included")
+			}
+			go engine.publishMetrics(includeServiceConnectStats)
+			go engine.publishHealth()
+		case <-engine.ctx.Done():
+			return
+		}
+	}
+}
+
+func (engine *DockerStatsEngine) publishMetrics(includeServiceConnectStats bool) {
+	publishMetricsCtx, cancel := context.WithTimeout(engine.ctx, publishMetricsTimeout)
+	defer cancel()
+	metricsMetadata, taskMetrics, metricsErr := engine.GetInstanceMetrics(includeServiceConnectStats)
+	if metricsErr == nil {
+		metricsMessage := ecstcs.TelemetryMessage{
+			Metadata:    metricsMetadata,
+			TaskMetrics: taskMetrics,
+		}
+		select {
+		case engine.metricsChannel <- metricsMessage:
+			seelog.Debugf("sent telemetry message")
+		case <-publishMetricsCtx.Done():
+			seelog.Errorf("timeout sending telemetry message, discarding metrics")
+		}
+	} else {
+		seelog.Warnf("Error collecting task metrics: %v", metricsErr)
+	}
+}
+
+func (engine *DockerStatsEngine) publishHealth() {
+	publishHealthCtx, cancel := context.WithTimeout(engine.ctx, publishMetricsTimeout)
+	defer cancel()
+	healthMetadata, taskHealthMetrics, healthErr := engine.GetTaskHealthMetrics()
+	if healthErr == nil {
+		healthMessage := ecstcs.HealthMessage{
+			Metadata:      healthMetadata,
+			HealthMetrics: taskHealthMetrics,
+		}
+		select {
+		case engine.healthChannel <- healthMessage:
+			seelog.Debugf("sent health message")
+		case <-publishHealthCtx.Done():
+			seelog.Errorf("timeout sending health message, discarding metrics")
+		}
+	} else {
+		seelog.Warnf("Error collecting health metrics: %v", healthErr)
+	}
+}
+
 // GetInstanceMetrics gets all task metrics and instance metadata from stats engine.
-func (engine *DockerStatsEngine) GetInstanceMetrics() (*ecstcs.MetricsMetadata, []*ecstcs.TaskMetric, error) {
-	var taskMetrics []*ecstcs.TaskMetric
+func (engine *DockerStatsEngine) GetInstanceMetrics(includeServiceConnectStats bool) (*ecstcs.MetricsMetadata, []*ecstcs.TaskMetric, error) {
 	idle := engine.isIdle()
 	metricsMetadata := &ecstcs.MetricsMetadata{
 		Cluster:           aws.String(engine.cluster),
@@ -404,6 +525,7 @@ func (engine *DockerStatsEngine) GetInstanceMetrics() (*ecstcs.MetricsMetadata, 
 		MessageId:         aws.String(uuid.NewRandom().String()),
 	}
 
+	var taskMetrics []*ecstcs.TaskMetric
 	if idle {
 		seelog.Debug("Instance is idle. No task metrics to report")
 		fin := true
@@ -414,16 +536,37 @@ func (engine *DockerStatsEngine) GetInstanceMetrics() (*ecstcs.MetricsMetadata, 
 	engine.lock.Lock()
 	defer engine.lock.Unlock()
 
-	for taskArn := range engine.tasksToContainers {
+	if includeServiceConnectStats {
+		err := engine.getServiceConnectStats()
+		if err != nil {
+			seelog.Errorf("Error getting service connect metrics: %v", err)
+		}
+	}
+
+	taskStatsToCollect := engine.getTaskStatsToCollect()
+	for taskArn := range taskStatsToCollect {
+		_, isServiceConnectTask := engine.taskToServiceConnectStats[taskArn]
 		containerMetrics, err := engine.taskContainerMetricsUnsafe(taskArn)
 		if err != nil {
 			seelog.Debugf("Error getting container metrics for task: %s, err: %v", taskArn, err)
-			continue
+			// skip collecting service connect related metrics, if task is not service connect enabled.
+			// when task metrics and health metrics are both disabled and there is a service connect task,
+			// and we should not include service connect this time, we also need to skip following execution
+			// to avoid invalid metrics sent to TCS
+			if !isServiceConnectTask || !includeServiceConnectStats {
+				continue
+			}
 		}
 
 		if len(containerMetrics) == 0 {
 			seelog.Debugf("Empty containerMetrics for task, ignoring, task: %s", taskArn)
-			continue
+			// skip collecting service connect related metrics, if task is not service connect enabled.
+			// when task metrics and health metrics are both disabled and there is a service connect task,
+			// and we should not include service connect this time, we also need to skip following execution
+			// to avoid invalid metrics sent to TCS
+			if !isServiceConnectTask || !includeServiceConnectStats {
+				continue
+			}
 		}
 
 		taskDef, exists := engine.tasksToDefinitions[taskArn]
@@ -431,19 +574,31 @@ func (engine *DockerStatsEngine) GetInstanceMetrics() (*ecstcs.MetricsMetadata, 
 			seelog.Debugf("Could not map task to definition, task: %s", taskArn)
 			continue
 		}
-
+		volMetrics := engine.getEBSVolumeMetrics(taskArn)
 		metricTaskArn := taskArn
 		taskMetric := &ecstcs.TaskMetric{
 			TaskArn:               &metricTaskArn,
 			TaskDefinitionFamily:  &taskDef.family,
 			TaskDefinitionVersion: &taskDef.version,
 			ContainerMetrics:      containerMetrics,
+			VolumeMetrics:         volMetrics,
+		}
+
+		if includeServiceConnectStats {
+			if serviceConnectStats, ok := engine.taskToServiceConnectStats[taskArn]; ok {
+				if !serviceConnectStats.HasStatsBeenSent() {
+					taskMetric.ServiceConnectMetricsWrapper = serviceConnectStats.GetStats()
+					seelog.Debugf("Adding service connect stats for task : %s", taskArn)
+					serviceConnectStats.SetStatsSent(true)
+				}
+			}
 		}
 		taskMetrics = append(taskMetrics, taskMetric)
 	}
 
 	if len(taskMetrics) == 0 {
 		// Not idle. Expect taskMetrics to be there.
+		seelog.Debugf("Return empty metrics error")
 		return nil, nil, EmptyMetricsError
 	}
 
@@ -486,7 +641,7 @@ func (engine *DockerStatsEngine) isIdle() bool {
 	engine.lock.RLock()
 	defer engine.lock.RUnlock()
 
-	return len(engine.tasksToContainers) == 0
+	return len(engine.tasksToContainers) == 0 && len(engine.taskToServiceConnectStats) == 0
 }
 
 func (engine *DockerStatsEngine) containerHealthsToMonitor() bool {
@@ -567,7 +722,7 @@ func (engine *DockerStatsEngine) getTaskHealthUnsafe(taskARN string) *ecstcs.Tas
 		containerHealth := &ecstcs.ContainerHealth{
 			ContainerName: aws.String(dockerContainer.Container.Name),
 			HealthStatus:  aws.String(healthInfo.Status.BackendStatus()),
-			StatusSince:   aws.Time(healthInfo.Since.UTC()),
+			StatusSince:   (*utils.Timestamp)(aws.Time(healthInfo.Since.UTC())),
 		}
 		containerHealths = append(containerHealths, containerHealth)
 	}
@@ -655,6 +810,8 @@ func newDockerContainerMetadataResolver(taskEngine ecsengine.TaskEngine) (*Docke
 }
 
 // taskContainerMetricsUnsafe gets all container metrics for a task arn.
+//
+//gocyclo:ignore
 func (engine *DockerStatsEngine) taskContainerMetricsUnsafe(taskArn string) ([]*ecstcs.ContainerMetric, error) {
 	containerMap, taskExists := engine.tasksToContainers[taskArn]
 	if !taskExists {
@@ -671,10 +828,20 @@ func (engine *DockerStatsEngine) taskContainerMetricsUnsafe(taskArn string) ([]*
 		if engine.stopTrackingContainerUnsafe(container, taskArn) {
 			continue
 		}
+		// age is used to determine if we should or should not expect missing metrics.
+		// this is because recently-started containers would normally not have their metrics
+		// queue filled yet.
+		age := time.Since(container.containerMetadata.StartedAt)
+		// gracePeriod is the time that containers are allowed to have missing metrics
+		// without throwing/logging errors.
+		gracePeriod := time.Second * 30
 
 		// CPU and Memory are both critical, so skip the container if either of these fail.
 		cpuStatsSet, err := container.statsQueue.GetCPUStatsSet()
 		if err != nil {
+			if age < gracePeriod {
+				continue
+			}
 			logger.Error("Error collecting cloudwatch metrics for container", logger.Fields{
 				field.Container: dockerID,
 				field.Error:     err,
@@ -683,6 +850,9 @@ func (engine *DockerStatsEngine) taskContainerMetricsUnsafe(taskArn string) ([]*
 		}
 		memoryStatsSet, err := container.statsQueue.GetMemoryStatsSet()
 		if err != nil {
+			if age < gracePeriod {
+				continue
+			}
 			logger.Error("Error collecting cloudwatch metrics for container", logger.Fields{
 				field.Container: dockerID,
 				field.Error:     err,
@@ -697,13 +867,26 @@ func (engine *DockerStatsEngine) taskContainerMetricsUnsafe(taskArn string) ([]*
 		}
 
 		storageStatsSet, err := container.statsQueue.GetStorageStatsSet()
-		if err != nil {
+		if err != nil && age > gracePeriod {
 			logger.Warn("Error getting storage stats for container", logger.Fields{
 				field.Container: dockerID,
 				field.Error:     err,
 			})
 		} else {
 			containerMetric.StorageStatsSet = storageStatsSet
+		}
+
+		restartStatsSet, err := container.statsQueue.GetRestartStatsSet()
+		if err != nil && age > gracePeriod {
+			// we expect to get an error here if there are no restart metrics,
+			// which would be common as it just means there is no restart policy on
+			// the container, so just log a debug message here.
+			logger.Debug("Unable to get restart stats for container", logger.Fields{
+				field.Container: dockerID,
+				field.Error:     err,
+			})
+		} else {
+			containerMetric.RestartStatsSet = restartStatsSet
 		}
 
 		task, err := engine.resolver.ResolveTask(dockerID)
@@ -713,31 +896,37 @@ func (engine *DockerStatsEngine) taskContainerMetricsUnsafe(taskArn string) ([]*
 				field.Error:     err,
 			})
 		} else {
-			// send network stats for default/bridge/nat/awsvpc network modes
-			if !task.IsNetworkModeAWSVPC() && container.containerMetadata.NetworkMode != hostNetworkMode &&
-				container.containerMetadata.NetworkMode != noneNetworkMode {
-				networkStatsSet, err := container.statsQueue.GetNetworkStatsSet()
-				if err != nil {
-					// we log the error and still continue to publish cpu, memory stats
-					logger.Warn("Error getting network stats for container", logger.Fields{
-						field.Container: dockerID,
-						field.Error:     err,
-					})
-				} else {
-					containerMetric.NetworkStatsSet = networkStatsSet
-				}
-			} else if task.IsNetworkModeAWSVPC() {
-				taskStatsMap, taskExistsInTaskStats := engine.taskToTaskStats[taskArn]
-				if !taskExistsInTaskStats {
-					return nil, fmt.Errorf("task not found")
-				}
-				if dockerContainer, err := engine.resolver.ResolveContainer(dockerID); err != nil {
-					seelog.Debugf("Could not map container ID to container, container: %s, err: %s", dockerID, err)
-				} else {
+			if dockerContainer, err := engine.resolver.ResolveContainer(dockerID); err != nil {
+				logger.Warn("Could not map container ID to container, container", logger.Fields{
+					field.DockerId: dockerID,
+					field.Error:    err,
+				})
+			} else {
+				// send network stats for default/bridge/nat/awsvpc network modes
+				if task.IsNetworkModeBridge() {
+					if task.IsServiceConnectEnabled() && dockerContainer.Container.Type == apicontainer.ContainerCNIPause {
+						seelog.Debug("Skip adding network stats for pause container in Service Connect enabled task")
+					} else {
+						networkStatsSet, err := container.statsQueue.GetNetworkStatsSet()
+						if err != nil && age > gracePeriod {
+							// we log the error and still continue to publish cpu, memory stats
+							logger.Warn("Error getting network stats for container", logger.Fields{
+								field.Container: dockerID,
+								field.Error:     err,
+							})
+						} else {
+							containerMetric.NetworkStatsSet = networkStatsSet
+						}
+					}
+				} else if task.IsNetworkModeAWSVPC() {
+					taskStatsMap, taskExistsInTaskStats := engine.taskToTaskStats[taskArn]
+					if !taskExistsInTaskStats {
+						return nil, fmt.Errorf("task not found")
+					}
 					// do not add network stats for pause container
 					if dockerContainer.Container.Type != apicontainer.ContainerCNIPause {
 						networkStats, err := taskStatsMap.StatsQueue.GetNetworkStatsSet()
-						if err != nil {
+						if err != nil && age > gracePeriod {
 							logger.Warn("Error getting network stats for container", logger.Fields{
 								field.TaskARN:   taskArn,
 								field.Container: dockerContainer.DockerID,
@@ -768,6 +957,10 @@ func (engine *DockerStatsEngine) doRemoveContainerUnsafe(container *StatsContain
 		// Delete will do nothing if the specified key doesn't exist.
 		delete(engine.tasksToDefinitions, taskArn)
 		seelog.Debugf("Deleted task from tasks, arn: %s", taskArn)
+
+		// Stop collecting service connect stats for this task
+		delete(engine.taskToServiceConnectStats, taskArn)
+		seelog.Debugf("Deleted task from the Service Connect stats watchlist, task ARN: %s", taskArn)
 	}
 
 	// Remove the container from health container watch list
@@ -792,7 +985,7 @@ func (engine *DockerStatsEngine) resetStatsUnsafe() {
 }
 
 // ContainerDockerStats returns the last stored raw docker stats object for a container
-func (engine *DockerStatsEngine) ContainerDockerStats(taskARN string, containerID string) (*types.StatsJSON, *NetworkStatsPerSec, error) {
+func (engine *DockerStatsEngine) ContainerDockerStats(taskARN string, containerID string) (*types.StatsJSON, *stats.NetworkStatsPerSec, error) {
 	engine.lock.RLock()
 	defer engine.lock.RUnlock()
 
@@ -834,4 +1027,132 @@ func (engine *DockerStatsEngine) ContainerDockerStats(taskARN string, containerI
 	}
 
 	return containerStats, containerNetworkRateStats, nil
+}
+
+// getTaskStatsToCollect returns a map of taskArns for which task metrics needs to collected
+func (engine *DockerStatsEngine) getTaskStatsToCollect() map[string]bool {
+	taskStatsToCollect := make(map[string]bool)
+	for taskArn := range engine.tasksToContainers {
+		if _, taskArnExists := taskStatsToCollect[taskArn]; !taskArnExists {
+			taskStatsToCollect[taskArn] = true
+		}
+	}
+	for taskArn := range engine.taskToServiceConnectStats {
+		if _, taskArnExists := taskStatsToCollect[taskArn]; !taskArnExists {
+			taskStatsToCollect[taskArn] = true
+		}
+	}
+	return taskStatsToCollect
+}
+
+// getServiceConnectStats invokes the workflow to retrieve all service connect
+// related metrics for all service connect enabled tasks
+func (engine *DockerStatsEngine) getServiceConnectStats() error {
+	var wg sync.WaitGroup
+
+	for taskArn := range engine.taskToServiceConnectStats {
+		wg.Add(1)
+		task, err := engine.resolver.ResolveTaskByARN(taskArn)
+		if err != nil {
+			return errors.Errorf("stats engine: task '%s' not found", taskArn)
+		}
+		// TODO [SC]: Check if task is service-connect enabled
+		serviceConnectStats, ok := engine.taskToServiceConnectStats[taskArn]
+		if !ok {
+			return errors.Errorf("task '%s' is not registered to collect service connect metrics", taskArn)
+		}
+		go func() {
+			serviceConnectStats.retrieveServiceConnectStats(task)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+func (engine *DockerStatsEngine) GetPublishServiceConnectTickerInterval() int32 {
+	engine.lock.RLock()
+	defer engine.lock.RUnlock()
+
+	return engine.publishServiceConnectTickerInterval
+}
+
+func (engine *DockerStatsEngine) SetPublishServiceConnectTickerInterval(publishServiceConnectTickerInterval int32) {
+	engine.lock.Lock()
+	defer engine.lock.Unlock()
+
+	engine.publishServiceConnectTickerInterval = publishServiceConnectTickerInterval
+}
+
+func (engine *DockerStatsEngine) GetPublishMetricsTicker() *time.Ticker {
+	return engine.publishMetricsTicker
+}
+
+func (engine *DockerStatsEngine) getEBSVolumeMetrics(taskArn string) []*ecstcs.VolumeMetric {
+	task, err := engine.resolver.ResolveTaskByARN(taskArn)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Unable to get corresponding task from dd with task arn: %s", taskArn))
+		return nil
+	}
+
+	if !task.IsEBSTaskAttachEnabled() {
+		logger.Debug("Task not EBS-backed, skip gathering EBS volume metrics.", logger.Fields{
+			"taskArn": taskArn,
+		})
+		return nil
+	}
+
+	// TODO: Remove the CSI client from the stats engine and just always have the CSI client created
+	// since a new connection is created regardless and it'll make the stats engine less stateful
+	if engine.csiClient == nil {
+		client := csiclient.NewCSIClient(filepath.Join(csiclient.DefaultSocketHostPath, csiclient.DefaultImageName, csiclient.DefaultSocketName))
+		engine.csiClient = &client
+	}
+	return engine.fetchEBSVolumeMetrics(task, taskArn)
+}
+
+func (engine *DockerStatsEngine) fetchEBSVolumeMetrics(task *apitask.Task, taskArn string) []*ecstcs.VolumeMetric {
+	var metrics []*ecstcs.VolumeMetric
+	for _, tv := range task.Volumes {
+		if tv.Volume.GetType() == taskresourcevolume.EBSVolumeType {
+			volumeId := tv.Volume.GetVolumeId()
+			hostPath := tv.Volume.Source()
+			volumeName := tv.Volume.GetVolumeName()
+			metric, err := engine.getVolumeMetricsWithTimeout(volumeId, hostPath)
+			if err != nil {
+				logger.Error("Failed to gather metrics for EBS volume", logger.Fields{
+					"VolumeId":             volumeId,
+					"SourceVolumeHostPath": hostPath,
+					"Error":                err,
+				})
+				continue
+			}
+			usedBytes := aws.Float64((float64)(metric.Used))
+			totalBytes := aws.Float64((float64)(metric.Capacity))
+			metrics = append(metrics, &ecstcs.VolumeMetric{
+				VolumeId:   aws.String(volumeId),
+				VolumeName: aws.String(volumeName),
+				Utilized: &ecstcs.UDoubleCWStatsSet{
+					Max:         usedBytes,
+					Min:         usedBytes,
+					SampleCount: aws.Int64(1),
+					Sum:         usedBytes,
+				},
+				Size: &ecstcs.UDoubleCWStatsSet{
+					Max:         totalBytes,
+					Min:         totalBytes,
+					SampleCount: aws.Int64(1),
+					Sum:         totalBytes,
+				},
+			})
+		}
+	}
+	return metrics
+}
+
+func (engine *DockerStatsEngine) getVolumeMetricsWithTimeout(volumeId, hostPath string) (*csiclient.Metrics, error) {
+	derivedCtx, cancel := context.WithTimeout(engine.ctx, getVolumeMetricsTimeout)
+	// releases resources if GetVolumeMetrics finishes before timeout
+	defer cancel()
+	return engine.csiClient.GetVolumeMetrics(derivedCtx, volumeId, hostPath)
 }

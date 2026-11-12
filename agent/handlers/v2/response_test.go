@@ -19,23 +19,27 @@ package v2
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
-	mock_api "github.com/aws/amazon-ecs-agent/agent/api/mocks"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	mock_dockerstate "github.com/aws/amazon-ecs-agent/agent/engine/dockerstate/mocks"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	mock_ecs "github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs/mocks"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	tmdsv2 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v2"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/docker/docker/api/types"
 	"github.com/golang/mock/gomock"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -56,6 +60,7 @@ const (
 	availabilityZone     = "us-west-2b"
 	containerInstanceArn = "containerInstance-test"
 	hostIp               = "0.0.0.0"
+	testEndpointID       = "test-endpoint-id"
 )
 
 func TestTaskResponse(t *testing.T) {
@@ -63,7 +68,7 @@ func TestTaskResponse(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
+	ecsClient := mock_ecs.NewMockECSClient(ctrl)
 	now := time.Now()
 	task := &apitask.Task{
 		Arn:                 taskARN,
@@ -71,9 +76,9 @@ func TestTaskResponse(t *testing.T) {
 		Version:             version,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
 		KnownStatusUnsafe:   apitaskstatus.TaskRunning,
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
@@ -127,7 +132,7 @@ func TestTaskResponse(t *testing.T) {
 		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
 	)
 
-	taskResponse, err := NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, false)
+	taskResponse, err := NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, false)
 	assert.NoError(t, err)
 	_, err = json.Marshal(taskResponse)
 	assert.NoError(t, err)
@@ -143,7 +148,7 @@ func TestTaskResponse(t *testing.T) {
 		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
 	)
 	// verify that 'v4' response without log driver or options returns blank fields as well
-	taskResponse, err = NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, true)
+	taskResponse, err = NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, true)
 	assert.NoError(t, err)
 	_, err = json.Marshal(taskResponse)
 	assert.NoError(t, err)
@@ -159,7 +164,7 @@ func TestTaskResponseWithV4Metadata(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
+	ecsClient := mock_ecs.NewMockECSClient(ctrl)
 	now := time.Now()
 	task := &apitask.Task{
 		Arn:                 taskARN,
@@ -167,9 +172,9 @@ func TestTaskResponseWithV4Metadata(t *testing.T) {
 		Version:             version,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
 		KnownStatusUnsafe:   apitaskstatus.TaskRunning,
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
@@ -226,7 +231,7 @@ func TestTaskResponseWithV4Metadata(t *testing.T) {
 		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
 	)
 
-	taskResponse, err := NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, true)
+	taskResponse, err := NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false, true)
 	assert.NoError(t, err)
 	_, err = json.Marshal(taskResponse)
 	assert.NoError(t, err)
@@ -300,15 +305,19 @@ func TestContainerResponse(t *testing.T) {
 				Container:  container,
 			}
 			task := &apitask.Task{
-				ENIs: []*apieni.ENI{
+				ENIs: []*ni.NetworkInterface{
 					{
-						IPV4Addresses: []*apieni.ENIIPV4Address{
+						IPV4Addresses: []*ni.IPV4Address{
 							{
 								Address: eniIPv4Address,
 							},
 						},
 					},
 				},
+			}
+			expectedHealthStatus := tmdsv2.HealthStatus{
+				Status: "HEALTHY",
+				Since:  container.Health.Since,
 			}
 			gomock.InOrder(
 				state.EXPECT().ContainerByID(containerID).Return(dockerContainer, true),
@@ -318,6 +327,9 @@ func TestContainerResponse(t *testing.T) {
 			containerResponse, err := NewContainerResponseFromState(containerID, state, false)
 			assert.NoError(t, err)
 			assert.Equal(t, containerResponse.Health == nil, tc.result)
+			if !tc.result {
+				assert.Equal(t, *containerResponse.Health, expectedHealthStatus)
+			}
 			_, err = json.Marshal(containerResponse)
 			assert.NoError(t, err)
 		})
@@ -328,6 +340,9 @@ func TestTaskResponseMarshal(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	nowStr := "2023-05-17T22:55:55.745786125Z"
+	now, err := time.Parse("2006-01-02T15:04:05.999999999Z", nowStr)
+	require.NoError(t, err)
 	expectedTaskResponseMap := map[string]interface{}{
 		"Cluster":          cluster,
 		"TaskARN":          taskARN,
@@ -365,6 +380,11 @@ func TestTaskResponseMarshal(t *testing.T) {
 						"NetworkMode": "awsvpc",
 					},
 				},
+				"Health": map[string]interface{}{
+					"status":      "HEALTHY",
+					"statusSince": nowStr,
+					"output":      "health check output",
+				},
 			},
 		},
 		"ContainerInstanceTags": map[string]interface{}{
@@ -378,7 +398,7 @@ func TestTaskResponseMarshal(t *testing.T) {
 	}
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
+	ecsClient := mock_ecs.NewMockECSClient(ctrl)
 
 	task := &apitask.Task{
 		Arn:                 taskARN,
@@ -386,9 +406,9 @@ func TestTaskResponseMarshal(t *testing.T) {
 		Version:             version,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
 		KnownStatusUnsafe:   apitaskstatus.TaskRunning,
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
@@ -407,6 +427,12 @@ func TestTaskResponseMarshal(t *testing.T) {
 				ContainerPort: 80,
 				Protocol:      apicontainer.TransportProtocolTCP,
 			},
+		},
+		HealthCheckType: apicontainer.DockerHealthCheckType,
+		Health: apicontainer.HealthStatus{
+			Status: apicontainerstatus.ContainerHealthy,
+			Since:  &now,
+			Output: "health check output",
 		},
 	}
 
@@ -430,29 +456,30 @@ func TestTaskResponseMarshal(t *testing.T) {
 	gomock.InOrder(
 		state.EXPECT().TaskByArn(taskARN).Return(task, true),
 		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
-		ecsClient.EXPECT().GetResourceTags(containerInstanceArn).Return([]*ecs.Tag{
-			&ecs.Tag{
+		state.EXPECT().ContainerNameByV3EndpointID(testEndpointID).Return(containerName, true),
+		ecsClient.EXPECT().GetResourceTags(gomock.Any(), containerInstanceArn).Return([]ecstypes.Tag{
+			{
 				Key:   &contInstTag1Key,
 				Value: &contInstTag1Val,
 			},
-			&ecs.Tag{
+			{
 				Key:   &contInstTag2Key,
 				Value: &contInstTag2Val,
 			},
 		}, nil),
-		ecsClient.EXPECT().GetResourceTags(taskARN).Return([]*ecs.Tag{
-			&ecs.Tag{
+		ecsClient.EXPECT().GetResourceTags(gomock.Any(), taskARN).Return([]ecstypes.Tag{
+			{
 				Key:   &taskTag1Key,
 				Value: &taskTag1Val,
 			},
-			&ecs.Tag{
+			{
 				Key:   &taskTag2Key,
 				Value: &taskTag2Val,
 			},
 		}, nil),
 	)
 
-	taskResponse, err := NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, true, false)
+	taskResponse, err := NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, true, false)
 	assert.NoError(t, err)
 
 	taskResponseJSON, err := json.Marshal(taskResponse)
@@ -554,9 +581,9 @@ func TestContainerResponseMarshal(t *testing.T) {
 		Container:  container,
 	}
 	task := &apitask.Task{
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
@@ -593,7 +620,7 @@ func TestTaskResponseWithV4TagsError(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
+	ecsClient := mock_ecs.NewMockECSClient(ctrl)
 	now := time.Now()
 	task := &apitask.Task{
 		Arn:                 taskARN,
@@ -601,9 +628,9 @@ func TestTaskResponseWithV4TagsError(t *testing.T) {
 		Version:             version,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
 		KnownStatusUnsafe:   apitaskstatus.TaskRunning,
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
@@ -656,35 +683,101 @@ func TestTaskResponseWithV4TagsError(t *testing.T) {
 		},
 	}
 
-	errCode := "ThrottlingException"
 	errMessage := "Rate exceeded"
 	errStatusCode := 400
 	containerTagsRequestId := "cef9da77-aee7-431d-84d5-f92b2d342c51"
 	taskTagsRequestId := "45dbbc67-0c60-4248-855e-14fdf4c11870"
-	containerTagsErr := awserr.NewRequestFailure(awserr.Error(awserr.New(errCode, errMessage, errors.New(""))), errStatusCode, containerTagsRequestId)
-	taskTagsError := awserr.NewRequestFailure(awserr.Error(awserr.New(errCode, errMessage, errors.New(""))), errStatusCode, taskTagsRequestId)
+	containerTagsErr := &awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{
+					StatusCode: errStatusCode,
+				},
+			},
+			Err: &ecstypes.LimitExceededException{Message: &errMessage},
+		},
+		RequestID: containerTagsRequestId,
+	}
+	taskTagsErr := &awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{
+				Response: &http.Response{
+					StatusCode: errStatusCode,
+				},
+			},
+			Err: &ecstypes.LimitExceededException{Message: &errMessage},
+		},
+		RequestID: taskTagsRequestId,
+	}
 
 	gomock.InOrder(
 		state.EXPECT().TaskByArn(taskARN).Return(task, true),
 		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
-		ecsClient.EXPECT().GetResourceTags(containerInstanceArn).Return(nil, containerTagsErr),
-		ecsClient.EXPECT().GetResourceTags(taskARN).Return(nil, taskTagsError),
+		state.EXPECT().ContainerNameByV3EndpointID(testEndpointID).Return(containerName, true),
+		ecsClient.EXPECT().GetResourceTags(gomock.Any(), containerInstanceArn).Return(nil, containerTagsErr),
+		ecsClient.EXPECT().GetResourceTags(gomock.Any(), taskARN).Return(nil, taskTagsErr),
 	)
 
-	taskWithTagsResponse, err := NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, true, true)
+	taskWithTagsResponse, err := NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, true, true)
 	assert.NoError(t, err)
 	_, err = json.Marshal(taskWithTagsResponse)
 	assert.NoError(t, err)
 	assert.Equal(t, taskWithTagsResponse.Errors[0].ErrorField, "ContainerInstanceTags")
-	assert.Equal(t, taskWithTagsResponse.Errors[0].ErrorCode, errCode)
+	assert.Equal(t, taskWithTagsResponse.Errors[0].ErrorCode, (&ecstypes.LimitExceededException{}).ErrorCode())
 	assert.Equal(t, taskWithTagsResponse.Errors[0].ErrorMessage, errMessage)
 	assert.Equal(t, taskWithTagsResponse.Errors[0].StatusCode, errStatusCode)
 	assert.Equal(t, taskWithTagsResponse.Errors[0].RequestId, containerTagsRequestId)
 	assert.Equal(t, taskWithTagsResponse.Errors[0].ResourceARN, containerInstanceArn)
 	assert.Equal(t, taskWithTagsResponse.Errors[1].ErrorField, "TaskTags")
-	assert.Equal(t, taskWithTagsResponse.Errors[1].ErrorCode, errCode)
+	assert.Equal(t, taskWithTagsResponse.Errors[1].ErrorCode, (&ecstypes.LimitExceededException{}).ErrorCode())
 	assert.Equal(t, taskWithTagsResponse.Errors[1].ErrorMessage, errMessage)
 	assert.Equal(t, taskWithTagsResponse.Errors[1].StatusCode, errStatusCode)
 	assert.Equal(t, taskWithTagsResponse.Errors[1].RequestId, taskTagsRequestId)
 	assert.Equal(t, taskWithTagsResponse.Errors[1].ResourceARN, taskARN)
+}
+
+// Tests that TMDS Health Status created by metadata endpoint v2 is marshaled to the same JSON
+// as the source container health status. This test makes sure that the change in TMDS response
+// model from using container health status directly to using a new TMDS Health Status type
+// is transparent to customers.
+func TestDockerContainerHealthToV2HealthJSON(t *testing.T) {
+	tcs := []struct {
+		name   string
+		status apicontainerstatus.ContainerHealthStatus
+	}{
+		{
+			name:   "container healthy",
+			status: apicontainerstatus.ContainerHealthy,
+		},
+		{
+			name:   "container unhealthy",
+			status: apicontainerstatus.ContainerUnhealthy,
+		},
+		{
+			name:   "container health unknown",
+			status: apicontainerstatus.ContainerHealthUnknown,
+		},
+		{
+			name:   "container health invalid",
+			status: 2345,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			apiHealth := &apicontainer.HealthStatus{
+				Status:   tc.status,
+				Since:    &now,
+				ExitCode: 5,
+				Output:   "some output",
+			}
+			apiHealthJSON, err := json.Marshal(apiHealth)
+			require.NoError(t, err)
+
+			tmdsHealthJSON, err := json.Marshal(dockerContainerHealthToV2Health(*apiHealth))
+			require.NoError(t, err)
+
+			assert.Equal(t, apiHealthJSON, tmdsHealthJSON)
+		})
+	}
 }

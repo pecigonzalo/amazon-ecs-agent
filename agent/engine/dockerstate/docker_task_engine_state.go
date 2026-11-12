@@ -19,9 +19,10 @@ import (
 	"sync"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
+	apiresource "github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment/resource"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 	"github.com/cihub/seelog"
 )
 
@@ -30,8 +31,11 @@ import (
 type TaskEngineState interface {
 	// AllTasks returns all of the tasks
 	AllTasks() []*apitask.Task
+	// AllExternalTasks returns all tasks with IsInternal==false (i.e. customer-initiated tasks).
+	// Currently, ServiceConnect AppNet Relay task is the only internal task.
+	AllExternalTasks() []*apitask.Task
 	// AllENIAttachments returns all of the eni attachments
-	AllENIAttachments() []*apieni.ENIAttachment
+	AllENIAttachments() []*ni.ENIAttachment
 	// AllImageStates returns all of the image.ImageStates
 	AllImageStates() []*image.ImageState
 	// GetAllContainerIDs returns all of the Container Ids
@@ -57,11 +61,11 @@ type TaskEngineState interface {
 	// AddImageState adds an image.ImageState to be stored
 	AddImageState(imageState *image.ImageState)
 	// AddENIAttachment adds an eni attachment from acs to be stored
-	AddENIAttachment(eni *apieni.ENIAttachment)
+	AddENIAttachment(eni *ni.ENIAttachment)
 	// RemoveENIAttachment removes an eni attachment to stop tracking
 	RemoveENIAttachment(mac string)
 	// ENIByMac returns the specific ENIAttachment of the given mac address
-	ENIByMac(mac string) (*apieni.ENIAttachment, bool)
+	ENIByMac(mac string) (*ni.ENIAttachment, bool)
 	// RemoveTask removes a task from the state
 	RemoveTask(task *apitask.Task)
 	// Reset resets all the fileds in the state
@@ -78,6 +82,20 @@ type TaskEngineState interface {
 	DockerIDByV3EndpointID(v3EndpointID string) (string, bool)
 	// TaskARNByV3EndpointID returns a taskARN for a given v3 endpoint ID
 	TaskARNByV3EndpointID(v3EndpointID string) (string, bool)
+	// ContainerNameByV3EndpointID returns the container name for a given TMDS v3 endpoint ID
+	ContainerNameByV3EndpointID(v3EndpointID string) (string, bool)
+	// GetAllEBSAttachments returns all of the ebs attachments
+	GetAllEBSAttachments() []*apiresource.ResourceAttachment
+	// AllPendingEBSAttachments reutrns all of the ebs attachments that haven't sent a state change
+	GetAllPendingEBSAttachments() []*apiresource.ResourceAttachment
+	// GetAllPendingEBSAttachmentWithKey returns a map of all pending ebs attachments along with the corresponding volume ID as the key
+	GetAllPendingEBSAttachmentsWithKey() map[string]*apiresource.ResourceAttachment
+	// AddEBSAttachment adds an ebs attachment from acs to be stored
+	AddEBSAttachment(ebs *apiresource.ResourceAttachment)
+	// RemoveEBSAttachment removes an ebs attachment to stop tracking
+	RemoveEBSAttachment(volumeId string)
+	// EBSByVolumeId returns the specific EBSAttachment of the given volume ID
+	GetEBSByVolumeId(volumeId string) (*apiresource.ResourceAttachment, bool)
 
 	json.Marshaler
 	json.Unmarshaler
@@ -104,7 +122,8 @@ type DockerTaskEngineState struct {
 	taskToID               map[string]map[string]*apicontainer.DockerContainer // taskarn -> (containername -> c.DockerContainer)
 	taskToPulledContainer  map[string]map[string]*apicontainer.DockerContainer // taskarn -> (containername -> c.DockerContainer)
 	idToContainer          map[string]*apicontainer.DockerContainer            // DockerId -> c.DockerContainer
-	eniAttachments         map[string]*apieni.ENIAttachment                    // ENIMac -> apieni.ENIAttachment
+	ebsAttachments         map[string]*apiresource.ResourceAttachment          // VolumeID -> apiresource.ResourceAttachment
+	eniAttachments         map[string]*ni.ENIAttachment                        // ENIMac -> ni.ENIAttachment
 	imageStates            map[string]*image.ImageState
 	ipToTask               map[string]string // ip address -> task arn
 	v3EndpointIDToTask     map[string]string // container's v3 endpoint id -> taskarn
@@ -132,7 +151,8 @@ func (state *DockerTaskEngineState) initializeDockerTaskEngineState() {
 	state.taskToPulledContainer = make(map[string]map[string]*apicontainer.DockerContainer)
 	state.idToContainer = make(map[string]*apicontainer.DockerContainer)
 	state.imageStates = make(map[string]*image.ImageState)
-	state.eniAttachments = make(map[string]*apieni.ENIAttachment)
+	state.ebsAttachments = make(map[string]*apiresource.ResourceAttachment)
+	state.eniAttachments = make(map[string]*ni.ENIAttachment)
 	state.ipToTask = make(map[string]string)
 	state.v3EndpointIDToTask = make(map[string]string)
 	state.v3EndpointIDToDockerID = make(map[string]string)
@@ -152,13 +172,32 @@ func (state *DockerTaskEngineState) AllTasks() []*apitask.Task {
 }
 
 func (state *DockerTaskEngineState) allTasksUnsafe() []*apitask.Task {
+	return state.getFilteredTasksUnsafe(false)
+}
+
+// AllExternalTasks returns all tasks with IsInternal==false (i.e. all customer-initiated tasks)
+func (state *DockerTaskEngineState) AllExternalTasks() []*apitask.Task {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	return state.allExternalTasksUnsafe()
+}
+
+func (state *DockerTaskEngineState) allExternalTasksUnsafe() []*apitask.Task {
+	return state.getFilteredTasksUnsafe(true)
+}
+
+func (state *DockerTaskEngineState) getFilteredTasksUnsafe(excludeInternal bool) []*apitask.Task {
 	ret := make([]*apitask.Task, len(state.tasks))
 	ndx := 0
 	for _, task := range state.tasks {
+		if excludeInternal && task.IsInternal {
+			continue
+		}
 		ret[ndx] = task
 		ndx++
 	}
-	return ret
+	return ret[:ndx]
 }
 
 // AllImageStates returns all of the image.ImageStates
@@ -178,15 +217,15 @@ func (state *DockerTaskEngineState) allImageStatesUnsafe() []*image.ImageState {
 }
 
 // AllENIAttachments returns all the enis managed by ecs on the instance
-func (state *DockerTaskEngineState) AllENIAttachments() []*apieni.ENIAttachment {
+func (state *DockerTaskEngineState) AllENIAttachments() []*ni.ENIAttachment {
 	state.lock.RLock()
 	defer state.lock.RUnlock()
 
 	return state.allENIAttachmentsUnsafe()
 }
 
-func (state *DockerTaskEngineState) allENIAttachmentsUnsafe() []*apieni.ENIAttachment {
-	var allENIAttachments []*apieni.ENIAttachment
+func (state *DockerTaskEngineState) allENIAttachmentsUnsafe() []*ni.ENIAttachment {
+	var allENIAttachments []*ni.ENIAttachment
 	for _, v := range state.eniAttachments {
 		allENIAttachments = append(allENIAttachments, v)
 	}
@@ -195,7 +234,7 @@ func (state *DockerTaskEngineState) allENIAttachmentsUnsafe() []*apieni.ENIAttac
 }
 
 // ENIByMac returns the eni object that match the give mac address
-func (state *DockerTaskEngineState) ENIByMac(mac string) (*apieni.ENIAttachment, bool) {
+func (state *DockerTaskEngineState) ENIByMac(mac string) (*ni.ENIAttachment, bool) {
 	state.lock.RLock()
 	defer state.lock.RUnlock()
 
@@ -204,7 +243,7 @@ func (state *DockerTaskEngineState) ENIByMac(mac string) (*apieni.ENIAttachment,
 }
 
 // AddENIAttachment adds the eni into the state
-func (state *DockerTaskEngineState) AddENIAttachment(eniAttachment *apieni.ENIAttachment) {
+func (state *DockerTaskEngineState) AddENIAttachment(eniAttachment *ni.ENIAttachment) {
 	if eniAttachment == nil {
 		seelog.Debug("Cannot add empty eni attachment information")
 		return
@@ -234,6 +273,101 @@ func (state *DockerTaskEngineState) RemoveENIAttachment(mac string) {
 	} else {
 		seelog.Debugf("Delete non-existed eni attachment: %v", mac)
 	}
+}
+
+// GetAllEBSAttachments returns all the ebs volumes managed by ecs on the instance
+func (state *DockerTaskEngineState) GetAllEBSAttachments() []*apiresource.ResourceAttachment {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	return state.allEBSAttachmentsUnsafe()
+}
+
+func (state *DockerTaskEngineState) allEBSAttachmentsUnsafe() []*apiresource.ResourceAttachment {
+	var allEBSAttachments []*apiresource.ResourceAttachment
+	for _, v := range state.ebsAttachments {
+		allEBSAttachments = append(allEBSAttachments, v)
+	}
+	return allEBSAttachments
+}
+
+// GetAllPendingEBSAttachments returns all the ebs volumes managed by ecs on the instance that haven't been found attached on the host
+func (state *DockerTaskEngineState) GetAllPendingEBSAttachments() []*apiresource.ResourceAttachment {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	return state.allPendingEBSAttachmentsUnsafe()
+}
+
+func (state *DockerTaskEngineState) allPendingEBSAttachmentsUnsafe() []*apiresource.ResourceAttachment {
+	var pendingEBSAttachments []*apiresource.ResourceAttachment
+	for _, v := range state.ebsAttachments {
+		if !v.IsAttached() || !v.IsSent() {
+			pendingEBSAttachments = append(pendingEBSAttachments, v)
+		}
+	}
+	return pendingEBSAttachments
+}
+
+// GetAllPendingEBSAttachmentsWithKey returns all the ebs volumes managed by ecs on the instance that haven't been found attached on the host as a map
+// with the corresponding volume ID as the key
+func (state *DockerTaskEngineState) GetAllPendingEBSAttachmentsWithKey() map[string]*apiresource.ResourceAttachment {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	return state.allPendingEBSAttachmentsWithKeyUnsafe()
+}
+
+func (state *DockerTaskEngineState) allPendingEBSAttachmentsWithKeyUnsafe() map[string]*apiresource.ResourceAttachment {
+	pendingEBSAttachments := make(map[string]*apiresource.ResourceAttachment)
+	for k, v := range state.ebsAttachments {
+		if !v.IsAttached() || !v.IsSent() {
+			pendingEBSAttachments[k] = v
+		}
+	}
+	return pendingEBSAttachments
+}
+
+// AddEBSAttachment adds the ebs volume to state
+func (state *DockerTaskEngineState) AddEBSAttachment(ebsAttachment *apiresource.ResourceAttachment) {
+	if ebsAttachment == nil {
+		seelog.Debug("Cannot add empty ebs attachment information")
+		return
+	}
+	state.lock.Lock()
+	defer state.lock.Unlock()
+	volumeId := ebsAttachment.AttachmentProperties[apiresource.VolumeIdKey]
+	if _, ok := state.ebsAttachments[volumeId]; !ok {
+		state.ebsAttachments[volumeId] = ebsAttachment
+		seelog.Debugf("Successfully added EBS attachment: %v", ebsAttachment.EBSToString())
+	} else {
+		seelog.Debugf("Duplicate ebs attachment information: %v", ebsAttachment.EBSToString())
+	}
+}
+
+// RemoveEBSAttachment removes the ebs volume from state and stops managing
+func (state *DockerTaskEngineState) RemoveEBSAttachment(volumeId string) {
+	if volumeId == "" {
+		seelog.Debug("Cannot remove empty ebs attachment information")
+		return
+	}
+	state.lock.Lock()
+	defer state.lock.Unlock()
+	if ebs, ok := state.ebsAttachments[volumeId]; ok {
+		delete(state.ebsAttachments, volumeId)
+		seelog.Debugf("Successfully deleted EBS attachment: %v", ebs.EBSToString())
+	} else {
+		seelog.Debugf("RemoveEBSAttachment: The requested EBS attachment with volume ID: %v does not exist", volumeId)
+	}
+}
+
+// GetEBSByVolumeId returns the ebs object that matches the given volume ID
+func (state *DockerTaskEngineState) GetEBSByVolumeId(volumeId string) (*apiresource.ResourceAttachment, bool) {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	ebs, ok := state.ebsAttachments[volumeId]
+	return ebs, ok
 }
 
 // GetAllContainerIDs returns all of the Container Ids
@@ -580,4 +714,23 @@ func (state *DockerTaskEngineState) TaskARNByV3EndpointID(v3EndpointID string) (
 
 	taskArn, ok := state.v3EndpointIDToTask[v3EndpointID]
 	return taskArn, ok
+}
+
+// ContainerNameByV3EndpointID returns the container name for a given TMDS v3 endpoint ID
+func (state *DockerTaskEngineState) ContainerNameByV3EndpointID(v3EndpointID string) (string, bool) {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	dockerContainerID, ok := state.v3EndpointIDToDockerID[v3EndpointID]
+	if !ok {
+		return "", false
+	}
+
+	dockerContainer, ok := state.idToContainer[dockerContainerID]
+	if !ok {
+		return "", false
+	}
+
+	// Extract the name of the container specified in the ECS task definition
+	return dockerContainer.Container.Name, true
 }

@@ -21,48 +21,48 @@ package mock_gpu
 import (
 	reflect "reflect"
 
-	ecs "github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
+	types "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockGPUManager is a mock of GPUManager interface
+// MockGPUManager is a mock of GPUManager interface.
 type MockGPUManager struct {
 	ctrl     *gomock.Controller
 	recorder *MockGPUManagerMockRecorder
 }
 
-// MockGPUManagerMockRecorder is the mock recorder for MockGPUManager
+// MockGPUManagerMockRecorder is the mock recorder for MockGPUManager.
 type MockGPUManagerMockRecorder struct {
 	mock *MockGPUManager
 }
 
-// NewMockGPUManager creates a new mock instance
+// NewMockGPUManager creates a new mock instance.
 func NewMockGPUManager(ctrl *gomock.Controller) *MockGPUManager {
 	mock := &MockGPUManager{ctrl: ctrl}
 	mock.recorder = &MockGPUManagerMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockGPUManager) EXPECT() *MockGPUManagerMockRecorder {
 	return m.recorder
 }
 
-// GetDevices mocks base method
-func (m *MockGPUManager) GetDevices() []*ecs.PlatformDevice {
+// GetDevices mocks base method.
+func (m *MockGPUManager) GetDevices() []types.PlatformDevice {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetDevices")
-	ret0, _ := ret[0].([]*ecs.PlatformDevice)
+	ret0, _ := ret[0].([]types.PlatformDevice)
 	return ret0
 }
 
-// GetDevices indicates an expected call of GetDevices
+// GetDevices indicates an expected call of GetDevices.
 func (mr *MockGPUManagerMockRecorder) GetDevices() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDevices", reflect.TypeOf((*MockGPUManager)(nil).GetDevices))
 }
 
-// GetDriverVersion mocks base method
+// GetDriverVersion mocks base method.
 func (m *MockGPUManager) GetDriverVersion() string {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetDriverVersion")
@@ -70,13 +70,13 @@ func (m *MockGPUManager) GetDriverVersion() string {
 	return ret0
 }
 
-// GetDriverVersion indicates an expected call of GetDriverVersion
+// GetDriverVersion indicates an expected call of GetDriverVersion.
 func (mr *MockGPUManagerMockRecorder) GetDriverVersion() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDriverVersion", reflect.TypeOf((*MockGPUManager)(nil).GetDriverVersion))
 }
 
-// GetGPUIDsUnsafe mocks base method
+// GetGPUIDsUnsafe mocks base method.
 func (m *MockGPUManager) GetGPUIDsUnsafe() []string {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetGPUIDsUnsafe")
@@ -84,13 +84,69 @@ func (m *MockGPUManager) GetGPUIDsUnsafe() []string {
 	return ret0
 }
 
-// GetGPUIDsUnsafe indicates an expected call of GetGPUIDsUnsafe
+// GetGPUIDsUnsafe indicates an expected call of GetGPUIDsUnsafe.
 func (mr *MockGPUManagerMockRecorder) GetGPUIDsUnsafe() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetGPUIDsUnsafe", reflect.TypeOf((*MockGPUManager)(nil).GetGPUIDsUnsafe))
 }
 
-// Initialize mocks base method
+// GetGPUMemoryMiBUnsafe mocks base method.
+func (m *MockGPUManager) GetGPUMemoryMiBUnsafe() map[string]uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetGPUMemoryMiBUnsafe")
+	ret0, _ := ret[0].(map[string]uint64)
+	return ret0
+}
+
+// GetGPUMemoryMiBUnsafe indicates an expected call of GetGPUMemoryMiBUnsafe.
+func (mr *MockGPUManagerMockRecorder) GetGPUMemoryMiBUnsafe() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetGPUMemoryMiBUnsafe", reflect.TypeOf((*MockGPUManager)(nil).GetGPUMemoryMiBUnsafe))
+}
+
+// GetHasVGPU mocks base method.
+func (m *MockGPUManager) GetHasVGPU() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetHasVGPU")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// GetHasVGPU indicates an expected call of GetHasVGPU.
+func (mr *MockGPUManagerMockRecorder) GetHasVGPU() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetHasVGPU", reflect.TypeOf((*MockGPUManager)(nil).GetHasVGPU))
+}
+
+// GetMpsControlBinaryPresent mocks base method.
+func (m *MockGPUManager) GetMpsControlBinaryPresent() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetMpsControlBinaryPresent")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// GetMpsControlBinaryPresent indicates an expected call of GetMpsControlBinaryPresent.
+func (mr *MockGPUManagerMockRecorder) GetMpsControlBinaryPresent() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMpsControlBinaryPresent", reflect.TypeOf((*MockGPUManager)(nil).GetMpsControlBinaryPresent))
+}
+
+// GetMpsServiceEnabled mocks base method.
+func (m *MockGPUManager) GetMpsServiceEnabled() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetMpsServiceEnabled")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// GetMpsServiceEnabled indicates an expected call of GetMpsServiceEnabled.
+func (mr *MockGPUManagerMockRecorder) GetMpsServiceEnabled() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMpsServiceEnabled", reflect.TypeOf((*MockGPUManager)(nil).GetMpsServiceEnabled))
+}
+
+// Initialize mocks base method.
 func (m *MockGPUManager) Initialize() error {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Initialize")
@@ -98,43 +154,43 @@ func (m *MockGPUManager) Initialize() error {
 	return ret0
 }
 
-// Initialize indicates an expected call of Initialize
+// Initialize indicates an expected call of Initialize.
 func (mr *MockGPUManagerMockRecorder) Initialize() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Initialize", reflect.TypeOf((*MockGPUManager)(nil).Initialize))
 }
 
-// SetDevices mocks base method
+// SetDevices mocks base method.
 func (m *MockGPUManager) SetDevices() {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "SetDevices")
 }
 
-// SetDevices indicates an expected call of SetDevices
+// SetDevices indicates an expected call of SetDevices.
 func (mr *MockGPUManagerMockRecorder) SetDevices() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetDevices", reflect.TypeOf((*MockGPUManager)(nil).SetDevices))
 }
 
-// SetDriverVersion mocks base method
+// SetDriverVersion mocks base method.
 func (m *MockGPUManager) SetDriverVersion(arg0 string) {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "SetDriverVersion", arg0)
 }
 
-// SetDriverVersion indicates an expected call of SetDriverVersion
+// SetDriverVersion indicates an expected call of SetDriverVersion.
 func (mr *MockGPUManagerMockRecorder) SetDriverVersion(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetDriverVersion", reflect.TypeOf((*MockGPUManager)(nil).SetDriverVersion), arg0)
 }
 
-// SetGPUIDs mocks base method
+// SetGPUIDs mocks base method.
 func (m *MockGPUManager) SetGPUIDs(arg0 []string) {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "SetGPUIDs", arg0)
 }
 
-// SetGPUIDs indicates an expected call of SetGPUIDs
+// SetGPUIDs indicates an expected call of SetGPUIDs.
 func (mr *MockGPUManagerMockRecorder) SetGPUIDs(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetGPUIDs", reflect.TypeOf((*MockGPUManager)(nil).SetGPUIDs), arg0)

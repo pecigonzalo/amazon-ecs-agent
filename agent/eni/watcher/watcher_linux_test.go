@@ -31,15 +31,16 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 
 	mock_dockerstate "github.com/aws/amazon-ecs-agent/agent/engine/dockerstate/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/eni/netlinkwrapper"
-	mock_netlinkwrapper "github.com/aws/amazon-ecs-agent/agent/eni/netlinkwrapper/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/eni/udevwrapper"
 	mock_udevwrapper "github.com/aws/amazon-ecs-agent/agent/eni/udevwrapper/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper"
+	mock_netlinkwrapper "github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper/mocks"
 )
 
 const (
@@ -83,10 +84,12 @@ func TestWatcherInit(t *testing.T) {
 	assert.NoError(t, err)
 
 	taskEngineState := dockerstate.NewTaskEngineState()
-	taskEngineState.AddENIAttachment(&apieni.ENIAttachment{
-		MACAddress:       randomMAC,
-		AttachStatusSent: false,
-		ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+	taskEngineState.AddENIAttachment(&ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			AttachStatusSent: false,
+			ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+		},
+		MACAddress: randomMAC,
 	})
 	eventChannel := make(chan statechange.Event)
 
@@ -196,7 +199,6 @@ func TestReconcileENIs(t *testing.T) {
 	require.NoError(t, watcher.reconcileOnce(false))
 
 	<-done
-	assert.NotNil(t, event.(api.TaskStateChange).Attachment)
 	assert.Equal(t, randomMAC, event.(api.TaskStateChange).Attachment.MACAddress)
 
 	select {
@@ -233,7 +235,6 @@ func TestReconcileENIsWithRetry(t *testing.T) {
 	require.NoError(t, watcher.reconcileOnce(true))
 
 	<-done
-	require.NotNil(t, event.(api.TaskStateChange).Attachment)
 	assert.Equal(t, randomMAC, event.(api.TaskStateChange).Attachment.MACAddress)
 
 	select {
@@ -243,11 +244,13 @@ func TestReconcileENIsWithRetry(t *testing.T) {
 	}
 }
 
-func getMockAttachment() *apieni.ENIAttachment {
-	return &apieni.ENIAttachment{
-		MACAddress:       randomMAC,
-		AttachStatusSent: false,
-		ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+func getMockAttachment() *ni.ENIAttachment {
+	return &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			AttachStatusSent: false,
+			ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+		},
+		MACAddress: randomMAC,
 	}
 }
 
@@ -363,8 +366,11 @@ func TestUdevAddEvent(t *testing.T) {
 					Name:         randomDevice,
 				},
 			}, nil),
-		mockStateManager.EXPECT().ENIByMac(randomMAC).Return(
-			&apieni.ENIAttachment{ExpiresAt: time.Unix(time.Now().Unix()+10, 0)}, true),
+		mockStateManager.EXPECT().ENIByMac(randomMAC).Return(&ni.ENIAttachment{
+			AttachmentInfo: attachment.AttachmentInfo{
+				ExpiresAt: time.Unix(time.Now().Unix()+10, 0),
+			},
+		}, true),
 	)
 
 	// Spin off event handler
@@ -376,7 +382,7 @@ func TestUdevAddEvent(t *testing.T) {
 	eniChangeEvent := <-eventChannel
 	taskStateChange, ok := eniChangeEvent.(api.TaskStateChange)
 	require.True(t, ok)
-	assert.Equal(t, apieni.ENIAttached, taskStateChange.Attachment.Status)
+	assert.Equal(t, attachment.AttachmentAttached, taskStateChange.Attachment.Status)
 
 	var waitForClose sync.WaitGroup
 	waitForClose.Add(2)

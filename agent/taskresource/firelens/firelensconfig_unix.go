@@ -19,10 +19,9 @@ package firelens
 import (
 	"fmt"
 
+	generator "github.com/awslabs/go-config-generator-for-fluentd-and-fluentbit"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
-
-	generator "github.com/awslabs/go-config-generator-for-fluentd-and-fluentbit"
 )
 
 const (
@@ -113,28 +112,36 @@ const (
 
 	// specifies awsvpc type mode for a task
 	awsvpcNetworkMode = "awsvpc"
+
+	memBufLimitOptionFluentBit = "Mem_Buf_Limit"
+
+	// the default mem buf limit (in MB) in case we cannot infer from the container memory reservation
+	defaultMemBufLimit = 25
 )
 
 // generateConfig generates a FluentConfig object that contains all necessary information to construct
 // a fluentd or fluentbit config file for a firelens container.
 func (firelens *FirelensResource) generateConfig() (generator.FluentConfig, error) {
 	config := generator.New()
-
+	var defaultInputMap map[string]string
 	// Specify log stream input, which is a unix socket that will be used for communication between the Firelens
 	// container and other containers.
-	var inputName, inputPathOption, matchAnyWildcard string
+	var inputName, matchAnyWildcard string
 	if firelens.firelensConfigType == FirelensConfigTypeFluentd {
 		inputName = socketInputNameFluentd
-		inputPathOption = socketInputPathOptionFluentd
 		matchAnyWildcard = matchAnyWildcardFluentd
+		defaultInputMap = map[string]string{
+			socketInputPathOptionFluentd: socketPath,
+		}
 	} else {
 		inputName = inputNameForward
-		inputPathOption = socketInputPathOptionFluentbit
 		matchAnyWildcard = matchAnyWildcardFluentbit
+		defaultInputMap = map[string]string{
+			socketInputPathOptionFluentbit: socketPath,
+			memBufLimitOptionFluentBit:     firelens.resolveMemBufLimit(),
+		}
 	}
-	config.AddInput(inputName, "", map[string]string{
-		inputPathOption: socketPath,
-	})
+	config.AddInput(inputName, "", defaultInputMap)
 	// Specify log stream input of tcp socket kind that can be used for communication between the Firelens
 	// container and other containers if the network is bridge or awsvpc mode. Also add health check sections to support
 	// doing container health check on firlens container for these two modes.
@@ -202,6 +209,20 @@ func (firelens *FirelensResource) generateConfig() (generator.FluentConfig, erro
 	return config, nil
 }
 
+// Derives the memory buffer limit from container memory limit (either 'memoryReservation' or 'memory' is set) or take
+// the default memory buffer limit (25MB)
+func (firelens *FirelensResource) resolveMemBufLimit() string {
+	// Formula is taken from https://github.com/aws-samples/amazon-ecs-firelens-examples/tree/mainline/examples/fluent-bit/oomkill-prevention#case-1-memory-buffering-only-default-or-storagetype-memory
+	// assuming that customer is not providing additional inputs (through supplemental configs) therefore we only have one input
+	memBufLimit := firelens.containerMemoryLimit / 2
+	if memBufLimit <= 0 {
+		memBufLimit = defaultMemBufLimit
+	}
+	memBufLimitString := fmt.Sprintf("%dMB", memBufLimit)
+	seelog.Infof("Resolved Firelens default mem buf limit for task %s: %s", firelens.taskARN, memBufLimitString)
+	return memBufLimitString
+}
+
 // addHealthcheckSections adds a health check input section and a health check output section to the config.
 func (firelens *FirelensResource) addHealthcheckSections(config generator.FluentConfig) {
 	// Health check supported is only added for fluentbit.
@@ -224,12 +245,12 @@ func (firelens *FirelensResource) addHealthcheckSections(config generator.Fluent
 // addOutputSection adds an output section to the firelens container's config that specifies how it routes another
 // container's logs. It's constructed based on that container's log options.
 // logOptions is a set of key-value pairs, which includes the following:
-//     1. The name of the output plugin (required when there are output options specified, i.e. the ones in 4). For
+//  1. The name of the output plugin (required when there are output options specified, i.e. the ones in 4). For
 //     fluentd, the key is "@type", for fluentbit, the key is "Name".
-//     2. include-pattern (optional): a regex specifying the logs to be included.
-//     3. exclude-pattern (optional): a regex specifying the logs to be excluded.
-//     4. All other key-value pairs are customer specified options for the plugin. They are unique for each plugin and
-//        we don't check them.
+//  2. include-pattern (optional): a regex specifying the logs to be included.
+//  3. exclude-pattern (optional): a regex specifying the logs to be excluded.
+//  4. All other key-value pairs are customer specified options for the plugin. They are unique for each plugin and
+//     we don't check them.
 func addOutputSection(tag, firelensConfigType string, logOptions map[string]string, config generator.FluentConfig) (generator.FluentConfig, error) {
 	var outputKey string
 	if firelensConfigType == FirelensConfigTypeFluentd {

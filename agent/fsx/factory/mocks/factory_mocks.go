@@ -21,43 +21,44 @@ package mock_factory
 import (
 	reflect "reflect"
 
-	credentials "github.com/aws/amazon-ecs-agent/agent/credentials"
 	fsx "github.com/aws/amazon-ecs-agent/agent/fsx"
+	credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockFSxClientCreator is a mock of FSxClientCreator interface
+// MockFSxClientCreator is a mock of FSxClientCreator interface.
 type MockFSxClientCreator struct {
 	ctrl     *gomock.Controller
 	recorder *MockFSxClientCreatorMockRecorder
 }
 
-// MockFSxClientCreatorMockRecorder is the mock recorder for MockFSxClientCreator
+// MockFSxClientCreatorMockRecorder is the mock recorder for MockFSxClientCreator.
 type MockFSxClientCreatorMockRecorder struct {
 	mock *MockFSxClientCreator
 }
 
-// NewMockFSxClientCreator creates a new mock instance
+// NewMockFSxClientCreator creates a new mock instance.
 func NewMockFSxClientCreator(ctrl *gomock.Controller) *MockFSxClientCreator {
 	mock := &MockFSxClientCreator{ctrl: ctrl}
 	mock.recorder = &MockFSxClientCreatorMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockFSxClientCreator) EXPECT() *MockFSxClientCreatorMockRecorder {
 	return m.recorder
 }
 
-// NewFSxClient mocks base method
-func (m *MockFSxClientCreator) NewFSxClient(arg0 string, arg1 credentials.IAMRoleCredentials) fsx.FSxClient {
+// NewFSxClient mocks base method.
+func (m *MockFSxClientCreator) NewFSxClient(arg0 string, arg1 credentials.IAMRoleCredentials) (fsx.FSxClient, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "NewFSxClient", arg0, arg1)
 	ret0, _ := ret[0].(fsx.FSxClient)
-	return ret0
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
-// NewFSxClient indicates an expected call of NewFSxClient
+// NewFSxClient indicates an expected call of NewFSxClient.
 func (mr *MockFSxClientCreatorMockRecorder) NewFSxClient(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewFSxClient", reflect.TypeOf((*MockFSxClientCreator)(nil).NewFSxClient), arg0, arg1)

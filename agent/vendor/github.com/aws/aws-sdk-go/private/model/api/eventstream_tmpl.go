@@ -1,3 +1,4 @@
+//go:build codegen
 // +build codegen
 
 package api
@@ -21,8 +22,14 @@ func renderEventStreamAPI(w io.Writer, op *Operation) error {
 	op.API.AddSDKImport("private/protocol/eventstream")
 	op.API.AddSDKImport("private/protocol/eventstream/eventstreamapi")
 
+	// usages of these imports are conditional - generate a compile-only
+	// reference to avoid potential unused imports:
+	//  - awserr is only used for input streams or json protocols
+	//  - time is only used for input streams or if an event payload has a
+	//    timestamp field
 	w.Write([]byte(`
 var _ awserr.Error
+var _ time.Time
 `))
 
 	return eventStreamAPITmpl.Execute(w, op)
@@ -117,7 +124,7 @@ type {{ $esapi.Name }} struct {
 // is called.
 {{- end }}
 //
-//   es := New{{ $esapi.Name }}(func(o *{{ $esapi.Name}}{
+//   es := New{{ $esapi.Name }}(func(o *{{ $esapi.Name}}){
 {{- if $inputStream }}
 //       es.Writer = myMockStreamWriter
 {{- end }}
@@ -213,6 +220,14 @@ func (es *{{ $esapi.Name }}) waitStreamPartClose() {
 			r.SetStreamingBody(inputReader)
 			es.inputWriter = inputWriter
 	}
+
+	// Closes the input-pipe writer
+	func (es *{{ $esapi.Name }}) closeInputPipe() error {
+		if es.inputWriter != nil {
+			return es.inputWriter.Close()
+		}
+		return nil
+	}	
 
 	// Send writes the event to the stream blocking until the event is written.
 	// Returns an error if the event was not written.
@@ -400,8 +415,8 @@ func (es *{{ $esapi.Name }}) safeClose() {
 		case <-t.C:
 		case <-writeCloseDone:
 		}
-		if es.inputWriter != nil {
-			es.inputWriter.Close()
+		if err := es.closeInputPipe(); err != nil {
+			es.err.SetError(err)
 		}
 	{{- end }}
 

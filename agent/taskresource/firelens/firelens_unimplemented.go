@@ -21,11 +21,13 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 )
 
 const (
@@ -51,9 +53,11 @@ const (
 type FirelensResource struct{}
 
 // NewFirelensResource returns a new FirelensResource.
-func NewFirelensResource(cluster, taskARN, taskDefinition, ec2InstanceID, dataDir, firelensConfigType, region, networkMode string,
-	firelensOptions map[string]string, containerToLogOptions map[string]map[string]string, credentialsManager credentials.Manager,
-	executionCredentialsID string) (*FirelensResource, error) {
+func NewFirelensResource(cluster, taskARN, taskDefinition, ec2InstanceID, dataDir, firelensConfigType, region,
+	networkMode, user string, firelensOptions map[string]string, containerToLogOptions map[string]map[string]string,
+	credentialsManager credentials.Manager, executionCredentialsID string, containerMemoryLimit int64,
+	ipCompatibility ipcompatibility.IPCompatibility) (*FirelensResource, error) {
+
 	return nil, errors.New("not implemented")
 }
 
@@ -154,7 +158,9 @@ func (firelens *FirelensResource) UnmarshalJSON(b []byte) error {
 }
 
 // Initialize fills in the resource fields.
-func (firelens *FirelensResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (firelens *FirelensResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 }
@@ -174,4 +180,9 @@ func (firelens *FirelensResource) BuildContainerDependency(containerName string,
 
 func (firelens *FirelensResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials
+func (firelens *FirelensResource) RequiresExecutionRoleCredentials() bool {
+	return false // Unimplemented version doesn't support S3 external configs
 }

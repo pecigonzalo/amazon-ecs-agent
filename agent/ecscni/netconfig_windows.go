@@ -19,8 +19,7 @@ package ecscni
 import (
 	"regexp"
 
-	"github.com/aws/amazon-ecs-agent/agent/api/eni"
-
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 	"github.com/cihub/seelog"
 	"github.com/containernetworking/cni/libcni"
 	"github.com/containernetworking/cni/pkg/types"
@@ -35,7 +34,7 @@ const (
 )
 
 // NewVPCENIPluginConfigForTaskNSSetup is used to create the configuration of vpc-eni plugin for task namespace setup.
-func NewVPCENIPluginConfigForTaskNSSetup(eni *eni.ENI, cfg *Config) (*libcni.NetworkConfig, error) {
+func NewVPCENIPluginConfigForTaskNSSetup(eni *ni.NetworkInterface, cfg *Config) (*libcni.NetworkConfig, error) {
 	// Use the DNS server addresses of the instance ENI it would belong in the same VPC as
 	// the task ENI and therefore, have same DNS configuration.
 	dns := types.DNS{
@@ -51,7 +50,7 @@ func NewVPCENIPluginConfigForTaskNSSetup(eni *eni.ENI, cfg *Config) (*libcni.Net
 	}
 
 	eniConf := VPCENIPluginConfig{
-		Type:               ECSVPCENIPluginName,
+		Type:               VPCENIPluginName,
 		DNS:                dns,
 		ENIName:            eni.GetLinkName(),
 		ENIMACAddress:      eni.MacAddress,
@@ -73,7 +72,7 @@ func NewVPCENIPluginConfigForTaskNSSetup(eni *eni.ENI, cfg *Config) (*libcni.Net
 // NewVPCENIPluginConfigForECSBridgeSetup creates the configuration required by vpc-eni plugin to setup ecs-bridge endpoint for the task.
 func NewVPCENIPluginConfigForECSBridgeSetup(cfg *Config) (*libcni.NetworkConfig, error) {
 	bridgeConf := VPCENIPluginConfig{
-		Type:               ECSVPCENIPluginName,
+		Type:               VPCENIPluginName,
 		UseExistingNetwork: true,
 		BlockIMDS:          cfg.BlockInstanceMetadata,
 	}

@@ -18,26 +18,33 @@ package engine
 import (
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
+	dm "github.com/aws/amazon-ecs-agent/agent/engine/daemonmanager"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
+	"github.com/aws/amazon-ecs-agent/agent/engine/serviceconnect"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 )
 
 // NewTaskEngine returns a default TaskEngine
 func NewTaskEngine(cfg *config.Config, client dockerapi.DockerClient,
 	credentialsManager credentials.Manager,
 	containerChangeEventStream *eventstream.EventStream,
-	imageManager ImageManager, state dockerstate.TaskEngineState,
+	imageManager ImageManager, hostResources map[string]types.Resource, state dockerstate.TaskEngineState,
 	metadataManager containermetadata.Manager,
 	resourceFields *taskresource.ResourceFields,
-	execCmdMgr execcmd.Manager) TaskEngine {
+	execCmdMgr execcmd.Manager,
+	serviceConnectManager serviceconnect.Manager,
+	daemonManagers map[string]dm.DaemonManager) TaskEngine {
 
+	hostResourceManager := NewHostResourceManager(hostResources)
 	taskEngine := NewDockerTaskEngine(cfg, client, credentialsManager,
-		containerChangeEventStream, imageManager,
-		state, metadataManager, resourceFields, execCmdMgr)
+		containerChangeEventStream, imageManager, &hostResourceManager,
+		state, metadataManager, resourceFields, execCmdMgr,
+		serviceConnectManager, daemonManagers)
 
 	return taskEngine
 }

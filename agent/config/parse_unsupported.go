@@ -21,12 +21,16 @@ import (
 	"strings"
 )
 
-func parseGMSACapability() bool {
-	return false
+func parseGMSACapability() BooleanDefaultFalse {
+	return BooleanDefaultFalse{Value: ExplicitlyDisabled}
 }
 
-func parseFSxWindowsFileServerCapability() bool {
-	return false
+func parseFSxWindowsFileServerCapability() BooleanDefaultTrue {
+	return BooleanDefaultTrue{Value: ExplicitlyDisabled}
+}
+
+func parseGMSADomainlessCapability() BooleanDefaultFalse {
+	return BooleanDefaultFalse{Value: ExplicitlyDisabled}
 }
 
 var IsWindows2016 = func() (bool, error) {
@@ -36,4 +40,17 @@ var IsWindows2016 = func() (bool, error) {
 // GetOSFamily returns "UNSUPPORTED" as operating system family for non-windows based ecs instances.
 func GetOSFamily() string {
 	return strings.ToUpper(OSType)
+}
+
+// GetDetailedOSFamily returns the same as GetOSFamily() for unsupported platforms.
+func GetDetailedOSFamily() string {
+	return GetOSFamily()
+}
+
+func parseTaskPidsLimit() int {
+	return 0
+}
+
+func parsePropagateTaskMemoryLimitCgroupV2() BooleanDefaultFalse {
+	return BooleanDefaultFalse{Value: ExplicitlyDisabled}
 }

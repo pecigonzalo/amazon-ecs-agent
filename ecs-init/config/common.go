@@ -19,11 +19,11 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
+	"github.com/aws/amazon-ecs-agent/ecs-agent/awsrulesfn"
 	"github.com/cihub/seelog"
-
-	"github.com/aws/aws-sdk-go/aws/endpoints"
 	godocker "github.com/fsouza/go-dockerclient"
 	"github.com/pkg/errors"
 )
@@ -46,14 +46,14 @@ const (
 	// DefaultAgentVersion is the version of the agent that will be
 	// fetched if required. This should look like v1.2.3 or an
 	// 8-character sha, as is downloadable from S3.
-	DefaultAgentVersion = "v1.62.1"
+	DefaultAgentVersion = "v1.108.3"
 
 	// AgentPartitionBucketName is the name of the paritional s3 bucket that stores the agent
 	AgentPartitionBucketName = "amazon-ecs-agent"
 
 	// DefaultRegionName is the default region to fall back if the user's region is not a region containing
 	// the agent bucket
-	DefaultRegionName = endpoints.UsEast1RegionID
+	DefaultRegionName = "us-east-1"
 
 	// dockerJSONLogMaxSize is the maximum allowed size of the
 	// individual backing json log files for the managed container.
@@ -93,14 +93,39 @@ const (
 
 	// DefaultRegionEnvVar is the environment variable for specifying the default AWS region to use.
 	DefaultRegionEnvVar = "AWS_DEFAULT_REGION"
+
+	// ECSGMSASupportEnvVar indicates that the gMSA is supported
+	ECSGMSASupportEnvVar = "ECS_GMSA_SUPPORTED"
+
+	// CredentialsFetcherHostEnvVar is the environment variable that specifies the location of the credentials-fetcher daemon socket.
+	CredentialsFetcherHostEnvVar = "CREDENTIALS_FETCHER_HOST"
+
+	// this socket is exposed by credentials-fetcher (daemon for gMSA support on Linux)
+	// defaultCredentialsFetcherSocketPath is set to /var/credentials-fetcher/socket/credentials_fetcher.sock
+	// in case path is not passed in the env variable
+	DefaultCredentialsFetcherSocketPath = "/var/credentials-fetcher/socket/credentials_fetcher.sock"
+
+	// ECSAgentAppArmorProfileNameEnvVar specifies the AppArmor profile name to use. Only applies
+	// on AppArmor-enabled platforms (such as Ubuntu and Debian).
+	ECSAgentAppArmorProfileNameEnvVar  = "ECS_AGENT_APPARMOR_PROFILE"
+	ECSAgentAppArmorDefaultProfileName = "ecs-agent-default"
+
+	// ECSAgentPIDNamespaceHostEnvVar is the environment variable that, when set to true,
+	// configures the agent container to share the host's PID namespace (--pid=host)
+	ECSAgentPIDNamespaceHostEnvVar = "ECS_AGENT_PID_NAMESPACE_HOST"
 )
+
+// OsStat is useful for mocking in unit tests
+var OsStat = os.Stat
 
 // partitionBucketRegion provides the "partitional" bucket region
 // suitable for downloading agent from.
 var partitionBucketRegion = map[string]string{
-	endpoints.AwsPartitionID:      endpoints.UsEast1RegionID,
-	endpoints.AwsCnPartitionID:    endpoints.CnNorth1RegionID,
-	endpoints.AwsUsGovPartitionID: endpoints.UsGovWest1RegionID,
+	"aws":        DefaultRegionName,
+	"aws-cn":     "cn-north-1",
+	"aws-us-gov": "us-gov-west-1",
+	"aws-iso":    "us-iso-east-1",
+	"aws-iso-b":  "us-isob-east-1",
 }
 
 // goarch is an injectable GOARCH runtime string. This controls the
@@ -122,14 +147,14 @@ var validDrivers = map[string]struct{}{
 
 // GetAgentPartitionBucketRegion returns the s3 bucket region where ECS Agent artifact is located
 func GetAgentPartitionBucketRegion(region string) (string, error) {
-	regionPartition, ok := endpoints.PartitionForRegion(endpoints.DefaultPartitions(), region)
-	if !ok {
-		return "", errors.Errorf("could not resolve partition ID for region %q", region)
+	partition := awsrulesfn.GetPartitionForRegion(region)
+	if partition == nil {
+		return "", errors.Errorf("could not resolve partition for region %q", region)
 	}
 
-	bucketRegion, ok := partitionBucketRegion[regionPartition.ID()]
+	bucketRegion, ok := partitionBucketRegion[partition.ID]
 	if !ok {
-		return "", errors.Errorf("no bucket available for partition ID %q", regionPartition.ID())
+		return "", errors.Errorf("no bucket available for partition %q", partition.ID)
 	}
 
 	return bucketRegion, nil
@@ -155,7 +180,7 @@ func LogDirectory() string {
 	return directoryPrefix + "/var/log/ecs"
 }
 
-func initLogFile() string {
+func InitLogFile() string {
 	return LogDirectory() + "/ecs-init.log"
 }
 
@@ -212,22 +237,44 @@ func DockerUnixSocket() (string, bool) {
 	return "/var/run", false
 }
 
+// credentialsFetcherUnixSocketHostPath returns the credentials fetcher daemon socket endpoint and whether it reads from CredentialsFetcherEnvVar
+func credentialsFetcherUnixSocket() string {
+	if credentialsFetcherHost := os.Getenv(CredentialsFetcherHostEnvVar); strings.HasPrefix(credentialsFetcherHost, UnixSocketPrefix) {
+		return strings.TrimPrefix(credentialsFetcherHost, UnixSocketPrefix)
+	}
+
+	return DefaultCredentialsFetcherSocketPath
+}
+
+// HostCredentialsFetcherPath() returns the daemon socket location if it is available
+func HostCredentialsFetcherPath() (string, bool) {
+	if credentialsFetcherHost := credentialsFetcherUnixSocket(); len(credentialsFetcherHost) > 0 {
+		return credentialsFetcherHost, true
+	}
+	return "", false
+}
+
 // CgroupMountpoint returns the cgroup mountpoint for the system
 func CgroupMountpoint() string {
 	return cgroupMountpoint
 }
 
-// HostCertsDirPath() returns the CA store path on the host
+// MountDirectoryEBS returns the location on disk where EBS volumes will be mounted
+func MountDirectoryEBS() string {
+	return directoryPrefix + "/mnt/ecs/ebs"
+}
+
+// HostCertsDirPath returns the CA store path on the host
 func HostCertsDirPath() string {
-	if _, err := os.Stat(hostCertsDirPath); err != nil {
+	if _, err := OsStat(hostCertsDirPath); err != nil {
 		return ""
 	}
 	return hostCertsDirPath
 }
 
-// HostPKIDirPath() returns the CA store path on the host
+// HostPKIDirPath returns the CA store path on the host
 func HostPKIDirPath() string {
-	if _, err := os.Stat(hostPKIDirPath); err != nil {
+	if _, err := OsStat(hostPKIDirPath); err != nil {
 		return ""
 	}
 	return hostPKIDirPath
@@ -301,6 +348,15 @@ func RunningInExternal() bool {
 	return envVar == "true"
 }
 
+// ECSAgentApparmorProfileName returns the name of the AppArmor profile to use.
+func ECSAgentAppArmorProfileName() string {
+	envVar := os.Getenv(ECSAgentAppArmorProfileNameEnvVar)
+	if len(strings.TrimSpace(envVar)) == 0 {
+		return ECSAgentAppArmorDefaultProfileName
+	}
+	return envVar
+}
+
 func agentArtifactName(version string, arch string) (string, error) {
 	var interpose string
 	switch arch {
@@ -312,4 +368,14 @@ func agentArtifactName(version string, arch string) (string, error) {
 		return "", errors.Errorf("unknown architecture %q", arch)
 	}
 	return fmt.Sprintf("ecs-agent%s-%s", interpose, version), nil
+}
+
+// IsECSAgentPIDNamespaceHostEnabled returns whether the ECS_AGENT_PID_NAMESPACE_HOST env variable is set to true
+func IsECSAgentPIDNamespaceHostEnabled() bool {
+	parsedBool, err := strconv.ParseBool(os.Getenv(ECSAgentPIDNamespaceHostEnvVar))
+	if err != nil {
+		seelog.Debugf("ECS_AGENT_PID_NAMESPACE_HOST env variable is not set to a valid boolean value, defaulting to false. Error: %v", err)
+		return false
+	}
+	return parsedBool
 }

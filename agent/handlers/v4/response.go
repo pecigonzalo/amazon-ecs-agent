@@ -14,84 +14,43 @@
 package v4
 
 import (
-	"github.com/aws/amazon-ecs-agent/agent/api"
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	"github.com/aws/amazon-ecs-agent/agent/handlers/utils"
 	v2 "github.com/aws/amazon-ecs-agent/agent/handlers/v2"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	tmdsresponse "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/response"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/utils"
+	tmdsv4 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v4/state"
+
 	"github.com/pkg/errors"
 )
 
-// TaskResponse is the v4 Task response. It augments the v4 Container response
-// with the v2 task response object.
-type TaskResponse struct {
-	*v2.TaskResponse
-	Containers []ContainerResponse `json:"Containers,omitempty"`
-}
-
-// ContainerResponse is the v4 Container response. It augments the v4 Network response
-// with the v2 container response object.
-type ContainerResponse struct {
-	*v2.ContainerResponse
-	Networks []Network `json:"Networks,omitempty"`
-}
-
-// Network is the v4 Network response. It adds a bunch of information about network
-// interface(s) on top of what is supported by v4.
-// See `NetworkInterfaceProperties` for more details.
-type Network struct {
-	containermetadata.Network
-	// NetworkInterfaceProperties specifies additional properties of the network
-	// of the network interface that are exposed via the metadata server.
-	// We currently populate this only for the `awsvpc` networking mode.
-	NetworkInterfaceProperties
-}
-
-// NetworkInterfaceProperties represents additional properties we may want to expose via
-// task metadata about the network interface that's attached to the container/task. We
-// mostly use this to populate data about ENIs for tasks launched with `awsvpc` mode.
-type NetworkInterfaceProperties struct {
-	// AttachmentIndex reflects the `index` specified by the customer (if any)
-	// while creating the task with `awsvpc` mode.
-	AttachmentIndex *int `json:"AttachmentIndex,omitempty"`
-	// MACAddress is the MAC address of the network interface.
-	MACAddress string `json:"MACAddress,omitempty"`
-	// IPv4SubnetCIDRBlock is the IPv4 CIDR address block associated with the interface's subnet.
-	IPV4SubnetCIDRBlock string `json:"IPv4SubnetCIDRBlock,omitempty"`
-	// IPv6SubnetCIDRBlock is the IPv6 CIDR address block associated with the interface's subnet.
-	IPv6SubnetCIDRBlock string `json:"IPv6SubnetCIDRBlock,omitempty"`
-	// DomainNameServers specifies the nameserver IP addresses for the network interface.
-	DomainNameServers []string `json:"DomainNameServers,omitempty"`
-	// DomainNameSearchList specifies the search list for the domain name lookup for
-	// the network interface.
-	DomainNameSearchList []string `json:"DomainNameSearchList,omitempty"`
-	// PrivateDNSName is the dns name assigned to this network interface.
-	PrivateDNSName string `json:"PrivateDNSName,omitempty"`
-	// SubnetGatewayIPV4Address is the IPv4 gateway address for the network interface.
-	SubnetGatewayIPV4Address string `json:"SubnetGatewayIpv4Address,omitempty"`
-}
-
 // NewTaskResponse creates a new v4 response object for the task. It augments v2 task response
-// with additional network interface fields.
+// with additional fields for the v4 response.
 func NewTaskResponse(
+	endpointID string,
 	taskARN string,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	cluster string,
 	az string,
+	azID string,
+	vpcID string,
 	containerInstanceARN string,
+	serviceName string,
 	propagateTags bool,
-) (*TaskResponse, error) {
+) (*tmdsv4.TaskResponse, error) {
 	// Construct the v2 response first.
-	v2Resp, err := v2.NewTaskResponse(taskARN, state, ecsClient, cluster, az,
+	v2Resp, err := v2.NewTaskResponse(endpointID, taskARN, state, ecsClient, cluster, az,
 		containerInstanceARN, propagateTags, true)
 	if err != nil {
 		return nil, err
 	}
-	var containers []ContainerResponse
+	var containers []tmdsv4.ContainerResponse
 	// Convert each container response into v4 container response.
 	for i, container := range v2Resp.Containers {
 		networks, err := toV4NetworkResponse(container.Networks, func() (*apitask.Task, bool) {
@@ -100,24 +59,29 @@ func NewTaskResponse(
 		if err != nil {
 			return nil, err
 		}
-		containers = append(containers, ContainerResponse{
+		v4Response := &tmdsv4.ContainerResponse{
 			ContainerResponse: &v2Resp.Containers[i],
 			Networks:          networks,
-		})
+		}
+		v4Response = augmentContainerResponse(container.ID, state, v4Response)
+		containers = append(containers, *v4Response)
 	}
 
-	return &TaskResponse{
-		TaskResponse: v2Resp,
-		Containers:   containers,
+	return &tmdsv4.TaskResponse{
+		TaskResponse:       v2Resp,
+		Containers:         containers,
+		VPCID:              vpcID,
+		ServiceName:        serviceName,
+		AvailabilityZoneID: azID,
 	}, nil
 }
 
-// NewContainerResponse creates a new v4 container response based on container id.  It augments
-// v4 container response with additional network interface fields.
+// NewContainerResponse creates a new v4 container response based on container id. It augments
+// v2 container response with additional fields for v4.
 func NewContainerResponse(
 	containerID string,
 	state dockerstate.TaskEngineState,
-) (*ContainerResponse, error) {
+) (*tmdsv4.ContainerResponse, error) {
 	// Construct the v2 response first.
 	container, err := v2.NewContainerResponseFromState(containerID, state, true)
 	if err != nil {
@@ -130,10 +94,11 @@ func NewContainerResponse(
 	if err != nil {
 		return nil, err
 	}
-	return &ContainerResponse{
+	v4Response := tmdsv4.ContainerResponse{
 		ContainerResponse: container,
 		Networks:          networks,
-	}, nil
+	}
+	return augmentContainerResponse(containerID, state, &v4Response), nil
 }
 
 // toV4NetworkResponse converts v2 network response to v4. Additional fields are only
@@ -141,12 +106,12 @@ func NewContainerResponse(
 // look up the task information in the local state based on the id, which could be
 // either task arn or contianer id.
 func toV4NetworkResponse(
-	networks []containermetadata.Network,
+	networks []tmdsresponse.Network,
 	lookup func() (*apitask.Task, bool),
-) ([]Network, error) {
-	var resp []Network
+) ([]tmdsv4.Network, error) {
+	var resp []tmdsv4.Network
 	for _, network := range networks {
-		respNetwork := Network{Network: network}
+		respNetwork := tmdsv4.Network{Network: network}
 		if network.NetworkMode == utils.NetworkModeAWSVPC {
 			task, ok := lookup()
 			if !ok {
@@ -164,9 +129,33 @@ func toV4NetworkResponse(
 	return resp, nil
 }
 
+// augmentContainerResponse augments the container response with additional fields.
+func augmentContainerResponse(
+	containerID string,
+	state dockerstate.TaskEngineState,
+	v4Response *tmdsv4.ContainerResponse,
+) *tmdsv4.ContainerResponse {
+	dockerContainer, ok := state.ContainerByID(containerID)
+	if !ok {
+		// did not find container, continue on and try next container(s)
+		// we don't return error here to avoid disrupting all of a TMDS response
+		// on a single missing container.
+		logger.Warn("V4 container response: unable to find container in internal state",
+			logger.Fields{
+				field.RuntimeID: containerID,
+			})
+		return v4Response
+	}
+	if dockerContainer.Container.RestartPolicyEnabled() {
+		restartCount := dockerContainer.Container.RestartTracker.GetRestartCount()
+		v4Response.RestartCount = &restartCount
+	}
+	return v4Response
+}
+
 // newNetworkInterfaceProperties creates the NetworkInterfaceProperties object for a given
 // task.
-func newNetworkInterfaceProperties(task *apitask.Task) (NetworkInterfaceProperties, error) {
+func newNetworkInterfaceProperties(task *apitask.Task) (tmdsv4.NetworkInterfaceProperties, error) {
 	eni := task.GetPrimaryENI()
 
 	var attachmentIndexPtr *int
@@ -175,7 +164,13 @@ func newNetworkInterfaceProperties(task *apitask.Task) (NetworkInterfaceProperti
 		attachmentIndexPtr = &vpcIndex
 	}
 
-	return NetworkInterfaceProperties{
+	var subnetGatewayIPv6Address string
+	if eni.IPv6Only() {
+		// Only populate SubnetGatewayIPv6Address for IPv6-only task ENIs as we do not
+		// populate it for dual-stack ENIs for historical reasons
+		subnetGatewayIPv6Address = eni.SubnetGatewayIPV6Address
+	}
+	return tmdsv4.NetworkInterfaceProperties{
 		// TODO this is hard-coded to `0` for now. Once backend starts populating
 		// `Index` field for an ENI, we should set it as per that. Since we
 		// only support 1 ENI per task anyway, setting it to `0` is acceptable
@@ -187,6 +182,7 @@ func newNetworkInterfaceProperties(task *apitask.Task) (NetworkInterfaceProperti
 		DomainNameSearchList:     eni.DomainNameSearchList,
 		PrivateDNSName:           eni.PrivateDNSName,
 		SubnetGatewayIPV4Address: eni.SubnetGatewayIPV4Address,
+		SubnetGatewayIPV6Address: subnetGatewayIPv6Address,
 	}, nil
 }
 
@@ -194,10 +190,10 @@ func newNetworkInterfaceProperties(task *apitask.Task) (NetworkInterfaceProperti
 // It augments v4 container response with an additional empty network interface field.
 func NewPulledContainerResponse(
 	dockerContainer *apicontainer.DockerContainer,
-	eni *apieni.ENI,
-) ContainerResponse {
+	eni *ni.NetworkInterface,
+) tmdsv4.ContainerResponse {
 	resp := v2.NewContainerResponse(dockerContainer, eni, true)
-	return ContainerResponse{
+	return tmdsv4.ContainerResponse{
 		ContainerResponse: &resp,
 	}
 }

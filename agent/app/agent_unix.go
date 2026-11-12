@@ -21,19 +21,22 @@ import (
 
 	asmfactory "github.com/aws/amazon-ecs-agent/agent/asm/factory"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
+	ebs "github.com/aws/amazon-ecs-agent/agent/ebs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/eni/watcher"
 	"github.com/aws/amazon-ecs-agent/agent/gpu"
+	s3factory "github.com/aws/amazon-ecs-agent/agent/s3/factory"
 	ssmfactory "github.com/aws/amazon-ecs-agent/agent/ssm/factory"
-
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	cgroup "github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup/control"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
@@ -43,7 +46,8 @@ const initPID = 1
 
 // awsVPCCNIPlugins is a list of CNI plugins required by the ECS Agent
 // to configure the ENI for a task
-var awsVPCCNIPlugins = []string{ecscni.ECSENIPluginName,
+var awsVPCCNIPlugins = []string{
+	ecscni.VPCENIPluginName,
 	ecscni.ECSBridgePluginName,
 	ecscni.ECSIPAMPluginName,
 	ecscni.ECSAppMeshPluginName,
@@ -99,7 +103,7 @@ func (agent *ecsAgent) initializeTaskENIDependencies(state dockerstate.TaskEngin
 // verifyCNIPluginsCapabilities returns an error if there's an error querying
 // capabilities or if the required capability is absent from the capabilities
 // of the following plugins:
-// a. ecs-eni
+// a. vpc-eni
 // b. ecs-bridge
 // c. ecs-ipam
 // d. aws-appmesh
@@ -148,17 +152,31 @@ func (agent *ecsAgent) startENIWatcher(state dockerstate.TaskEngineState, stateC
 	return nil
 }
 
+func (agent *ecsAgent) startEBSWatcher(
+	state dockerstate.TaskEngineState,
+	taskEngine engine.TaskEngine,
+	dockerClient dockerapi.DockerClient,
+) {
+	if agent.ebsWatcher == nil {
+		seelog.Debug("Creating new EBS watcher...")
+		agent.ebsWatcher = ebs.NewWatcher(agent.ctx, agent.cfg, state, taskEngine, dockerClient)
+		go agent.ebsWatcher.Start()
+	}
+}
+
 // initializeResourceFields exists mainly for testing doStart() to use mock Control
 // object
 func (agent *ecsAgent) initializeResourceFields(credentialsManager credentials.Manager) {
+	ec2InstanceID, _ := agent.getEc2MetadataWithRetry(agent.ec2MetadataClient.InstanceID, "EC2 instance ID")
 	agent.resourceFields = &taskresource.ResourceFields{
 		Control: cgroup.New(),
 		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
 			IOUtil:             ioutilwrapper.NewIOUtil(),
 			ASMClientCreator:   asmfactory.NewClientCreator(),
 			SSMClientCreator:   ssmfactory.NewSSMClientCreator(),
+			S3ClientCreator:    s3factory.NewS3ClientCreator(),
 			CredentialsManager: credentialsManager,
-			EC2InstanceID:      agent.getEC2InstanceID(),
+			EC2InstanceID:      ec2InstanceID,
 		},
 		Ctx:              agent.ctx,
 		DockerClient:     agent.dockerClient,
@@ -188,7 +206,7 @@ func (agent *ecsAgent) initializeGPUManager() error {
 	return nil
 }
 
-func (agent *ecsAgent) getPlatformDevices() []*ecs.PlatformDevice {
+func (agent *ecsAgent) getPlatformDevices() []types.PlatformDevice {
 	if agent.cfg.GPUSupportEnabled {
 		if agent.resourceFields != nil && agent.resourceFields.NvidiaGPUManager != nil {
 			return agent.resourceFields.NvidiaGPUManager.GetDevices()

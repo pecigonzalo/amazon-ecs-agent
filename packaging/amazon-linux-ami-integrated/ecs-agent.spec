@@ -24,9 +24,10 @@
 %global no_exec_perm 644
 %global debug_package %{nil}
 %global agent_image ecs-agent-v%{version}.tar
+%global ebs_csi_driver_dir /var/lib/ecs/deps/daemons/ebs-csi-driver
 
 Name:           ecs-init
-Version:        1.62.2
+Version:        1.108.3
 Release:        1%{?dist}
 License:        Apache 2.0
 Summary:        Amazon Elastic Container Service initialization application
@@ -38,8 +39,13 @@ Source2:        ecs.service
 Source3:        amazon-ecs-volume-plugin.service
 Source4:        amazon-ecs-volume-plugin.socket
 Source5:        amazon-ecs-volume-plugin.conf
+Source6:        ebs-csi-driver-arm64-v%{version}.tar
+Source7:        ebs-csi-driver-v%{version}.tar
 
-BuildRequires:  golang >= 1.18.0
+BuildRequires:  golang >= 1.26.0
+BuildRequires:  ca-certificates
+BuildRequires:  p11-kit-trust
+BuildRequires:  util-linux
 %if %{with systemd}
 BuildRequires:  systemd
 Requires:       systemd
@@ -47,7 +53,7 @@ Requires:       systemd
 Requires:       upstart
 %endif
 Requires:       iptables
-Requires:       docker >= 17.06.2ce
+Requires:       docker >= 20.10.0
 Requires:       procps
 
 # The following 'Provides' lists the vendored dependencies bundled in
@@ -58,96 +64,215 @@ Requires:       procps
 # statements by reading out the vendor directory:
 #
 # find ../../ecs-init/vendor -name \*.go -exec dirname {} \; | sort | uniq | sed 's,^.*ecs-init/vendor/,,; s/^/bundled(golang(/; s/$/))/;' | sed 's/^/Provides:\t/' | expand -
-Provides:	    bundled(golang(github.com/Azure/go-ansiterm))
-Provides:	    bundled(golang(github.com/Azure/go-ansiterm/winterm))
-Provides:	    bundled(golang(github.com/Microsoft/go-winio))
-Provides:	    bundled(golang(github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml))
-Provides:	    bundled(golang(github.com/Nvveen/Gotty))
-Provides:	    bundled(golang(github.com/Sirupsen/logrus))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/awserr))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/awsutil))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/client))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/client/metadata))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/corehandlers))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/credentials))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/credentials/endpointcreds))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/credentials/stscreds))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/defaults))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/ec2metadata))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/endpoints))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/request))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/session))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/aws/signer/v4))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/internal/sdkio))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/internal/sdkrand))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/internal/shareddefaults))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol/query))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol/query/queryutil))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol/rest))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol/restxml))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/private/protocol/xml/xmlutil))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/service/s3))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/service/s3/s3iface))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/service/s3/s3manager))
-Provides:	    bundled(golang(github.com/aws/aws-sdk-go/service/sts))
-Provides:	    bundled(golang(github.com/cihub/seelog))
-Provides:	    bundled(golang(github.com/cihub/seelog/archive))
-Provides:	    bundled(golang(github.com/cihub/seelog/archive/gzip))
-Provides:	    bundled(golang(github.com/cihub/seelog/archive/tar))
-Provides:	    bundled(golang(github.com/cihub/seelog/archive/zip))
-Provides:	    bundled(golang(github.com/coreos/go-systemd/activation))
-Provides:	    bundled(golang(github.com/davecgh/go-spew/spew))
-Provides:	    bundled(golang(github.com/docker/docker/api/types))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/blkiodev))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/container))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/filters))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/mount))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/network))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/registry))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/strslice))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/swarm))
-Provides:	    bundled(golang(github.com/docker/docker/api/types/versions))
-Provides:	    bundled(golang(github.com/docker/docker/opts))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/archive))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/fileutils))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/homedir))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/idtools))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/ioutils))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/jsonlog))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/jsonmessage))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/longpath))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/mount))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/pools))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/promise))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/stdcopy))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/system))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/term))
-Provides:	    bundled(golang(github.com/docker/docker/pkg/term/windows))
-Provides:	    bundled(golang(github.com/docker/go-connections/nat))
-Provides:	    bundled(golang(github.com/docker/go-connections/sockets))
-Provides:	    bundled(golang(github.com/docker/go-plugins-helpers/sdk))
-Provides:	    bundled(golang(github.com/docker/go-plugins-helpers/volume))
-Provides:	    bundled(golang(github.com/docker/go-units))
-Provides:	    bundled(golang(github.com/fsouza/go-dockerclient))
-Provides:	    bundled(golang(github.com/go-ini/ini))
-Provides:	    bundled(golang(github.com/golang/mock/gomock))
-Provides:	    bundled(golang(github.com/jmespath/go-jmespath))
-Provides:	    bundled(golang(github.com/opencontainers/go-digest))
-Provides:	    bundled(golang(github.com/opencontainers/image-spec/specs-go))
-Provides:	    bundled(golang(github.com/opencontainers/image-spec/specs-go/v1))
-Provides:	    bundled(golang(github.com/opencontainers/runc/libcontainer/system))
-Provides:	    bundled(golang(github.com/opencontainers/runc/libcontainer/user))
-Provides:	    bundled(golang(github.com/pkg/errors))
-Provides:	    bundled(golang(github.com/pmezard/go-difflib/difflib))
-Provides:	    bundled(golang(github.com/stretchr/testify/assert))
-Provides:	    bundled(golang(golang.org/x/net/context))
-Provides:	    bundled(golang(golang.org/x/net/context/ctxhttp))
-Provides:	    bundled(golang(golang.org/x/net/proxy))
-Provides:	    bundled(golang(golang.org/x/sys/unix))
-Provides:	    bundled(golang(golang.org/x/sys/windows))
+Provides:       bundled(golang(github.com/Azure/go-ansiterm))
+Provides:       bundled(golang(github.com/Azure/go-ansiterm/winterm))
+Provides:       bundled(golang(github.com/Microsoft/go-winio))
+Provides:       bundled(golang(github.com/Microsoft/go-winio/internal/fs))
+Provides:       bundled(golang(github.com/Microsoft/go-winio/internal/socket))
+Provides:       bundled(golang(github.com/Microsoft/go-winio/internal/stringbuffer))
+Provides:       bundled(golang(github.com/Microsoft/go-winio/pkg/guid))
+Provides:       bundled(golang(github.com/NVIDIA/go-nvml/pkg/dl))
+Provides:       bundled(golang(github.com/NVIDIA/go-nvml/pkg/nvml))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/awsrulesfn))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/logger))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/utils))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/utils/net))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper))
+Provides:       bundled(golang(github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper/mocks))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/arn))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/defaults))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/middleware))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream/eventstreamapi))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/protocol/query))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/protocol/restjson))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/protocol/xml))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/ratelimit))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/retry))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/signer/internal/v4))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/signer/v4))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/aws/transport/http))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/config))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/config/internal/ini))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/endpointcreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/endpointcreds/internal/client))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/logincreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/processcreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/ssocreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/credentials/stscreds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/feature/ec2/imds))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/feature/ec2/imds/internal/config))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/feature/s3/manager))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/auth))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/auth/smithy))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/awsutil))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/configsources))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/context))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/endpoints/awsrulesfn))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/endpoints/v2))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/rand))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/sdk))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/sdkio))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/shareddefaults))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/strings))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/sync/singleflight))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/timeconv))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/timeouts))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/v4a))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/v4a/internal/crypto))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/internal/v4a/internal/v4))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/checksum))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/presigned-url))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/s3shared))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/s3shared/arn))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/internal/s3shared/config))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/s3))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/s3/internal/arn))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/s3/internal/customizations))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/s3/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/s3/types))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/signin))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/signin/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/signin/types))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sso))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sso/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sso/types))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/ssooidc))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/ssooidc/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/ssooidc/types))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sts))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sts/internal/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go-v2/service/sts/types))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/awserr))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/awsutil))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/client/metadata))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/credentials))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/endpoints))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/request))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/aws/signer/v4))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/context))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/ini))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/sdkio))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/sdkmath))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/shareddefaults))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/strings))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/internal/sync/singleflight))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/private/protocol))
+Provides:       bundled(golang(github.com/aws/aws-sdk-go/private/protocol/rest))
+Provides:       bundled(golang(github.com/aws/smithy-go))
+Provides:       bundled(golang(github.com/aws/smithy-go/auth))
+Provides:       bundled(golang(github.com/aws/smithy-go/auth/bearer))
+Provides:       bundled(golang(github.com/aws/smithy-go/container/private/cache))
+Provides:       bundled(golang(github.com/aws/smithy-go/container/private/cache/lru))
+Provides:       bundled(golang(github.com/aws/smithy-go/context))
+Provides:       bundled(golang(github.com/aws/smithy-go/document))
+Provides:       bundled(golang(github.com/aws/smithy-go/encoding))
+Provides:       bundled(golang(github.com/aws/smithy-go/encoding/httpbinding))
+Provides:       bundled(golang(github.com/aws/smithy-go/encoding/json))
+Provides:       bundled(golang(github.com/aws/smithy-go/encoding/xml))
+Provides:       bundled(golang(github.com/aws/smithy-go/endpoints))
+Provides:       bundled(golang(github.com/aws/smithy-go/endpoints/private/bdd))
+Provides:       bundled(golang(github.com/aws/smithy-go/endpoints/private/rulesfn))
+Provides:       bundled(golang(github.com/aws/smithy-go/eventstream))
+Provides:       bundled(golang(github.com/aws/smithy-go/internal/sync/singleflight))
+Provides:       bundled(golang(github.com/aws/smithy-go/io))
+Provides:       bundled(golang(github.com/aws/smithy-go/logging))
+Provides:       bundled(golang(github.com/aws/smithy-go/metrics))
+Provides:       bundled(golang(github.com/aws/smithy-go/middleware))
+Provides:       bundled(golang(github.com/aws/smithy-go/private/requestcompression))
+Provides:       bundled(golang(github.com/aws/smithy-go/ptr))
+Provides:       bundled(golang(github.com/aws/smithy-go/rand))
+Provides:       bundled(golang(github.com/aws/smithy-go/sync))
+Provides:       bundled(golang(github.com/aws/smithy-go/time))
+Provides:       bundled(golang(github.com/aws/smithy-go/tracing))
+Provides:       bundled(golang(github.com/aws/smithy-go/traits))
+Provides:       bundled(golang(github.com/aws/smithy-go/transport/http))
+Provides:       bundled(golang(github.com/aws/smithy-go/transport/http/internal/io))
+Provides:       bundled(golang(github.com/aws/smithy-go/waiter))
+Provides:       bundled(golang(github.com/cihub/seelog))
+Provides:       bundled(golang(github.com/cihub/seelog/archive))
+Provides:       bundled(golang(github.com/cihub/seelog/archive/gzip))
+Provides:       bundled(golang(github.com/cihub/seelog/archive/tar))
+Provides:       bundled(golang(github.com/cihub/seelog/archive/zip))
+Provides:       bundled(golang(github.com/containerd/containerd/pkg/apparmor))
+Provides:       bundled(golang(github.com/containerd/containerd/pkg/userns))
+Provides:       bundled(golang(github.com/containerd/log))
+Provides:       bundled(golang(github.com/coreos/go-systemd/activation))
+Provides:       bundled(golang(github.com/docker/docker/api/types/blkiodev))
+Provides:       bundled(golang(github.com/docker/docker/api/types/container))
+Provides:       bundled(golang(github.com/docker/docker/api/types/filters))
+Provides:       bundled(golang(github.com/docker/docker/api/types/mount))
+Provides:       bundled(golang(github.com/docker/docker/api/types/network))
+Provides:       bundled(golang(github.com/docker/docker/api/types/registry))
+Provides:       bundled(golang(github.com/docker/docker/api/types/strslice))
+Provides:       bundled(golang(github.com/docker/docker/api/types/swarm))
+Provides:       bundled(golang(github.com/docker/docker/api/types/swarm/runtime))
+Provides:       bundled(golang(github.com/docker/docker/api/types/versions))
+Provides:       bundled(golang(github.com/docker/docker/image/spec/specs-go/v1))
+Provides:       bundled(golang(github.com/docker/docker/internal/multierror))
+Provides:       bundled(golang(github.com/docker/docker/pkg/archive))
+Provides:       bundled(golang(github.com/docker/docker/pkg/homedir))
+Provides:       bundled(golang(github.com/docker/docker/pkg/idtools))
+Provides:       bundled(golang(github.com/docker/docker/pkg/ioutils))
+Provides:       bundled(golang(github.com/docker/docker/pkg/jsonmessage))
+Provides:       bundled(golang(github.com/docker/docker/pkg/longpath))
+Provides:       bundled(golang(github.com/docker/docker/pkg/pools))
+Provides:       bundled(golang(github.com/docker/docker/pkg/stdcopy))
+Provides:       bundled(golang(github.com/docker/docker/pkg/system))
+Provides:       bundled(golang(github.com/docker/docker/profiles/apparmor))
+Provides:       bundled(golang(github.com/docker/go-connections/nat))
+Provides:       bundled(golang(github.com/docker/go-connections/sockets))
+Provides:       bundled(golang(github.com/docker/go-plugins-helpers/sdk))
+Provides:       bundled(golang(github.com/docker/go-plugins-helpers/volume))
+Provides:       bundled(golang(github.com/docker/go-units))
+Provides:       bundled(golang(github.com/fsouza/go-dockerclient))
+Provides:       bundled(golang(github.com/gogo/protobuf/proto))
+Provides:       bundled(golang(github.com/golang/mock/gomock))
+Provides:       bundled(golang(github.com/golang/mock/mockgen/model))
+Provides:       bundled(golang(github.com/jmespath/go-jmespath))
+Provides:       bundled(golang(github.com/klauspost/compress))
+Provides:       bundled(golang(github.com/klauspost/compress/fse))
+Provides:       bundled(golang(github.com/klauspost/compress/huff0))
+Provides:       bundled(golang(github.com/klauspost/compress/internal/cpuinfo))
+Provides:       bundled(golang(github.com/klauspost/compress/internal/le))
+Provides:       bundled(golang(github.com/klauspost/compress/internal/snapref))
+Provides:       bundled(golang(github.com/klauspost/compress/zstd))
+Provides:       bundled(golang(github.com/klauspost/compress/zstd/internal/xxhash))
+Provides:       bundled(golang(github.com/moby/patternmatcher))
+Provides:       bundled(golang(github.com/moby/sys/sequential))
+Provides:       bundled(golang(github.com/moby/sys/user))
+Provides:       bundled(golang(github.com/moby/sys/userns))
+Provides:       bundled(golang(github.com/moby/term))
+Provides:       bundled(golang(github.com/moby/term/windows))
+Provides:       bundled(golang(github.com/morikuni/aec))
+Provides:       bundled(golang(github.com/opencontainers/go-digest))
+Provides:       bundled(golang(github.com/opencontainers/image-spec/specs-go))
+Provides:       bundled(golang(github.com/opencontainers/image-spec/specs-go/v1))
+Provides:       bundled(golang(github.com/pkg/errors))
+Provides:       bundled(golang(github.com/sirupsen/logrus))
+Provides:       bundled(golang(github.com/stretchr/testify/assert))
+Provides:       bundled(golang(github.com/stretchr/testify/assert/yaml))
+Provides:       bundled(golang(github.com/stretchr/testify/internal/difflib))
+Provides:       bundled(golang(github.com/stretchr/testify/internal/spew))
+Provides:       bundled(golang(github.com/stretchr/testify/require))
+Provides:       bundled(golang(github.com/vishvananda/netlink))
+Provides:       bundled(golang(github.com/vishvananda/netlink/nl))
+Provides:       bundled(golang(github.com/vishvananda/netns))
+Provides:       bundled(golang(go.yaml.in/yaml/v3))
+Provides:       bundled(golang(golang.org/x/exp/constraints))
+Provides:       bundled(golang(golang.org/x/net/internal/socks))
+Provides:       bundled(golang(golang.org/x/net/proxy))
+Provides:       bundled(golang(golang.org/x/sys/unix))
+Provides:       bundled(golang(golang.org/x/sys/windows))
+Provides:       bundled(golang(golang.org/x/sys/windows/registry))
+Provides:       bundled(golang(golang.org/x/sys/windows/svc/eventlog))
 
 %description
 ecs-init supports the initialization and supervision of the Amazon ECS
@@ -159,10 +284,7 @@ required routes among its preparation steps.
 
 %build
 # each of these should build for arm and amd arch
-./scripts/get-host-certs
-./scripts/build-cni-plugins
-./scripts/build-integrated true "" false true
-./scripts/build-agent-image
+make release-agent-internal KOJI_BUILD=true
 ./scripts/gobuild.sh %{gobuild_tag}
 
 %install
@@ -173,6 +295,13 @@ install -m %{no_exec_perm} -D scripts/amazon-ecs-init.1 %{buildroot}%{_mandir}/m
 mkdir -p %{buildroot}%{_sysconfdir}/ecs
 touch %{buildroot}%{_sysconfdir}/ecs/ecs.config
 touch %{buildroot}%{_sysconfdir}/ecs/ecs.config.json
+
+mkdir -p %{buildroot}%{ebs_csi_driver_dir}
+%ifarch aarch64
+install -m %{no_exec_perm} -D %{SOURCE6} %{buildroot}%{ebs_csi_driver_dir}/ebs-csi-driver.tar
+%else
+install -m %{no_exec_perm} -D %{SOURCE7} %{buildroot}%{ebs_csi_driver_dir}/ebs-csi-driver.tar
+%endif
 
 # Configure ecs-init to reload the bundled ECS container agent image.
 mkdir -p %{buildroot}%{_cachedir}/ecs
@@ -194,12 +323,15 @@ install -m %{no_exec_perm} -D %{SOURCE5} %{buildroot}%{_sysconfdir}/init/amazon-
 %{_libexecdir}/amazon-ecs-init
 %{_mandir}/man1/amazon-ecs-init.1*
 %{_libexecdir}/amazon-ecs-volume-plugin
+%dir %{_sysconfdir}/ecs
 %config(noreplace) %ghost %{_sysconfdir}/ecs/ecs.config
 %config(noreplace) %ghost %{_sysconfdir}/ecs/ecs.config.json
 %ghost %{_cachedir}/ecs/ecs-agent.tar
 %{_cachedir}/ecs/%{basename:%{agent_image}}
 %{_cachedir}/ecs/state
 %dir %{_sharedstatedir}/ecs/data
+%dir %{ebs_csi_driver_dir}
+%{ebs_csi_driver_dir}/ebs-csi-driver.tar
 
 %if %{with systemd}
 %{_unitdir}/ecs.service
@@ -272,6 +404,309 @@ fi
 %endif
 
 %changelog
+* Wed Nov 11 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.108.3-1
+- Cache Agent version 1.108.3
+
+* Wed Oct 28 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.108.2-1
+- Cache Agent version 1.108.2
+
+* Thu Oct 15 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.108.1-1
+- Cache Agent version 1.108.1
+
+* Tue Sep 29 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.108.0-1
+- Cache Agent version 1.108.0
+
+* Thu Sep 17 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.107.0-1
+- Cache Agent version 1.107.0
+
+* Fri Aug 28 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.106.2-1
+- Cache Agent version 1.106.2
+
+* Fri Aug 07 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.106.1-1
+- Cache Agent version 1.106.1
+
+* Wed Jul 22 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.106.0-1
+- Cache Agent version 1.106.0
+
+* Mon Jun 29 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.105.1-1
+- Cache Agent version 1.105.1
+
+* Fri Jun 12 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.105.0-1
+- Cache Agent version 1.105.0
+
+* Thu Jun 04 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.104.0-1
+- Cache Agent version 1.104.0
+
+* Tue May 19 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.103.2-1
+- Cache Agent version 1.103.2
+
+* Mon May 04 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.103.1-1
+- Cache Agent version 1.103.1
+
+* Tue Apr 21 2026 amazon-ecs-bot <amazon-ecs-bot@amazon.com> - 1.103.0-1
+- Cache Agent version 1.103.0
+
+* Mon Mar 30 2026 Amogh Rathore <amoghr@amazon.com> - 1.102.2-1
+- Cache Agent version 1.102.2
+
+* Fri Mar 06 2026 Prateek Chaudhry <ptchau@amazon.com> - 1.102.1-1
+- Cache Agent version 1.102.1
+
+* Thu Feb 19 2026 Cameron Sparr <cssparr@amazon.com> - 1.102.0-1
+- Cache Agent version 1.102.0
+
+* Thu Jan 29 2026 Thean Lim <theanlim@amazon.com> - 1.101.3-1
+- Cache Agent version 1.101.3
+
+* Fri Jan 09 2026 Prateek Chaudhry <ptchau@amazon.com> - 1.101.2-1
+- Cache Agent version 1.101.2
+
+* Wed Dec 10 2025 Michael Ye <yemike@amazon.com> - 1.101.1-1
+- Cache Agent version 1.101.1
+
+* Wed Nov 12 2025 Amogh Rathore <amoghr@amazon.com> - 1.101.0-1
+- Cache Agent version 1.101.0
+
+* Tue Oct 28 2025 Anuj Singh <singholt@amazon.com> - 1.100.1-1
+- Cache Agent version 1.100.1
+
+* Tue Oct 07 2025 Harish Senthilkumar <harishxr@amazon.com> - 1.100.0-1
+- Cache Agent version 1.100.0
+
+* Wed Sep 17 2025 Yiyuan Zhong <yiyzhong@amazon.com> - 1.99.1-1
+- Cache Agent version 1.99.1
+
+* Wed Sep 03 2025 Dane Lim <slimdane@amazon.com> - 1.99.0-1
+- Cache Agent version 1.99.0
+
+* Fri Aug 15 2025 Shelby Hagman <shelbyzh@amazon.com> - 1.98.0-1
+- Cache Agent version 1.98.0
+
+* Thu Aug 07 2025 Harish Senthilkumar <harishxr@amazon.com> - 1.97.1-1
+- Cache Agent version 1.97.1
+
+* Wed Jul 23 2025 Dane Lim <slimdane@amazon.com> - 1.97.0-1
+- Cache Agent version 1.97.0
+
+* Thu Jul 03 2025 Prateek Chaudhry <ptchau@amazon.com> - 1.96.0-1
+- Cache Agent version 1.96.0
+
+* Thu Jun 05 2025 Harish Senthilkumar <harishxr@amazon.com> - 1.95.0-1
+- Cache Agent version 1.95.0
+
+* Tue May 20 2025 Dane Lim <slimdane@amazon.com> - 1.94.0-1
+- Cache Agent version 1.94.0
+
+* Tue May 06 2025 Anuj Singh <singholt@amazon.com> - 1.93.1-1
+- Cache Agent version 1.93.1
+
+* Wed Apr 23 2025 Amogh Rathore <amoghr@amazon.com> - 1.93.0-1
+- Cache Agent version 1.93.0
+
+* Wed Apr 09 2025 Thean Lim <theanlim@amazon.com> - 1.92.0-1
+- Cache Agent version 1.92.0
+
+* Thu Mar 20 2025 Dane H Lim <slimdane@amazon.com> - 1.91.2-1
+- Cache Agent version 1.91.2
+
+* Tue Mar 11 2025 Michael Ye <yemike@amazon.com> - 1.91.1-1
+- Cache Agent version 1.91.1
+
+* Thu Feb 20 2025 Amogh Rathore <amoghr@amazon.com> - 1.91.0-1
+- Cache Agent version 1.91.0
+
+* Thu Jan 23 2025 Thean Lim <theanlim@amazon.com> - 1.90.0-1
+- Cache Agent version 1.90.0
+
+* Tue Jan 07 2025 Prateek Chaudhry <ptchau@amazon.com> - 1.89.3-1
+- Cache Agent version 1.89.3
+
+* Mon Dec 09 2024 Yiyuan Zhong <yiyzhong@amazon.com> - 1.89.2-1
+- Cache Agent version 1.89.2
+
+* Tue Nov 19 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.89.1-1
+- Cache Agent version 1.89.1
+
+* Thu Nov 14 2024 Thean Lim <theanlim@amazon.com> - 1.89.0-1
+- Cache Agent version 1.89.0
+
+* Wed Oct 30 2024 Michael Ye <yemike@amazon.com> - 1.88.0-1
+- Cache Agent version 1.88.0
+
+* Thu Oct 10 2024 Amogh Rathore <amoghr@amazon.com> - 1.87.1-1
+- Cache Agent version 1.87.1
+
+* Thu Sep 19 2024 Yiyuan Zhong <yiyzhong@amazon.com> - 1.87.0-1
+- Cache Agent version 1.87.0
+
+* Mon Aug 26 2024 Dane Lim <slimdane@amazon.com> - 1.86.3-1
+- Cache Agent version 1.86.3
+
+* Sat Aug 17 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.86.2-1
+- Cache Agent version 1.86.2
+
+* Thu Aug 15 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.86.1-1
+- Cache Agent version 1.86.1
+
+* Wed Aug 07 2024 Dane Lim <slimdane@amazon.com> - 1.86.0-1
+- Cache Agent version 1.86.0
+
+* Fri Jul 26 2024 Anuj Singh <singholt@amazon.com> - 1.85.3-1
+- Cache Agent version 1.85.3
+
+* Wed Jul 24 2024 Anuj Singh <singholt@amazon.com> - 1.85.2-1
+- Cache Agent version 1.85.2
+
+* Thu Jul 11 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.85.1-1
+- Cache Agent version 1.85.1
+
+* Mon Jul 08 2024 Amogh Rathore <amoghr@amazon.com> - 1.85.0-1
+- Cache Agent version 1.85.0
+
+* Thu Jun 13 2024 Prateek Chaudhry <ptchau@amazon.com> - 1.84.0-1
+- Cache Agent version 1.84.0
+
+* Tue May 28 2024 Yiyuan Zhong <yiyzhong@amazon.com> - 1.83.0-1
+- Cache Agent version 1.83.0
+
+* Wed May 08 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.82.4-1
+- Cache Agent version 1.82.4
+
+* Fri Apr 19 2024 Harish Senthilkumar <harishxr@amazon.com> - 1.82.3-1
+- Cache Agent version 1.82.3
+
+* Thu Apr 04 2024 Yiyuan Zhong <yiyzhong@amazon.com> - 1.82.2-1
+- Cache Agent version 1.82.2
+
+* Tue Mar 19 2024 Michael Ye <yemike@amazon.com> - 1.82.1-1
+- Cache Agent version 1.82.1
+
+* Wed Feb 28 2024 Amogh Rathore <amoghr@amazon.com> - 1.82.0-1
+- Cache Agent version 1.82.0
+
+* Tue Feb 20 2024 Yinyi Chen <yinyic@amazon.com> - 1.81.1-1
+- Cache Agent version 1.81.1
+
+* Wed Jan 31 2024 Chien-Han Lin <chilinn@amazon.com> - 1.81.0-1
+- Cache Agent version 1.81.0
+
+* Tue Jan 09 2024 Michael Ye <yemike@amazon.com> - 1.80.0-1
+- Cache Agent version 1.80.0
+
+* Mon Dec 04 2023 Dane Lim <slimdane@amazon.com> - 1.79.2-1
+- Cache Agent version 1.79.2
+
+* Mon Nov 13 2023 Chien-Han Lin <chilinn@amazon.com> - 1.79.1-1
+- Cache Agent version 1.79.1
+
+* Tue Oct 31 2023 Saisree Valluri <vsaisree@amazon.com> - 1.79.0-1
+- Cache Agent version 1.79.0
+
+* Thu Oct 26 2023 Anuj Singh <singholt@amazon.com> - 1.78.1-1
+- Cache Agent version 1.78.1
+
+* Wed Oct 11 2023 Cameron Sparr <cssparr@amazon.com> - 1.78.0-1
+- Cache Agent version 1.78.0
+
+* Wed Sep 27 2023 Prateek Chaudhry <ptchau@amazon.com> - 1.77.0-1
+- Cache Agent version 1.77.0
+
+* Tue Sep 12 2023 Yinyi Chen <yinyic@amazon.com> - 1.76.0-1
+- Cache Agent version 1.76.0
+
+* Wed Aug 30 2023 Utsa Bhattacharjya <utsa@amazon.com> - 1.75.3-1
+- Cache Agent version 1.75.3
+
+* Tue Aug 29 2023 Utsa Bhattacharjya <utsa@amazon.com> - 1.75.2-1
+- Cache Agent version 1.75.2
+
+* Thu Aug 24 2023 Ray Allan <fierlion@amazon.com> - 1.75.1-1
+- Cache Agent version 1.75.1
+
+* Wed Aug 09 2023 Chien-Han Lin <chilinn@amazon.com> - 1.75.0-1
+- Cache Agent version 1.75.0
+
+* Fri Jul 21 2023 Heming Han <hanhm@amazon.com> - 1.74.1-1
+- Cache Agent version 1.74.1
+
+* Thu Jul 20 2023 Heming Han <hanhm@amazon.com> - 1.74.0-1
+- Cache Agent version 1.74.0
+
+* Wed Jul 05 2023 Michael Ye <yemike@amazon.com> - 1.73.1-1
+- Cache Agent version 1.73.1
+
+* Thu Jun 22 2023 Prateek Chaudhry <ptchau@amazon.com> - 1.73.0-1
+- Cache Agent version 1.73.0
+
+* Tue Jun 06 2023 Yinyi Chen <yinyic@amazon.com> - 1.72.0-1
+- Cache Agent version 1.72.0
+
+* Tue May 23 2023 Utsa Bhattacharjya <utsa@amazon.com> - 1.71.2-1
+- Cache Agent version 1.71.2
+
+* Tue May 09 2023 Heming Han <hanhm@amazon.com> - 1.71.1-1
+- Cache Agent version 1.71.1
+
+* Tue Apr 25 2023 Yiyuan Zhong <yiyzhong@amazon.com> - 1.71.0-1
+- Cache Agent version 1.71.0
+
+* Tue Apr 11 2023 Mythri Garaga Manjunatha <mythr@amazon.com> - 1.70.2-1
+- Cache Agent version 1.70.2
+
+* Tue Mar 28 2023 Yash Kulshrstha <kulshres@amazon.com> - 1.70.1-1
+- Cache Agent version 1.70.1
+
+* Mon Mar 13 2023 Utsa Bhattacharjya <utsa@amazon.com> - 1.70.0-1
+- Cache Agent version 1.70.0
+
+* Fri Feb 24 2023 Yash Kulshrestha <kulshres@amazon.com> - 1.69.0-1
+- Cache Agent version 1.69.0
+
+* Wed Feb 08 2023 Prateek Chaudhry <ptchau@amazon.com> - 1.68.2-1
+- Cache Agent version 1.68.2
+
+* Mon Jan 23 2023 Utsa Bhattacharjya <utsa@amazon.com> - 1.68.1-1
+- Cache Agent version 1.68.1
+
+* Mon Jan 09 2023 Ray Allan <fierlion@amazon.com> - 1.68.0-1
+- Cache Agent version 1.68.0
+
+* Mon Dec 12 2022 Utsa Bhattacharjya <utsa@amazon.com> - 1.67.2-1
+- Cache Agent version 1.67.2
+
+* Wed Dec 07 2022 Dane H Lim <slimdane@amazon.com> - 1.67.1-1
+- Cache Agent version 1.67.1
+
+* Mon Dec 05 2022 Yash Kulshrestha <kulshres@amazon.com> - 1.67.0-1
+- Cache Agent version 1.67.0
+
+* Sat Nov 12 2022 Heming Han <hanhm@amazon.com> - 1.66.2-1
+- Cache Agent version 1.66.2
+
+* Thu Nov 10 2022 Heming Han <hanhm@amazon.com> - 1.66.1-1
+- Cache Agent version 1.66.1
+
+* Tue Nov 08 2022 Cameron Sparr <cssparr@amazon.com> - 1.66.0-1
+- Cache Agent version 1.66.0
+
+* Fri Oct 28 2022 Ray Allan <fierlion@amazon.com> - 1.65.1-1
+- Cache Agent version 1.65.1
+
+* Wed Oct 19 2022 Mythri Garaga Manjunatha <mythr@amazon.com> - 1.65.0-1
+- Cache Agent version 1.65.0
+
+* Tue Oct 04 2022 Utsa Bhattacharjya <utsa@amazon.com> - 1.64.0-1
+- Cache Agent version 1.64.0
+
+* Mon Sep 12 2022 Chien Han Lin <chilinn@amazon.com> - 1.63.1-1
+- Cache Agent version 1.63.1
+- Dependabot ecs-init fixes
+
+* Tue Sep 06 2022 Chien Han Lin <chilinn@amazon.com> - 1.63.0-1
+- Cache Agent version 1.63.0
+- Update dependencies to include security patches reported by dependabot for ecs-init
+- Fix format string for ecs-init
+
 * Wed Aug 17 2022 Yash Kulshrestha <kulshres@amazon.com> - 1.62.2-1
 - Cache Agent version 1.62.2
 
@@ -283,6 +718,9 @@ fi
 
 * Wed Jun 15 2022 Mythri Garaga Manjunatha <mythr@amazon.com> - 1.61.3-1
 - Cache Agent version 1.61.3
+
+* Wed Jun 01 2022 Utsa Bhattacharjya <utsa@amazon.com> - 1.61.2-1
+- Cache Agent version 1.61.2
 
 * Tue May 03 2022 Anuj Singh <singholt@amazon.com> - 1.61.1-1
 - Cache Agent version 1.61.1
@@ -737,3 +1175,4 @@ fi
 
 * Mon Dec 15 2014 Samuel Karp <skarp@amazon.com> - 0.2-1
 - Naive update functionality
+

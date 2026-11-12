@@ -31,8 +31,29 @@ New tests cover the changes: <!-- yes|no -->
 <!--
 Write a short (one line) summary that describes the changes in this
 pull request for inclusion in the changelog.
+
+Format: [Category] Description
+Categories: Feature, Enhancement, Bugfix, Housekeeping
+
+Examples:
+- Feature - Add support for ECS Exec
+- Enhancement - Improve error handling in task cleanup
+- Bugfix - Fixed memory leak in stats collector
+- Housekeeping - Update go module dependencies
+
 You can see our changelog entry style here:
 https://github.com/aws/amazon-ecs-agent/commit/c9aefebc2b3007f09468f651f6308136bd7b384f
+-->
+
+### Additional Information
+
+**Does this PR include breaking model changes? If so, Have you added transformation functions?**
+<!-- If yes, next release should have a upgraded minor version -->  
+
+**Does this PR include the addition of new environment variables in the README?**
+<!-- 
+If it is a sensitive variable, add it to this blocklist in ecs-logs-collector here: https://github.com/aws/amazon-ecs-logs-collector/blob/b0958c2aa424c6dc578d5a8def4422c51791a076/ecs-logs-collector.sh#L63
+If it is not a sensitive variable, add it to the allowlist in ecs-logs-collector here: https://github.com/aws/amazon-ecs-logs-collector/blob/b0958c2aa424c6dc578d5a8def4422c51791a076/ecs-logs-collector.sh#L66
 -->
 
 ### Licensing

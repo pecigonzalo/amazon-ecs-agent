@@ -14,12 +14,12 @@
 package engine
 
 import (
-	"encoding/json"
-
 	"context"
+	"encoding/json"
 
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/data"
+	dm "github.com/aws/amazon-ecs-agent/agent/engine/daemonmanager"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
 )
 
@@ -43,6 +43,12 @@ type TaskEngine interface {
 	// lifecycle. If it returns an error, the task was not added.
 	AddTask(*apitask.Task)
 
+	// UpsertTask upserts a task in the task engine. Upserting means:
+	//   - if a task with the same ARN already exists in the task engine's state, then the existing task's desired
+	//     status is updated to the desired status of the upserted task
+	//   - else the upserted task is inserted into the task engine's state
+	UpsertTask(*apitask.Task)
+
 	// ListTasks lists all the tasks being managed by the TaskEngine.
 	ListTasks() ([]*apitask.Task, error)
 
@@ -55,6 +61,10 @@ type TaskEngine interface {
 	LoadState() error
 	// SaveState saves all the data in task engine state to db.
 	SaveState() error
+
+	GetDaemonManagers() map[string]dm.DaemonManager
+	GetDaemonTask(string) *apitask.Task
+	SetDaemonTask(string, *apitask.Task)
 
 	json.Marshaler
 	json.Unmarshaler

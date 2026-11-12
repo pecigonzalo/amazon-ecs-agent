@@ -15,9 +15,10 @@ package data
 
 import (
 	"github.com/aws/amazon-ecs-agent/agent/api/container"
-	"github.com/aws/amazon-ecs-agent/agent/api/eni"
 	"github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment/resource"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 )
 
 type noopClient struct{}
@@ -68,7 +69,7 @@ func (c *noopClient) GetImageStates() ([]*image.ImageState, error) {
 	return nil, nil
 }
 
-func (c *noopClient) SaveENIAttachment(*eni.ENIAttachment) error {
+func (c *noopClient) SaveENIAttachment(*networkinterface.ENIAttachment) error {
 	return nil
 }
 
@@ -76,7 +77,19 @@ func (c *noopClient) DeleteENIAttachment(string) error {
 	return nil
 }
 
-func (c *noopClient) GetENIAttachments() ([]*eni.ENIAttachment, error) {
+func (c *noopClient) GetENIAttachments() ([]*networkinterface.ENIAttachment, error) {
+	return nil, nil
+}
+
+func (c *noopClient) SaveResourceAttachment(*resource.ResourceAttachment) error {
+	return nil
+}
+
+func (c *noopClient) DeleteResourceAttachment(string) error {
+	return nil
+}
+
+func (c *noopClient) GetResourceAttachments() ([]*resource.ResourceAttachment, error) {
 	return nil, nil
 }
 
@@ -86,6 +99,10 @@ func (c *noopClient) SaveMetadata(string, string) error {
 
 func (c *noopClient) GetMetadata(string) (string, error) {
 	return "", nil
+}
+
+func (c *noopClient) HasNonTerminalTasks() bool {
+	return false
 }
 
 func (c *noopClient) Close() error {

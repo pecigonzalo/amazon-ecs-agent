@@ -15,7 +15,7 @@ check-option-value() {
 }
 
 usage() {
-    echo "$(basename "$0") [--help] --region REGION --activation-code CODE --activation-id ID [--cluster CLUSTER] [--enable-gpu] [--docker-install-source all|docker|distro|none] [--ecs-version VERSION] [--ecs-endpoint ENDPOINT] [--skip-registration] [--no-start]
+    echo "$(basename "$0") [--help] --region REGION --activation-code CODE --activation-id ID [--cluster CLUSTER] [--enable-gpu] [--docker-install-source all|docker|distro|none] [--ecs-version VERSION] [--ecs-endpoint ENDPOINT] [--skip-registration] [--no-start] [--ip-compatibility ipv4|ipv6]
 
   --help
         (optional) display this help message.
@@ -37,6 +37,8 @@ usage() {
         (optional) if this is enabled, SSM agent install and instance registration with SSM is skipped.
   --certs-file
         (optional) TLS certs for execute command feature. Defaults to searching for certs in known possible locations.
+  --ip-compatibility string
+        (optional) IP compatibility mode. Possible values are 'ipv4' or 'ipv6'. If not specified, auto-detects based on routing table.
   --no-start
         (optional) if this flag is provided, SSM agent, docker and ECS agent will not be started by the script despite being installed."
 }
@@ -54,11 +56,13 @@ DEB_URL=""
 RPM_URL=""
 ECS_ENDPOINT=""
 CERTS_FILE=""
-# Whether to check signature for the downloaded amazon-ecs-init package. true unless --skip-gpg-check
-# specified. --skip-gpg-check is mostly for testing purpose (so that we can test a custom build of ecs init package
-# without having to sign it).
+# Whether to check GPG signature for downloaded amazon-ecs-init and amazon-ssm-agent packages. true unless
+# --skip-gpg-check is specified. --skip-gpg-check can be used for testing with custom unsigned ecs-init builds,
+# or when GPG verification is not feasible.
 CHECK_SIG=true
 NO_START=false
+IP_COMPATIBILITY=""
+
 while :; do
     case "$1" in
     --help)
@@ -131,6 +135,15 @@ while :; do
         CHECK_SIG=false
         shift 1
         ;;
+    --ip-compatibility)
+        check-option-value "$1" "$2"
+        if [ "$2" != "ipv4" ] && [ "$2" != "ipv6" ]; then
+            echo "Invalid value for --ip-compatibility: $2. Must be 'ipv4' or 'ipv6'."
+            fail
+        fi
+        IP_COMPATIBILITY="$2"
+        shift 2
+        ;;
     *)
         [ -z "$1" ] && break
         echo "invalid option: [$1]"
@@ -200,14 +213,68 @@ else
     fail
 fi
 
+# Determines if IPv6-only configuration should be used.
+# Uses --ip-compatibility flag if set, otherwise auto-detects from routing table.
+# Returns 0 for IPv6-only, 1 for IPv4
+is-ipv6() {
+    # If explicitly set to ipv6, return true
+    if [ "$IP_COMPATIBILITY" = "ipv6" ]; then
+        return 0
+    fi
+
+    # If explicitly set to ipv4, return false
+    if [ "$IP_COMPATIBILITY" = "ipv4" ]; then
+        return 1
+    fi
+
+    # Auto-detect when not explicitly set
+    # Check if ip command is available
+    if ! command -v ip >/dev/null 2>&1; then
+        echo "WARNING: ip command not found while detecting IP compatibility, assuming IPv4"
+        return 1
+    fi
+
+    # Auto-detect IPv6-only environment by checking routes
+    # Check if there's a default IPv4 route
+    if ip route show default | grep -q "default"; then
+        # IPv4 default route exists, not IPv6-only
+        return 1
+    fi
+
+    # Check if there's a default IPv6 route
+    if ip -6 route show default | grep -q "default"; then
+        # IPv6 default route exists but no IPv4, this is IPv6-only
+        return 0
+    fi
+
+    # No default routes found, assume IPv4
+    return 1
+}
+
+is-cn-region() {
+    [[ $REGION =~ ^cn- ]]
+}
+
+is-eusc-region() {
+    [[ $REGION =~ ^eusc- ]]
+}
+
 S3_BUCKET="amazon-ecs-agent-$REGION"
 RPM_PKG_NAME="amazon-ecs-init-$ECS_VERSION.$ARCH.rpm"
 DEB_PKG_NAME="amazon-ecs-init-$ECS_VERSION.$ARCH_ALT.deb"
-S3_URL_SUFFIX=""
-if grep -q "^cn-" <<< "$REGION"; then
-    S3_URL_SUFFIX=".cn"
+S3_URL_SUFFIX="amazonaws.com"
+if is-cn-region; then
+    S3_URL_SUFFIX="${S3_URL_SUFFIX}.cn"
 fi
-S3_URL="https://s3.${REGION}.amazonaws.com${S3_URL_SUFFIX}"
+if is-eusc-region; then
+    S3_URL_SUFFIX="amazonaws.eu"
+fi
+S3_URL_DUALSTACK=""
+# Dualstack URLs in EUSC regions are currently not yet fully supported.
+if is-ipv6 && ! is-eusc-region; then
+    S3_URL_DUALSTACK="dualstack."
+fi
+S3_URL="https://s3.${S3_URL_DUALSTACK}${REGION}.${S3_URL_SUFFIX}"
 SSM_S3_BUCKET="amazon-ssm-$REGION"
 
 if [ -z "$RPM_URL" ]; then
@@ -316,7 +383,34 @@ register-ssm-agent() {
     ok
 }
 
+configure-ssm-agent-ipv6() {
+    try "configure SSM agent for IPv6-only environment"
+    local ssm_config_dir="/etc/amazon/ssm"
+    local ssm_config_file="$ssm_config_dir/amazon-ssm-agent.json"
+
+    if [ -f "$ssm_config_file" ]; then
+        echo "SSM agent configuration file already exists at $ssm_config_file, skipping creation."
+    else
+        echo "Creating SSM agent configuration for IPv6-only environment"
+        mkdir -p "$ssm_config_dir"
+
+        cat > "$ssm_config_file" << EOF
+{
+        "Agent": {
+		    "UseDualStackEndpoint": true
+	    }
+}
+EOF
+        echo "Created SSM agent configuration file at $ssm_config_file"
+    fi
+    ok
+}
+
 install-ssm-agent() {
+# Dualstack URLs in EUSC regions are currently not yet fully supported.
+    if is-ipv6 && ! is-eusc-region; then
+        configure-ssm-agent-ipv6
+    fi
     try "install ssm agent"
     if systemctl is-enabled $SSM_SERVICE_NAME &>/dev/null; then
         echo "SSM agent is already installed."
@@ -331,15 +425,19 @@ install-ssm-agent() {
         case "$PKG_MANAGER" in
         apt)
             curl-helper "$dir/$SSM_DEB_PKG_NAME" "$SSM_DEB_URL"
-            curl-helper "$dir/$SSM_DEB_PKG_NAME.sig" "$SSM_DEB_URL.sig"
-            ssm-agent-signature-verify "$dir/$SSM_DEB_PKG_NAME.sig" "$dir/$SSM_DEB_PKG_NAME"
+            if $CHECK_SIG; then
+                curl-helper "$dir/$SSM_DEB_PKG_NAME.sig" "$SSM_DEB_URL.sig"
+                ssm-agent-signature-verify "$dir/$SSM_DEB_PKG_NAME.sig" "$dir/$SSM_DEB_PKG_NAME"
+            fi
             chmod -R a+rX "$dir"
             dpkg -i "$dir/ssm-agent.deb"
             ;;
         dnf | yum | zypper)
             curl-helper "$dir/$SSM_RPM_PKG_NAME" "$SSM_RPM_URL"
-            curl-helper "$dir/$SSM_RPM_PKG_NAME.sig" "$SSM_RPM_URL.sig"
-            ssm-agent-signature-verify "$dir/$SSM_RPM_PKG_NAME.sig" "$dir/$SSM_RPM_PKG_NAME"
+            if $CHECK_SIG; then
+                curl-helper "$dir/$SSM_RPM_PKG_NAME.sig" "$SSM_RPM_URL.sig"
+                ssm-agent-signature-verify "$dir/$SSM_RPM_PKG_NAME.sig" "$dir/$SSM_RPM_PKG_NAME"
+            fi
             local args=""
             local install_args="-y"
             if [[ "$PKG_MANAGER" == "zypper" ]]; then
@@ -364,7 +462,7 @@ ssm-agent-signature-verify() {
         return
     fi
 
-    curl-helper "$dir/amazon-ssm-agent.gpg" "https://raw.githubusercontent.com/aws/amazon-ecs-init/master/scripts/amazon-ssm-agent.gpg"
+    curl-helper "$dir/amazon-ssm-agent.gpg" "${S3_URL}/${S3_BUCKET}/amazon-ssm-agent.gpg"
     gpg --import "$dir/amazon-ssm-agent.gpg"
 
     if gpg --verify "$1" "$2"; then
@@ -548,7 +646,7 @@ ecs-init-signature-verify() {
         return
     fi
 
-    curl-helper "$dir/amazon-ecs-agent.gpg" "https://raw.githubusercontent.com/aws/amazon-ecs-init/master/scripts/amazon-ecs-agent.gpg"
+    curl-helper "$dir/amazon-ecs-agent.gpg" "${S3_URL}/${S3_BUCKET}/amazon-ecs-agent.gpg"
     gpg --import "$dir/amazon-ecs-agent.gpg"
     if gpg --verify "$1" "$2"; then
         echo "amazon-ecs-init GPG verification passed. Install amazon-ecs-init."
@@ -637,23 +735,28 @@ find-copy-certs-exec() {
 }
 
 download-ssm-binaries-exec() {
-    BINARY_VERSION="3.1.804.0"
+    BINARY_VERSION="3.3.5700.0"
     BINARY_PATH="/var/lib/ecs/deps/execute-command/bin/${BINARY_VERSION}"
-    BINARY_DOWNLOAD_PATH="ssm-binaries"
+    local BINARY_URL="${S3_URL}/${SSM_S3_BUCKET}/${BINARY_VERSION}/linux_$ARCH_ALT/amazon-ssm-agent-binaries.tar.gz"
+
+    local dir
+    dir="$(mktemp -d)"
 
     # Download SSM binaries from S3
     echo "Downloading SSM binaries for exec feature"
 
-    mkdir -p $BINARY_DOWNLOAD_PATH
-    curl "${S3_URL}/${SSM_S3_BUCKET}/${BINARY_VERSION}/linux_$ARCH_ALT/amazon-ssm-agent-binaries.tar.gz" -o ${BINARY_DOWNLOAD_PATH}/amazon-ssm-agent.tar.gz
-    tar -xvf ${BINARY_DOWNLOAD_PATH}/amazon-ssm-agent.tar.gz -C ${BINARY_DOWNLOAD_PATH}/
+    curl-helper "$dir/amazon-ssm-agent.tar.gz" "$BINARY_URL"
+    if $CHECK_SIG; then
+        curl-helper "$dir/amazon-ssm-agent.tar.gz.sig" "$BINARY_URL.sig"
+        ssm-agent-signature-verify "$dir/amazon-ssm-agent.tar.gz.sig" "$dir/amazon-ssm-agent.tar.gz"
+    fi
+    tar -xvf "$dir/amazon-ssm-agent.tar.gz" -C "$dir/"
 
-    # Copy binaries to exec directory
-    mkdir -p ${BINARY_PATH}
-    cp ${BINARY_DOWNLOAD_PATH}/amazon-ssm-agent ${BINARY_PATH}/amazon-ssm-agent
-    cp ${BINARY_DOWNLOAD_PATH}/ssm-agent-worker ${BINARY_PATH}/ssm-agent-worker
-    cp ${BINARY_DOWNLOAD_PATH}/ssm-session-worker ${BINARY_PATH}/ssm-session-worker
-    rm -rf ${BINARY_DOWNLOAD_PATH}
+    # Copy binaries to exec directory and set permissions simultaneously
+    install -D -m 0755 "$dir/amazon-ssm-agent" "${BINARY_PATH}/amazon-ssm-agent"
+    install -D -m 0755 "$dir/ssm-agent-worker" "${BINARY_PATH}/ssm-agent-worker"
+    install -D -m 0755 "$dir/ssm-session-worker" "${BINARY_PATH}/ssm-session-worker"
+    rm -rf "$dir"
     ok
 }
 

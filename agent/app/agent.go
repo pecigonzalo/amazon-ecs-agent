@@ -20,50 +20,60 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/logger"
-	"github.com/aws/amazon-ecs-agent/agent/logger/field"
-
-	"github.com/aws/amazon-ecs-agent/agent/doctor"
-	"github.com/aws/amazon-ecs-agent/agent/eni/watcher"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-
-	"github.com/aws/amazon-ecs-agent/agent/credentials/instancecreds"
-	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
-	"github.com/aws/amazon-ecs-agent/agent/metrics"
-
-	acshandler "github.com/aws/amazon-ecs-agent/agent/acs/handler"
-	"github.com/aws/amazon-ecs-agent/agent/api"
-	"github.com/aws/amazon-ecs-agent/agent/api/ecsclient"
-	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
+	agentacs "github.com/aws/amazon-ecs-agent/agent/acs/session"
+	"github.com/aws/amazon-ecs-agent/agent/acs/updater"
 	"github.com/aws/amazon-ecs-agent/agent/app/factory"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/sdkclientfactory"
-	"github.com/aws/amazon-ecs-agent/agent/ec2"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
+	dockerdoctor "github.com/aws/amazon-ecs-agent/agent/doctor" // for Docker specific container instance health checks
+	"github.com/aws/amazon-ecs-agent/agent/ebs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
+	dm "github.com/aws/amazon-ecs-agent/agent/engine/daemonmanager"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
+	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
+	engineserviceconnect "github.com/aws/amazon-ecs-agent/agent/engine/serviceconnect"
 	"github.com/aws/amazon-ecs-agent/agent/eni/pause"
+	"github.com/aws/amazon-ecs-agent/agent/eni/watcher"
 	"github.com/aws/amazon-ecs-agent/agent/eventhandler"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
+	"github.com/aws/amazon-ecs-agent/agent/imdscreds"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers/exitcodes"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/stats"
+	"github.com/aws/amazon-ecs-agent/agent/stats/reporter"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
-	tcshandler "github.com/aws/amazon-ecs-agent/agent/tcs/handler"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/amazon-ecs-agent/agent/utils/ec2metadata"
+	"github.com/aws/amazon-ecs-agent/agent/utils/loader"
 	"github.com/aws/amazon-ecs-agent/agent/utils/mobypkgwrapper"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
 	"github.com/aws/amazon-ecs-agent/agent/version"
-	"github.com/aws/aws-sdk-go/aws"
-	aws_credentials "github.com/aws/aws-sdk-go/aws/credentials"
+	acsclient "github.com/aws/amazon-ecs-agent/ecs-agent/acs/client"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/acs/session"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	ecsclient "github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs/client"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials/imds"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials/providers"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/doctor"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ec2"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	metricsfactory "github.com/aws/amazon-ecs-agent/ecs-agent/metrics"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tcs/model/ecstcs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/wsclient"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/smithy-go"
 	"github.com/cihub/seelog"
 	"github.com/pborman/uuid"
 )
@@ -81,20 +91,22 @@ const (
 
 	blackholed = "blackholed"
 
-	instanceIdBackoffMin      = time.Second
-	instanceIdBackoffMax      = time.Second * 5
-	instanceIdBackoffJitter   = 0.2
-	instanceIdBackoffMultiple = 1.3
-	instanceIdMaxRetryCount   = 3
+	imdsBackoffMin      = time.Second
+	imdsBackoffMax      = time.Second * 5
+	imdsBackoffJitter   = 0.2
+	imdsBackoffMultiple = 1.3
+	imdsMaxRetryCount   = 5
 
-	targetLifecycleBackoffMin      = time.Second
-	targetLifecycleBackoffMax      = time.Second * 5
-	targetLifecycleBackoffJitter   = 0.2
-	targetLifecycleBackoffMultiple = 1.3
-	targetLifecycleMaxRetryCount   = 3
-	inServiceState                 = "InService"
-	asgLifecyclePollWait           = time.Minute
-	asgLifecyclePollMax            = 120 // given each poll cycle waits for about a minute, this gives 2-3 hours before timing out
+	inServiceState       = "InService"
+	asgLifecyclePollWait = time.Minute
+	asgLifecyclePollMax  = 120 // given each poll cycle waits for about a minute, this gives 2-3 hours before timing out
+
+	// By default, TCS (or TACS) will reject metrics that are older than 5 minutes. Since our metrics collection interval
+	// is currently set to 20 seconds, setting a buffer size of 15 allows us to store exactly 5 minutes of metrics in
+	// these buffers in the case where we temporarily lose connect to TCS. This value does not change with task number,
+	// as the number of messages in the channel is equal to the number of times we call `getInstanceMetrics`, which collects
+	// metrics from all tasks and containers and put them into one TelemetryMessage object.
+	telemetryChannelDefaultBufferSize = 15
 )
 
 var (
@@ -130,11 +142,14 @@ type ecsAgent struct {
 	dataClient                  data.Client
 	dockerClient                dockerapi.DockerClient
 	containerInstanceARN        string
-	credentialProvider          *aws_credentials.Credentials
+	credentialsCache            *aws.CredentialsCache
 	stateManagerFactory         factory.StateManager
 	saveableOptionFactory       factory.SaveableOption
-	pauseLoader                 pause.Loader
+	pauseLoader                 loader.Loader
+	serviceconnectManager       engineserviceconnect.Manager
+	daemonManagers              map[string]dm.DaemonManager
 	eniWatcher                  *watcher.ENIWatcher
+	ebsWatcher                  *ebs.EBSWatcher
 	cniClient                   ecscni.CNIClient
 	vpc                         string
 	subnet                      string
@@ -144,16 +159,31 @@ type ecsAgent struct {
 	mobyPlugins                 mobypkgwrapper.Plugins
 	resourceFields              *taskresource.ResourceFields
 	availabilityZone            string
+	availabilityZoneID          string
 	latestSeqNumberTaskManifest *int64
 }
 
 // newAgent returns a new ecsAgent object, but does not start anything
 func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	ec2MetadataClient := ec2.NewEC2MetadataClient(nil)
+
+	var (
+		ec2MetadataClient ec2.EC2MetadataClient
+		err               error
+	)
 	if blackholeEC2Metadata {
 		ec2MetadataClient = ec2.NewBlackholeEC2MetadataClient()
+	} else {
+		ec2MetadataClient, err = ec2.NewEC2MetadataClient(nil)
+		if err != nil {
+			logger.Critical("Error creating EC2 metadata client", logger.Fields{
+				field.Error: err,
+			})
+			cancel()
+			return nil, err
+		}
 	}
+
 	logger.Info("Starting Amazon ECS Agent", logger.Fields{
 		"version": version.Version,
 		"commit":  version.GitShortHash,
@@ -167,7 +197,7 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		cancel()
 		return nil, err
 	}
-	cfg.AcceptInsecureCert = aws.BoolValue(acceptInsecureCert)
+	cfg.AcceptInsecureCert = aws.ToBool(acceptInsecureCert)
 	if cfg.AcceptInsecureCert {
 		seelog.Warn("SSL certificate verification disabled. This is not recommended.")
 	}
@@ -179,9 +209,20 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		cfg.NoIID = true
 	}
 
-	ec2Client := ec2.NewClientImpl(cfg.AWSRegion)
-	dockerClient, err := dockerapi.NewDockerGoClient(sdkclientfactory.NewFactory(ctx, cfg.DockerEndpoint), cfg, ctx)
+	ec2ClientDualStackEndpointState := aws.DualStackEndpointStateDisabled
+	if cfg.InstanceIPCompatibility.IsIPv6Only() {
+		ec2ClientDualStackEndpointState = aws.DualStackEndpointStateEnabled
+	}
+	ec2Client, err := ec2.NewClientImpl(cfg.AWSRegion, ec2ClientDualStackEndpointState)
+	if err != nil {
+		logger.Critical("Error creating EC2 client", logger.Fields{
+			field.Error: err,
+		})
+		cancel()
+		return nil, err
+	}
 
+	dockerClient, err := dockerapi.NewDockerGoClient(sdkclientfactory.NewFactory(ctx, cfg.DockerEndpoint), cfg, ctx)
 	if err != nil {
 		// This is also non terminal in the current config
 		logger.Critical("Error creating Docker client", logger.Fields{
@@ -195,7 +236,7 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 	if cfg.Checkpoint.Enabled() {
 		dataClient, err = data.New(cfg.DataDir)
 		if err != nil {
-			logger.Critical("Error creating Docker client", logger.Fields{
+			logger.Critical("Error creating data client", logger.Fields{
 				field.Error: err,
 			})
 			cancel()
@@ -205,6 +246,10 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		dataClient = data.NewNoopClient()
 	}
 
+	// Resolved here rather than during config initialization because it requires
+	// the data client, which is created after config setup.
+	resolveIMDSIAMRolesConfig(cfg, dataClient, ec2MetadataClient)
+
 	var metadataManager containermetadata.Manager
 	if cfg.ContainerMetadataEnabled.Enabled() {
 		// We use the default API client for the metadata inspect call. This version has some information
@@ -213,6 +258,11 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		metadataManager = containermetadata.NewManager(dockerClient, cfg)
 	}
 
+	credentialsCache := providers.NewInstanceCredentialsCache(
+		cfg.External.Enabled(),
+		providers.NewRotatingSharedCredentialsProviderV2(),
+		nil,
+	)
 	initialSeqNumber := int64(-1)
 	return &ecsAgent{
 		ctx:               ctx,
@@ -225,10 +275,12 @@ func newAgent(blackholeEC2Metadata bool, acceptInsecureCert *bool) (agent, error
 		// We instantiate our own credentialProvider for use in acs/tcs. This tries
 		// to mimic roughly the way it's instantiated by the SDK for a default
 		// session.
-		credentialProvider:          instancecreds.GetCredentials(cfg.External.Enabled()),
+		credentialsCache:            credentialsCache,
 		stateManagerFactory:         factory.NewStateManager(),
 		saveableOptionFactory:       factory.NewSaveableOption(),
 		pauseLoader:                 pause.New(),
+		serviceconnectManager:       engineserviceconnect.NewManager(),
+		daemonManagers:              make(map[string]dm.DaemonManager),
 		cniClient:                   ecscni.NewClient(cfg.CNIPluginsPath),
 		metadataManager:             metadataManager,
 		terminationHandler:          sighandlers.StartDefaultTerminationHandler,
@@ -250,7 +302,7 @@ func (agent *ecsAgent) printECSAttributes() int {
 		return exitcodes.ExitError
 	}
 	for _, attr := range capabilities {
-		fmt.Printf("%s\t%s\n", aws.StringValue(attr.Name), aws.StringValue(attr.Value))
+		fmt.Printf("%s\t%s\n", aws.ToString(attr.Name), aws.ToString(attr.Value))
 	}
 	return exitcodes.ExitSuccess
 }
@@ -267,10 +319,38 @@ func (agent *ecsAgent) start() int {
 	credentialsManager := credentials.NewManager()
 	state := dockerstate.NewTaskEngineState()
 	imageManager := engine.NewImageManager(agent.cfg, agent.dockerClient, state)
-	client := ecsclient.NewECSClient(agent.credentialProvider, agent.cfg, agent.ec2MetadataClient)
+	cfgAccessor, err := config.NewAgentConfigAccessor(agent.cfg)
+	if err != nil {
+		logger.Critical("Unable to create new agent config accessor", logger.Fields{
+			field.Error: err,
+		})
+		return exitcodes.ExitError
+	}
 
+	// Options for ECS Client
+	ecsClientOpts := []ecsclient.ECSClientOption{
+		// We always exclude IPv4 bindings for IPv6-only instances
+		// as they are assumed to NOT be reachable over IPv4.
+		ecsclient.WithIPv4PortBindingExcluded(agent.cfg.InstanceIPCompatibility.IsIPv6Only()),
+
+		// Exclusion of IPv6 port bindings is controlled by configuration for historical reasons.
+		ecsclient.WithIPv6PortBindingExcluded(agent.cfg.ShouldExcludeIPv6PortBinding.Enabled()),
+
+		// If instance is IPv6-only then we must use dualstack ECS endpoints
+		ecsclient.WithDualStackEnabled(agent.cfg.InstanceIPCompatibility.IsIPv6Only()),
+	}
+
+	clientFactory := ecsclient.NewECSClientFactory(agent.credentialsCache, cfgAccessor, agent.ec2MetadataClient,
+		version.String(), ecsClientOpts...)
+	client, err := clientFactory.NewClient()
+	if err != nil {
+		logger.Critical("Unable to create new ECS client", logger.Fields{
+			field.Error: err,
+		})
+		return exitcodes.ExitError
+	}
 	agent.initializeResourceFields(credentialsManager)
-	return agent.doStart(containerChangeEventStream, credentialsManager, state, imageManager, client, execcmd.NewManager())
+	return agent.doStart(containerChangeEventStream, credentialsManager, state, imageManager, client, execcmd.NewManager(agent.cfg))
 }
 
 // doStart is the worker invoked by start for starting the ECS Agent. This involves
@@ -280,8 +360,20 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	credentialsManager credentials.Manager,
 	state dockerstate.TaskEngineState,
 	imageManager engine.ImageManager,
-	client api.ECSClient,
+	client ecs.ECSClient,
 	execCmdMgr execcmd.Manager) int {
+	// Check for cloud-init failure before proceeding with startup.
+	// If cloud-init fell back to DataSourceNone but userdata exists on IMDS,
+	// userdata was not executed and the agent may have incorrect config.
+	if !agent.cfg.External.Enabled() {
+		if err := config.CheckCloudInitFailure(agent.ec2MetadataClient, config.CloudInitResultFilePath); err != nil {
+			seelog.Criticalf("Cloud-init failure detected: %v. "+
+				"Userdata was not executed during instance boot. "+
+				"Refusing to start with potentially incorrect config.", err)
+			return exitcodes.ExitTerminal
+		}
+	}
+
 	// check docker version >= 1.9.0, exit agent if older
 	if exitcode, ok := agent.verifyRequiredDockerVersion(); !ok {
 		return exitcode
@@ -294,17 +386,25 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 			return exitcodes.ExitTerminal
 		}
 	}
+	hostResources, err := client.GetHostResources()
+	if err != nil {
+		seelog.Critical("Unable to fetch host resources")
+		return exitcodes.ExitError
+	}
 	if agent.cfg.GPUSupportEnabled {
 		err := agent.initializeGPUManager()
 		if err != nil {
 			seelog.Criticalf("Could not initialize Nvidia GPU Manager: %v", err)
 			return exitcodes.ExitError
 		}
+		// Find GPUs (if any) on the instance
+		seedGPUMemoryCapacity(hostResources, agent.getPlatformDevices())
 	}
 
 	// Create the task engine
-	taskEngine, currentEC2InstanceID, err := agent.newTaskEngine(containerChangeEventStream,
-		credentialsManager, state, imageManager, execCmdMgr)
+	taskEngine, currentEC2InstanceID, err := agent.newTaskEngine(
+		containerChangeEventStream, credentialsManager, state, imageManager, hostResources, execCmdMgr,
+		agent.serviceconnectManager, agent.daemonManagers)
 	if err != nil {
 		seelog.Criticalf("Unable to initialize new task engine: %v", err)
 		return exitcodes.ExitTerminal
@@ -315,26 +415,24 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 
 	// If part of ASG, wait until instance is being set up to go in service before registering with cluster
 	if agent.cfg.WarmPoolsSupport.Enabled() {
-		err := agent.waitUntilInstanceInService(asgLifecyclePollWait, asgLifecyclePollMax, targetLifecycleMaxRetryCount)
+		err := agent.waitUntilInstanceInService(asgLifecyclePollWait, asgLifecyclePollMax)
 		if err != nil && err.Error() != blackholed {
 			seelog.Criticalf("Could not determine target lifecycle of instance: %v", err)
 			return exitcodes.ExitTerminal
 		}
 	}
 
-	agent.initMetricsEngine()
-
 	loadPauseErr := agent.loadPauseContainer()
 	if loadPauseErr != nil {
 		seelog.Errorf("Failed to load pause container: %v", loadPauseErr)
 	}
 
-	var vpcSubnetAttributes []*ecs.Attribute
+	var vpcSubnetAttributes []types.Attribute
 	// Check if Task ENI is enabled
 	if agent.cfg.TaskENIEnabled.Enabled() {
 		// check pause container image load
 		if loadPauseErr != nil {
-			if pause.IsNoSuchFileError(loadPauseErr) || pause.UnsupportedPlatform(loadPauseErr) {
+			if loader.IsNoSuchFileError(loadPauseErr) || loader.IsUnsupportedPlatform(loadPauseErr) {
 				return exitcodes.ExitTerminal
 			} else {
 				return exitcodes.ExitError
@@ -363,23 +461,67 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 			}
 			return exitcodes.ExitError
 		}
+	} else if !agent.cfg.External.Enabled() {
+		// Set VPC and Subnet IDs for the EC2 instance
+		err, terminal := agent.setVPCSubnet()
+		switch err {
+		case nil:
+			// No error so do nothing
+		case instanceNotLaunchedInVPCError:
+			// We have ascertained that the EC2 Instance is not running in a VPC
+			// No need to stop the ECS Agent in this case
+			logger.Info("Unable to detect VPC ID for the instance as it was not launched in VPC mode.")
+		default:
+			// Encountered an error initializing VPC ID and Subnet
+			seelog.Criticalf("Unable to detect VPC ID and Subnet: %v", err)
+			if terminal {
+				return exitcodes.ExitTerminal
+			}
+			return exitcodes.ExitError
+		}
+	}
+
+	// populate availability zone id from IMDS
+	availabilityZoneID, err := agent.getEc2MetadataWithRetry(agent.ec2MetadataClient.AvailabilityZoneID, "availability zone ID")
+	if availabilityZoneID == "" {
+		seelog.Warnf("Unable to get Availability Zone ID for the Instance")
+	} else {
+		agent.availabilityZoneID = availabilityZoneID
 	}
 
 	// Register the container instance
 	err = agent.registerContainerInstance(client, vpcSubnetAttributes)
 	if err != nil {
-		if isTransient(err) {
-			return exitcodes.ExitError
+		if isTerminal(err) {
+			// On unrecoverable error codes, agent should terminally exit.
+			logger.Critical("Agent will terminally exit, unable to register container instance:", logger.Fields{
+				field.Error: err,
+			})
+			return exitcodes.ExitTerminal
 		}
-		return exitcodes.ExitTerminal
+		// Other errors are considered recoverable and will be retried.
+		return exitcodes.ExitError
+	}
+
+	// Load Managed Daemon images asynchronously
+	agent.loadManagedDaemonImagesAsync(imageManager)
+
+	scManager := agent.serviceconnectManager
+	scManager.SetECSClient(client, agent.containerInstanceARN)
+	if loaded, _ := scManager.IsLoaded(agent.dockerClient); loaded {
+		imageManager.AddImageToCleanUpExclusionList(agent.serviceconnectManager.GetLoadedImageName())
 	}
 
 	// Add container instance ARN to metadata manager
 	if agent.cfg.ContainerMetadataEnabled.Enabled() {
 		agent.metadataManager.SetContainerInstanceARN(agent.containerInstanceARN)
 		agent.metadataManager.SetAvailabilityZone(agent.availabilityZone)
-		agent.metadataManager.SetHostPrivateIPv4Address(agent.getHostPrivateIPv4AddressFromEC2Metadata())
-		agent.metadataManager.SetHostPublicIPv4Address(agent.getHostPublicIPv4AddressFromEC2Metadata())
+		if agent.cfg.InstanceIPCompatibility.IsIPv6Only() {
+			agent.metadataManager.SetHostIPv6Address(agent.getHostIPv6AddressFromEC2Metadata())
+		} else {
+			agent.metadataManager.SetHostPrivateIPv4Address(agent.getHostPrivateIPv4AddressFromEC2Metadata())
+			agent.metadataManager.SetHostPublicIPv4Address(agent.getHostPublicIPv4AddressFromEC2Metadata())
+		}
 	}
 
 	if agent.cfg.Checkpoint.Enabled() {
@@ -390,7 +532,7 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 		agent.saveMetadata(data.EC2InstanceIDKey, currentEC2InstanceID)
 	}
 
-	// now that we know the container instance ARN, we can build out the doctor
+	// now that we know the container instance ARN, we can create the doctor
 	// and pass it on to ACS and TACS
 	doctor, doctorCreateErr := agent.newDoctorWithHealthchecks(agent.cfg.Cluster, agent.containerInstanceARN)
 	if doctorCreateErr != nil {
@@ -412,31 +554,56 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	attachmentEventHandler := eventhandler.NewAttachmentEventHandler(agent.ctx, agent.dataClient, client)
 	agent.startAsyncRoutines(containerChangeEventStream, credentialsManager, imageManager,
 		taskEngine, deregisterInstanceEventStream, client, taskHandler, attachmentEventHandler, state, doctor)
-
+	// TODO add EBS watcher to async routines
+	agent.startEBSWatcher(state, taskEngine, agent.dockerClient)
 	// Start the acs session, which should block doStart
 	return agent.startACSSession(credentialsManager, taskEngine,
 		deregisterInstanceEventStream, client, state, taskHandler, doctor)
 }
 
+// seedGPUMemoryCapacity adds a GPU_MEMORY:<uuid> capacity entry to hostResources
+// for every GPU device. A device that reports no usable memory seeds 0, which
+// still admits whole-GPU tasks but refuses MPS sharing.
+func seedGPUMemoryCapacity(hostResources map[string]types.Resource, platformDevices []types.PlatformDevice) {
+	for _, device := range platformDevices {
+		if device.Type != types.PlatformDeviceTypeGpu {
+			continue
+		}
+		memoryMiB := int32(0)
+		if device.GpuInfo != nil && device.GpuInfo.MemoryInMiB != nil {
+			memoryMiB = *device.GpuInfo.MemoryInMiB
+		} else {
+			seelog.Warnf("GPU %s reported no usable memory; seeding capacity 0 "+
+				"(whole-GPU tasks allowed, MPS sharing refused); check ecs-init/NVML version", *device.Id)
+		}
+		key := engine.GPUMemoryCapacityPrefix + *device.Id
+		hostResources[key] = types.Resource{
+			Name:         utils.Strptr(key),
+			Type:         utils.Strptr("INTEGER"),
+			IntegerValue: memoryMiB,
+		}
+	}
+}
+
 // waitUntilInstanceInService Polls IMDS until the target lifecycle state indicates that the instance is going in
 // service. This is to avoid instances going to a warm pool being registered as container instances with the cluster
-func (agent *ecsAgent) waitUntilInstanceInService(pollWaitDuration time.Duration, pollMaxTimes int, maxRetries int) error {
+func (agent *ecsAgent) waitUntilInstanceInService(pollWaitDuration time.Duration, pollMaxTimes int) error {
 	seelog.Info("Waiting for instance to go InService")
 	var err error
 	var targetState string
 	// Poll until a target lifecycle state is obtained from IMDS, or an unexpected error occurs
-	targetState, err = agent.pollUntilTargetLifecyclePresent(pollWaitDuration, pollMaxTimes, maxRetries)
+	targetState, err = agent.pollUntilTargetLifecyclePresent(pollWaitDuration, pollMaxTimes)
 	if err != nil {
 		return err
 	}
 	// Poll while the instance is in a warmed state until it is going to go into service
 	for targetState != inServiceState {
 		time.Sleep(pollWaitDuration)
-		targetState, err = agent.getTargetLifecycle(maxRetries)
+		targetState, err = agent.getEc2MetadataWithRetry(agent.ec2MetadataClient.TargetLifecycleState, "target life cycle state")
 		if err != nil {
 			// Do not exit if error is due to throttling or temporary server errors
 			// These are likely transient, as at this point IMDS has been successfully queried for state
-			switch utils.GetRequestFailureStatusCode(err) {
+			switch utils.GetResponseErrorStatusCode(err) {
 			case 429, 500, 502, 503, 504:
 				seelog.Warnf("Encountered error while waiting for warmed instance to go in service: %v", err)
 			default:
@@ -448,13 +615,13 @@ func (agent *ecsAgent) waitUntilInstanceInService(pollWaitDuration time.Duration
 }
 
 // pollUntilTargetLifecyclePresent polls until obtains a target state or receives an unexpected error
-func (agent *ecsAgent) pollUntilTargetLifecyclePresent(pollWaitDuration time.Duration, pollMaxTimes int, maxRetries int) (string, error) {
+func (agent *ecsAgent) pollUntilTargetLifecyclePresent(pollWaitDuration time.Duration, pollMaxTimes int) (string, error) {
 	var err error
 	var targetState string
 	for i := 0; i < pollMaxTimes; i++ {
-		targetState, err = agent.getTargetLifecycle(maxRetries)
+		targetState, err = agent.getEc2MetadataWithRetry(agent.ec2MetadataClient.TargetLifecycleState, "target life cycle state")
 		if targetState != "" ||
-			(err != nil && utils.GetRequestFailureStatusCode(err) != 404) {
+			(err != nil && utils.GetResponseErrorStatusCode(err) != 404) {
 			break
 		}
 		time.Sleep(pollWaitDuration)
@@ -462,24 +629,29 @@ func (agent *ecsAgent) pollUntilTargetLifecyclePresent(pollWaitDuration time.Dur
 	return targetState, err
 }
 
-// getTargetLifecycle obtains the target lifecycle state for the instance from IMDS. This is populated for instances
-// associated with an ASG
-func (agent *ecsAgent) getTargetLifecycle(maxRetries int) (string, error) {
-	var targetState string
+func (agent *ecsAgent) getEc2MetadataWithRetry(imdsMetadataFunc func() (string, error), logContext string) (string, error) {
+	var result string
 	var err error
-	backoff := retry.NewExponentialBackoff(targetLifecycleBackoffMin, targetLifecycleBackoffMax, targetLifecycleBackoffJitter, targetLifecycleBackoffMultiple)
-	for i := 0; i < maxRetries; i++ {
-		targetState, err = agent.ec2MetadataClient.TargetLifecycleState()
-		if err == nil {
-			break
+	backoff := retry.NewExponentialBackoff(imdsBackoffMin, imdsBackoffMax, imdsBackoffJitter, imdsBackoffMultiple)
+
+	for i := 0; i < imdsMaxRetryCount; i++ {
+		result, err = imdsMetadataFunc()
+		if err == nil || err.Error() == blackholed {
+			return result, err
 		}
-		seelog.Debugf("Error when getting intended lifecycle state: %v", err)
-		if i < maxRetries {
+		if i < imdsMaxRetryCount-1 {
 			time.Sleep(backoff.Duration())
 		}
 	}
-	seelog.Debugf("Target lifecycle state of instance: %v", targetState)
-	return targetState, err
+
+	if err != nil {
+		logger.Warn(fmt.Sprintf("Unable to access EC2 Metadata service to determine %s", logContext), logger.Fields{
+			field.Error: err,
+		})
+		return "", err
+	}
+	seelog.Debugf("%v of instance: %v", logContext, result)
+	return result, nil
 }
 
 // newTaskEngine creates a new docker task engine object. It tries to load the
@@ -488,18 +660,22 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 	credentialsManager credentials.Manager,
 	state dockerstate.TaskEngineState,
 	imageManager engine.ImageManager,
-	execCmdMgr execcmd.Manager) (engine.TaskEngine, string, error) {
+	hostResources map[string]types.Resource,
+	execCmdMgr execcmd.Manager,
+	serviceConnectManager engineserviceconnect.Manager,
+	daemonManagers map[string]dm.DaemonManager) (engine.TaskEngine, string, error) {
 
 	containerChangeEventStream.StartListening()
 
 	if !agent.cfg.Checkpoint.Enabled() {
 		seelog.Info("Checkpointing not enabled; a new container instance will be created each time the agent is run")
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
-			containerChangeEventStream, imageManager, state,
-			agent.metadataManager, agent.resourceFields, execCmdMgr), "", nil
+			containerChangeEventStream, imageManager, hostResources, state,
+			agent.metadataManager, agent.resourceFields, execCmdMgr,
+			serviceConnectManager, daemonManagers), "", nil
 	}
 
-	savedData, err := agent.loadData(containerChangeEventStream, credentialsManager, state, imageManager, execCmdMgr)
+	savedData, err := agent.loadData(containerChangeEventStream, credentialsManager, state, imageManager, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 	if err != nil {
 		seelog.Criticalf("Error loading previously saved state: %v", err)
 		return nil, "", err
@@ -511,7 +687,11 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 		return nil, "", err
 	}
 
-	currentEC2InstanceID := agent.getEC2InstanceID()
+	currentEC2InstanceID, err := agent.getEc2MetadataWithRetry(agent.ec2MetadataClient.InstanceID, "EC2 Instance ID")
+	if currentEC2InstanceID == "" {
+		currentEC2InstanceID = savedData.ec2InstanceID
+		seelog.Warnf("Not able to get EC2 Instance ID from IMDS, using EC2 Instance ID from saved state: '%s'", currentEC2InstanceID)
+	}
 	if savedData.ec2InstanceID != "" && savedData.ec2InstanceID != currentEC2InstanceID {
 		seelog.Warnf(instanceIDMismatchErrorFormat,
 			savedData.ec2InstanceID, currentEC2InstanceID)
@@ -520,8 +700,9 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 		state.Reset()
 		// Reset taskEngine; all the other values are still default
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
-			containerChangeEventStream, imageManager, state, agent.metadataManager,
-			agent.resourceFields, execCmdMgr), currentEC2InstanceID, nil
+			containerChangeEventStream, imageManager, hostResources, state, agent.metadataManager,
+			agent.resourceFields, execCmdMgr, serviceConnectManager,
+			daemonManagers), currentEC2InstanceID, nil
 	}
 
 	if savedData.cluster != "" {
@@ -538,30 +719,19 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 	return savedData.taskEngine, currentEC2InstanceID, nil
 }
 
-func (agent *ecsAgent) initMetricsEngine() {
-	// In case of a panic during set-up, we will recover quietly and resume
-	// normal Agent execution.
-	defer func() {
-		if r := recover(); r != nil {
-			seelog.Errorf("MetricsEngine Set-up panicked. Recovering quietly: %s", r)
-		}
-	}()
-
-	// We init the global MetricsEngine before we publish metrics
-	metrics.MustInit(agent.cfg)
-	metrics.PublishMetrics()
-}
-
 // newDoctorWithHealthchecks creates a new doctor and also configures
 // the healthchecks that the doctor should be running
 func (agent *ecsAgent) newDoctorWithHealthchecks(cluster, containerInstanceARN string) (*doctor.Doctor, error) {
 	// configure the required healthchecks
-	runtimeHealthCheck := doctor.NewDockerRuntimeHealthcheck(agent.dockerClient)
+	runtimeHealthCheck := dockerdoctor.NewDockerRuntimeHealthcheck(agent.dockerClient)
 
 	// put the healthechecks in a list
 	healthcheckList := []doctor.Healthcheck{
 		runtimeHealthCheck,
 	}
+
+	// register the MPS control daemon health check on MPS-capable instances
+	healthcheckList = agent.appendMpsDaemonHealthcheck(healthcheckList)
 
 	// set up the doctor and return it
 	return doctor.NewDoctor(healthcheckList, cluster, containerInstanceARN)
@@ -594,28 +764,6 @@ func (agent *ecsAgent) setClusterInConfig(previousCluster string) error {
 	})
 
 	return nil
-}
-
-// getEC2InstanceID gets the EC2 instance ID from the metadata service
-func (agent *ecsAgent) getEC2InstanceID() string {
-	var instanceID string
-	var err error
-	backoff := retry.NewExponentialBackoff(instanceIdBackoffMin, instanceIdBackoffMax, instanceIdBackoffJitter, instanceIdBackoffMultiple)
-	for i := 0; i < instanceIdMaxRetryCount; i++ {
-		instanceID, err = agent.ec2MetadataClient.InstanceID()
-		if err == nil || err.Error() == blackholed {
-			return instanceID
-		}
-		if i < instanceIdMaxRetryCount-1 {
-			time.Sleep(backoff.Duration())
-		}
-	}
-	if err != nil {
-		logger.Warn("Unable to access EC2 Metadata service to determine EC2 ID", logger.Fields{
-			field.Error: err,
-		})
-	}
-	return instanceID
 }
 
 // getoutpostARN gets the Outpost ARN from the metadata service
@@ -656,8 +804,8 @@ func (agent *ecsAgent) newStateManager(
 
 // constructVPCSubnetAttributes returns vpc and subnet IDs of the instance as
 // an attribute list
-func (agent *ecsAgent) constructVPCSubnetAttributes() []*ecs.Attribute {
-	return []*ecs.Attribute{
+func (agent *ecsAgent) constructVPCSubnetAttributes() []types.Attribute {
+	return []types.Attribute{
 		{
 			Name:  aws.String(vpcIDAttributeName),
 			Value: aws.String(agent.vpc),
@@ -669,12 +817,44 @@ func (agent *ecsAgent) constructVPCSubnetAttributes() []*ecs.Attribute {
 	}
 }
 
+// Loads Managed Daemon images for all Managed Daemons registered on the Agent.
+// The images are loaded in the background. Successfully loaded images are added to
+// imageManager's cleanup exclusion list.
+func (agent *ecsAgent) loadManagedDaemonImagesAsync(imageManager engine.ImageManager) {
+	daemonManagers := agent.getDaemonManagers()
+	logger.Debug(fmt.Sprintf("Will load images for %d Managed Daemons", len(daemonManagers)))
+	for _, daemonManager := range daemonManagers {
+		go agent.loadManagedDaemonImage(daemonManager, imageManager)
+	}
+}
+
+// Loads Managed Daemon image and adds it to image cleanup exclusion list upon success.
+func (agent *ecsAgent) loadManagedDaemonImage(dm dm.DaemonManager, imageManager engine.ImageManager) {
+	imageRef := dm.GetManagedDaemon().GetImageRef()
+	logger.Info("Starting to load Managed Daemon image", logger.Fields{
+		field.ImageRef: imageRef,
+	})
+	image, err := dm.LoadImage(agent.ctx, agent.dockerClient)
+	if err != nil {
+		logger.Error("Failed to load Managed Daemon image", logger.Fields{
+			field.ImageRef: imageRef,
+			field.Error:    err,
+		})
+		return
+	}
+	logger.Info("Successfully loaded Managed Daemon image", logger.Fields{
+		field.ImageRef: imageRef,
+		field.ImageID:  image.ID,
+	})
+	imageManager.AddImageToCleanUpExclusionList(imageRef)
+}
+
 // registerContainerInstance registers the container instance ID for the ECS Agent
 func (agent *ecsAgent) registerContainerInstance(
-	client api.ECSClient,
-	additionalAttributes []*ecs.Attribute) error {
+	client ecs.ECSClient,
+	additionalAttributes []types.Attribute) error {
 	// Preflight request to make sure they're good
-	if preflightCreds, err := agent.credentialProvider.Get(); err != nil || preflightCreds.AccessKeyID == "" {
+	if preflightCreds, err := agent.credentialsCache.Retrieve(context.TODO()); err != nil || !preflightCreds.HasKeys() {
 		seelog.Errorf("Error getting valid credentials: %s", err)
 	}
 
@@ -718,13 +898,19 @@ func (agent *ecsAgent) registerContainerInstance(
 			field.Error: err,
 		})
 		if retriable, ok := err.(apierrors.Retriable); ok && !retriable.Retry() {
-			return err
+			return terminalError{err}
 		}
-		if utils.IsAWSErrorCodeEqual(err, ecs.ErrCodeInvalidParameterException) {
+		if utils.IsAWSErrorCodeEqual(err, apierrors.ErrCodeInvalidParameterException) {
 			logger.Critical("Instance registration attempt with an invalid parameter", logger.Fields{
 				field.Error: err,
 			})
-			return err
+			return terminalError{err}
+		}
+		if utils.IsAWSErrorCodeEqual(err, apierrors.ErrCodeClientException) {
+			logger.Critical("Instance registration attempt with client performing invalid action", logger.Fields{
+				field.Error: err,
+			})
+			return terminalError{err}
 		}
 		if _, ok := err.(apierrors.AttributeError); ok {
 			attributeErrorMsg := ""
@@ -734,9 +920,9 @@ func (agent *ecsAgent) registerContainerInstance(
 			logger.Critical("Instance registration attempt with invalid attribute(s)", logger.Fields{
 				field.Error: attributeErrorMsg,
 			})
-			return err
+			return terminalError{err}
 		}
-		return transientError{err}
+		return err
 	}
 	logger.Info("Instance registration completed successfully", logger.Fields{
 		"instanceArn": containerInstanceArn,
@@ -750,8 +936,8 @@ func (agent *ecsAgent) registerContainerInstance(
 // reregisterContainerInstance registers a container instance that has already been
 // registered with ECS. This is for cases where the ECS Agent is being restored
 // from a check point.
-func (agent *ecsAgent) reregisterContainerInstance(client api.ECSClient, capabilities []*ecs.Attribute,
-	tags []*ecs.Tag, registrationToken string, platformDevices []*ecs.PlatformDevice, outpostARN string) error {
+func (agent *ecsAgent) reregisterContainerInstance(client ecs.ECSClient, capabilities []types.Attribute,
+	tags []types.Tag, registrationToken string, platformDevices []types.PlatformDevice, outpostARN string) error {
 	_, availabilityZone, err := client.RegisterContainerInstance(agent.containerInstanceARN, capabilities, tags,
 		registrationToken, platformDevices, outpostARN)
 
@@ -766,7 +952,19 @@ func (agent *ecsAgent) reregisterContainerInstance(client api.ECSClient, capabil
 	})
 	if apierrors.IsInstanceTypeChangedError(err) {
 		seelog.Criticalf(instanceTypeMismatchErrorFormat, err)
-		return err
+		return terminalError{err}
+	}
+	if utils.IsAWSErrorCodeEqual(err, apierrors.ErrCodeInvalidParameterException) {
+		logger.Critical("Instance re-registration attempt with an invalid parameter", logger.Fields{
+			field.Error: err,
+		})
+		return terminalError{err}
+	}
+	if utils.IsAWSErrorCodeEqual(err, apierrors.ErrCodeClientException) {
+		logger.Critical("Instance re-registration attempt with client performing invalid action", logger.Fields{
+			field.Error: err,
+		})
+		return terminalError{err}
 	}
 	if _, ok := err.(apierrors.AttributeError); ok {
 		attributeErrorMsg := ""
@@ -776,19 +974,19 @@ func (agent *ecsAgent) reregisterContainerInstance(client api.ECSClient, capabil
 		logger.Critical("Instance re-registration attempt with invalid attribute(s)", logger.Fields{
 			field.Error: attributeErrorMsg,
 		})
-		return err
+		return terminalError{err}
 	}
-	return transientError{err}
+	return err
 }
 
-// startAsyncRoutines starts all of the background methods
+// startAsyncRoutines starts all background methods
 func (agent *ecsAgent) startAsyncRoutines(
 	containerChangeEventStream *eventstream.EventStream,
 	credentialsManager credentials.Manager,
 	imageManager engine.ImageManager,
 	taskEngine engine.TaskEngine,
 	deregisterInstanceEventStream *eventstream.EventStream,
-	client api.ECSClient,
+	client ecs.ECSClient,
 	taskHandler *eventhandler.TaskHandler,
 	attachmentEventHandler *eventhandler.AttachmentEventHandler,
 	state dockerstate.TaskEngineState,
@@ -805,39 +1003,52 @@ func (agent *ecsAgent) startAsyncRoutines(
 		go agent.startSpotInstanceDrainingPoller(agent.ctx, client)
 	}
 
+	// Start IMDS credentials refresher for periodic task credential retrieval via IMDS.
+	if imdsRefresher := agent.getIMDSCredentialsRefresher(credentialsManager, taskEngine); imdsRefresher != nil {
+		go imdsRefresher.Start()
+	}
+
 	// Agent introspection api
 	go handlers.ServeIntrospectionHTTPEndpoint(agent.ctx, &agent.containerInstanceARN, taskEngine, agent.cfg)
 
-	statsEngine := stats.NewDockerStatsEngine(agent.cfg, agent.dockerClient, containerChangeEventStream)
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, telemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, telemetryChannelDefaultBufferSize)
+
+	statsEngine := stats.NewDockerStatsEngine(agent.cfg, agent.dockerClient, containerChangeEventStream, telemetryMessages, healthMessages, agent.dataClient)
 
 	// Start serving the endpoint to fetch IAM Role credentials and other task metadata
 	if agent.cfg.TaskMetadataAZDisabled {
 		// send empty availability zone
-		go handlers.ServeTaskHTTPEndpoint(agent.ctx, credentialsManager, state, client, agent.containerInstanceARN, agent.cfg, statsEngine, "")
+		go handlers.ServeTaskHTTPEndpoint(agent.ctx, credentialsManager, state, client, agent.containerInstanceARN, agent.cfg, statsEngine, "", "", agent.vpc)
 	} else {
-		go handlers.ServeTaskHTTPEndpoint(agent.ctx, credentialsManager, state, client, agent.containerInstanceARN, agent.cfg, statsEngine, agent.availabilityZone)
+		go handlers.ServeTaskHTTPEndpoint(agent.ctx, credentialsManager, state, client, agent.containerInstanceARN, agent.cfg, statsEngine, agent.availabilityZone, agent.availabilityZoneID, agent.vpc)
 	}
 
 	// Start sending events to the backend
 	go eventhandler.HandleEngineEvents(agent.ctx, taskEngine, client, taskHandler, attachmentEventHandler)
 
-	telemetrySessionParams := tcshandler.TelemetrySessionParams{
-		Ctx:                           agent.ctx,
-		CredentialProvider:            agent.credentialProvider,
-		Cfg:                           agent.cfg,
-		ContainerInstanceArn:          agent.containerInstanceARN,
-		DeregisterInstanceEventStream: deregisterInstanceEventStream,
-		ECSClient:                     client,
-		TaskEngine:                    taskEngine,
-		StatsEngine:                   statsEngine,
-		Doctor:                        doctor,
+	err := statsEngine.MustInit(agent.ctx, taskEngine, agent.cfg.Cluster, agent.containerInstanceARN)
+	if err != nil {
+		seelog.Warnf("Error initializing metrics engine: %v", err)
+		return
+	}
+	go statsEngine.StartMetricsPublish()
+
+	session, err := reporter.NewDockerTelemetrySession(agent.containerInstanceARN, agent.credentialsCache, agent.cfg, deregisterInstanceEventStream,
+		client, taskEngine, telemetryMessages, healthMessages, doctor)
+	if err != nil {
+		seelog.Warnf("Error creating telemetry session: %v", err)
+		return
+	}
+	if session == nil {
+		seelog.Infof("Metrics disabled on the instance.")
+		return
 	}
 
-	// Start metrics session in a go routine
-	go tcshandler.StartMetricsSession(&telemetrySessionParams)
+	go session.Start(agent.ctx)
 }
 
-func (agent *ecsAgent) startSpotInstanceDrainingPoller(ctx context.Context, client api.ECSClient) {
+func (agent *ecsAgent) startSpotInstanceDrainingPoller(ctx context.Context, client ecs.ECSClient) {
 	for !agent.spotInstanceDrainingPoller(client) {
 		select {
 		case <-ctx.Done():
@@ -848,9 +1059,27 @@ func (agent *ecsAgent) startSpotInstanceDrainingPoller(ctx context.Context, clie
 	}
 }
 
+// getIMDSCredentialsRefresher returns an IMDS credentials refresher
+// if the IMDSIAMRolesEnabled configuration is enabled.
+func (agent *ecsAgent) getIMDSCredentialsRefresher(
+	credentialsManager credentials.Manager,
+	taskEngine engine.TaskEngine,
+) *imdscreds.IMDSCredentialsRefresher {
+	if agent.cfg.IMDSIAMRolesEnabled {
+		// The agent passes a no-op metrics factory; scanner-emitted metrics,
+		// like other agent runtime metrics, are not consumed today.
+		imdsScanner := imds.NewScanner(agent.ec2MetadataClient, metricsfactory.NewNopEntryFactory())
+		return imdscreds.NewIMDSCredentialsRefresher(
+			agent.ctx, imdsScanner, credentialsManager,
+			taskEngine, imdscreds.ScanInterval,
+		)
+	}
+	return nil
+}
+
 // spotInstanceDrainingPoller returns true if spot instance interruption has been
 // set AND the container instance state is successfully updated to DRAINING.
-func (agent *ecsAgent) spotInstanceDrainingPoller(client api.ECSClient) bool {
+func (agent *ecsAgent) spotInstanceDrainingPoller(client ecs.ECSClient) bool {
 	// this endpoint 404s unless a interruption has been set, so expect failure in most cases.
 	resp, err := agent.ec2MetadataClient.SpotInstanceAction()
 	if err == nil {
@@ -874,7 +1103,7 @@ func (agent *ecsAgent) spotInstanceDrainingPoller(client api.ECSClient) bool {
 		}
 
 		seelog.Infof("Received a spot interruption (%s) scheduled for %s, setting state to DRAINING", ia.Action, ia.Time)
-		err = client.UpdateContainerInstancesState(agent.containerInstanceARN, "DRAINING")
+		err = client.UpdateContainerInstancesState(agent.containerInstanceARN, types.ContainerInstanceStatusDraining)
 		if err != nil {
 			seelog.Errorf("Error setting instance [ARN: %s] state to DRAINING: %s", agent.containerInstanceARN, err)
 		} else {
@@ -890,61 +1119,104 @@ func (agent *ecsAgent) startACSSession(
 	credentialsManager credentials.Manager,
 	taskEngine engine.TaskEngine,
 	deregisterInstanceEventStream *eventstream.EventStream,
-	client api.ECSClient,
+	client ecs.ECSClient,
 	state dockerstate.TaskEngineState,
 	taskHandler *eventhandler.TaskHandler,
 	doctor *doctor.Doctor) int {
 
-	acsSession := acshandler.NewSession(
-		agent.ctx,
-		agent.cfg,
-		deregisterInstanceEventStream,
-		agent.containerInstanceARN,
-		agent.credentialProvider,
-		agent.dockerClient,
-		client,
-		state,
-		agent.dataClient,
-		taskEngine,
-		credentialsManager,
-		taskHandler,
-		agent.latestSeqNumberTaskManifest,
-		doctor,
-	)
-	seelog.Info("Beginning Polling for updates")
-	err := acsSession.Start()
+	inactiveInstanceCB := func() {
+		// If the instance is inactive (i.e., was deregistered), send an event to the event stream
+		// for the same.
+		err := deregisterInstanceEventStream.WriteToEventStream(struct{}{})
+		if err != nil {
+			logger.Debug("Failed to write to deregister container instance event stream", logger.Fields{
+				field.Error: err,
+			})
+		}
+	}
+
+	dockerVersion, err := taskEngine.Version()
 	if err != nil {
-		seelog.Criticalf("Unretriable error starting communicating with ACS: %v", err)
+		if err != nil {
+			logger.Warn("Failed to get docker version from task engine", logger.Fields{
+				field.Error: err,
+			})
+		}
+	}
+
+	minAgentCfg := &wsclient.WSClientMinAgentConfig{
+		AcceptInsecureCert: agent.cfg.AcceptInsecureCert,
+		AWSRegion:          agent.cfg.AWSRegion,
+		DockerEndpoint:     agent.cfg.DockerEndpoint,
+		IsDocker:           true,
+	}
+
+	payloadMessageHandler := agentacs.NewPayloadMessageHandler(taskEngine, client, agent.dataClient, taskHandler,
+		credentialsManager, agent.latestSeqNumberTaskManifest)
+	credsMetadataSetter := agentacs.NewCredentialsMetadataSetter(taskEngine, agent.getConfig().InstanceIPCompatibility)
+	eniHandler := agentacs.NewENIHandler(state, agent.dataClient)
+	manifestMessageIDAccessor := agentacs.NewManifestMessageIDAccessor()
+	sequenceNumberAccessor := agentacs.NewSequenceNumberAccessor(agent.latestSeqNumberTaskManifest, agent.dataClient)
+	taskComparer := agentacs.NewTaskComparer(taskEngine)
+	taskStopper := agentacs.NewTaskStopper(taskEngine, agent.dataClient)
+
+	acsSession := session.NewSession(agent.containerInstanceARN,
+		agent.cfg.Cluster,
+		client,
+		agent.credentialsCache,
+		inactiveInstanceCB,
+		acsclient.NewACSClientFactory(),
+		metricsfactory.NewNopEntryFactory(),
+		version.Version,
+		version.GitHashString(),
+		dockerVersion,
+		minAgentCfg,
+		payloadMessageHandler,
+		credentialsManager,
+		credsMetadataSetter,
+		doctor,
+		eniHandler,
+		manifestMessageIDAccessor,
+		taskComparer,
+		sequenceNumberAccessor,
+		taskStopper,
+		agent.ebsWatcher,
+		updater.NewUpdater(agent.cfg, state, agent.dataClient, taskEngine).AddAgentUpdateHandlers,
+	)
+	logger.Info("Beginning Polling for updates")
+	sessionEndReason := acsSession.Start(agent.ctx)
+	if sessionEndReason == nil {
+		// Agent somehow exited without a reason.
+		// We don't expect this condition to ever be reached, but log a critical error just in case it is.
+		logger.Critical("ACS session ended for unknown reason")
 		return exitcodes.ExitTerminal
 	}
 	return exitcodes.ExitSuccess
 }
 
-// validateRequiredVersion validates docker version.
+// verifyRequiredDockerVersion validates docker version.
 // Minimum docker version supported is 1.9.0, maps to api version 1.21
 // see https://docs.docker.com/develop/sdk/#api-version-matrix
 func (agent *ecsAgent) verifyRequiredDockerVersion() (int, bool) {
-	supportedVersions := agent.dockerClient.SupportedVersions()
+	supportedVersions := dockerclient.SupportedVersionsExtended(agent.dockerClient.SupportedVersions)
 	if len(supportedVersions) == 0 {
 		seelog.Critical("Could not get supported docker versions.")
 		return exitcodes.ExitError, false
 	}
 
-	// if api version 1.21 is supported, it means docker version is at least 1.9.0
 	for _, version := range supportedVersions {
-		if version == dockerclient.Version_1_21 {
+		if version == dockerclient.MinDockerAPIVersion {
 			return -1, true
 		}
 	}
 
-	// api 1.21 is not supported, docker version is older than 1.9.0
-	seelog.Criticalf("Required minimum docker API verion %s is not supported",
-		dockerclient.Version_1_21)
+	seelog.Criticalf("Required minimum docker API version %s is not supported",
+		dockerclient.MinDockerAPIVersion)
 	return exitcodes.ExitTerminal, false
 }
 
 // getContainerInstanceTagsFromEC2API will retrieve the tags of this instance remotely.
-func (agent *ecsAgent) getContainerInstanceTagsFromEC2API() ([]*ecs.Tag, error) {
+func (agent *ecsAgent) getContainerInstanceTagsFromEC2API() ([]types.Tag, error) {
 	// Get instance ID from ec2 metadata client.
 	instanceID, err := agent.ec2MetadataClient.InstanceID()
 	if err != nil {
@@ -956,15 +1228,15 @@ func (agent *ecsAgent) getContainerInstanceTagsFromEC2API() ([]*ecs.Tag, error) 
 
 // mergeTags will merge the local tags and ec2 tags, for the overlap part, ec2 tags
 // will be overridden by local tags.
-func mergeTags(localTags []*ecs.Tag, ec2Tags []*ecs.Tag) []*ecs.Tag {
+func mergeTags(localTags []types.Tag, ec2Tags []types.Tag) []types.Tag {
 	tagsMap := make(map[string]string)
 
 	for _, ec2Tag := range ec2Tags {
-		tagsMap[aws.StringValue(ec2Tag.Key)] = aws.StringValue(ec2Tag.Value)
+		tagsMap[aws.ToString(ec2Tag.Key)] = aws.ToString(ec2Tag.Value)
 	}
 
 	for _, localTag := range localTags {
-		tagsMap[aws.StringValue(localTag.Key)] = aws.StringValue(localTag.Value)
+		tagsMap[aws.ToString(localTag.Key)] = aws.ToString(localTag.Value)
 	}
 
 	return utils.MapToTags(tagsMap)
@@ -994,11 +1266,32 @@ func (agent *ecsAgent) getHostPublicIPv4AddressFromEC2Metadata() string {
 	return hostPublicIPv4Address
 }
 
+// getHostIPv6AddressFromEC2Metadata will retrieve the IPv6 address of this
+// instance through the EC2 API
+func (agent *ecsAgent) getHostIPv6AddressFromEC2Metadata() string {
+	// Get instance IPv6 address from ec2 metadata client.
+	hostIPv6Address, err := agent.ec2MetadataClient.IPv6Address()
+	if err != nil {
+		seelog.Errorf("Unable to retrieve Host Instance IPv6 Address: %v", err)
+		return ""
+	}
+	return hostIPv6Address
+}
+
 func (agent *ecsAgent) saveMetadata(key, val string) {
 	err := agent.dataClient.SaveMetadata(key, val)
 	if err != nil {
 		seelog.Errorf("Failed to save agent metadata to disk (key: [%s], value: [%s]): %v", key, val, err)
 	}
+}
+
+func (agent *ecsAgent) setDaemonManager(key string, val dm.DaemonManager) {
+	agent.daemonManagers[key] = val
+}
+
+// Returns daemon managers map. Not designed to be thread-safe.
+func (agent *ecsAgent) getDaemonManagers() map[string]dm.DaemonManager {
+	return agent.daemonManagers
 }
 
 // setVPCSubnet sets the vpc and subnet ids for the agent by querying the
@@ -1029,11 +1322,11 @@ func (agent *ecsAgent) setVPCSubnet() (error, bool) {
 	return nil, false
 }
 
-// isInstanceLaunchedInVPC returns false when the awserr returned is an EC2MetadataError
+// isInstanceLaunchedInVPC returns false when the error returned is an EC2MetadataError
 // when querying the vpc id from instance metadata
 func isInstanceLaunchedInVPC(err error) bool {
-	if aerr, ok := err.(awserr.Error); ok &&
-		aerr.Code() == "EC2MetadataError" {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "EC2MetadataError" {
 		return false
 	}
 	return true
@@ -1048,4 +1341,28 @@ func contains(capabilities []string, capability string) bool {
 	}
 
 	return false
+}
+
+// resolveIMDSIAMRolesConfig determines whether IMDS IAM roles should be enabled and persists the state for agent restarts.
+func resolveIMDSIAMRolesConfig(cfg *config.Config, dataClient data.Client, ec2MetadataClient ec2.EC2MetadataClient) {
+	imdsIAMRolesVal, err := dataClient.GetMetadata(data.IMDSIAMRolesKey)
+	if err != nil {
+		seelog.Debugf("Unable to retrieve %s from database: %v", data.IMDSIAMRolesKey, err)
+	}
+
+	// Metadata values are stored as strings in the database.
+	previouslyEnabled := imdsIAMRolesVal == "true"
+	cfg.DetermineIMDSIAMRolesConfig(ec2metadata.IsIMDSAvailable(ec2MetadataClient),
+		previouslyEnabled,
+		dataClient.HasNonTerminalTasks(),
+	)
+
+	// Persist enablement so the agent knows it was previously enabled, after a restart.
+	if cfg.IMDSIAMRolesEnabled {
+		if err := dataClient.SaveMetadata(data.IMDSIAMRolesKey, "true"); err != nil {
+			seelog.Warnf("Failed to persist %s: %v", data.IMDSIAMRolesKey, err)
+		} else {
+			seelog.Debugf("Persisted %s to database", data.IMDSIAMRolesKey)
+		}
+	}
 }

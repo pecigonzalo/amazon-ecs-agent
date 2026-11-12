@@ -18,17 +18,19 @@ package stats
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	ecsengine "github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	dockercontainer "github.com/docker/docker/api/types/container"
 
 	"github.com/docker/docker/api/types"
 	"github.com/stretchr/testify/assert"
@@ -41,7 +43,10 @@ func init() {
 	dockerClient, _ = dockerapi.NewDockerGoClient(sdkClientFactory, &cfg, ctx)
 }
 
-func createRunningTask() *apitask.Task {
+func createRunningTask(networkMode string) *apitask.Task {
+	if networkMode == "default" {
+		networkMode = "bridge"
+	}
 	return &apitask.Task{
 		Arn:                 taskArn,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
@@ -53,17 +58,21 @@ func createRunningTask() *apitask.Task {
 				Name: containerName,
 			},
 		},
+		NetworkMode: networkMode,
 	}
 }
 
 func TestStatsEngineWithExistingContainersWithoutHealth(t *testing.T) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithExistingContainersWithoutHealth"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithExistingContainersWithoutHealth"), nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	// Create a container to get the container id.
 	container, err := createGremlin(client, "default")
@@ -75,12 +84,12 @@ func TestStatsEngineWithExistingContainersWithoutHealth(t *testing.T) {
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithExistingContainersWithoutHealth")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
-	testTask := createRunningTask()
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
+	testTask := createRunningTask("default")
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine := taskEngine.(*ecsengine.DockerTaskEngine)
 	dockerTaskEngine.State().AddTask(testTask)
@@ -100,10 +109,10 @@ func TestStatsEngineWithExistingContainersWithoutHealth(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	validateInstanceMetrics(t, engine)
+	validateInstanceMetrics(t, engine, false)
 	validateEmptyTaskHealthMetrics(t, engine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -123,11 +132,14 @@ func TestStatsEngineWithExistingContainersWithoutHealth(t *testing.T) {
 
 func TestStatsEngineWithNewContainersWithoutHealth(t *testing.T) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNewContainers"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNewContainers"), nil, nil, nil)
 	defer engine.removeAll()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	container, err := createGremlin(client, "default")
 	require.NoError(t, err, "creating container failed")
@@ -138,8 +150,8 @@ func TestStatsEngineWithNewContainersWithoutHealth(t *testing.T) {
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithNewContainers")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
-	testTask := createRunningTask()
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
+	testTask := createRunningTask("default")
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine := taskEngine.(*ecsengine.DockerTaskEngine)
 	dockerTaskEngine.State().AddTask(testTask)
@@ -159,7 +171,7 @@ func TestStatsEngineWithNewContainersWithoutHealth(t *testing.T) {
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	// Write the container change event to event stream
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -172,10 +184,10 @@ func TestStatsEngineWithNewContainersWithoutHealth(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	validateInstanceMetrics(t, engine)
+	validateInstanceMetrics(t, engine, false)
 	validateEmptyTaskHealthMetrics(t, engine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 	// Write the container change event to event stream
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -195,7 +207,7 @@ func TestStatsEngineWithNewContainersWithoutHealth(t *testing.T) {
 
 func TestStatsEngineWithExistingContainers(t *testing.T) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithExistingContainers"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithExistingContainers"), nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
@@ -205,19 +217,22 @@ func TestStatsEngineWithExistingContainers(t *testing.T) {
 	defer client.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{Force: true})
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	engine.cluster = defaultCluster
 	engine.containerInstanceArn = defaultContainerInstance
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithExistingContainers")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
-	testTask := createRunningTask()
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
+	testTask := createRunningTask("bridge")
 	// enable container health check for this container
 	testTask.Containers[0].HealthCheckType = "docker"
 	// Populate Tasks and Container map in the engine.
@@ -241,12 +256,12 @@ func TestStatsEngineWithExistingContainers(t *testing.T) {
 	time.Sleep(checkPointSleep)
 
 	// Verify the metrics of the container
-	validateInstanceMetrics(t, engine)
+	validateInstanceMetrics(t, engine, false)
 
 	// Verify the health metrics of container
 	validateTaskHealthMetrics(t, engine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -266,13 +281,16 @@ func TestStatsEngineWithExistingContainers(t *testing.T) {
 
 func TestStatsEngineWithNewContainers(t *testing.T) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNewContainers"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNewContainers"), nil, nil, nil)
 	defer engine.removeAll()
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	container, err := createHealthContainer(client)
 	require.NoError(t, err, "creating container failed")
@@ -283,9 +301,9 @@ func TestStatsEngineWithNewContainers(t *testing.T) {
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithNewContainers")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 
-	testTask := createRunningTask()
+	testTask := createRunningTask("bridge")
 	// enable health check of the container
 	testTask.Containers[0].HealthCheckType = "docker"
 	// Populate Tasks and Container map in the engine.
@@ -305,7 +323,7 @@ func TestStatsEngineWithNewContainers(t *testing.T) {
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	// Write the container change event to event stream
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -318,11 +336,11 @@ func TestStatsEngineWithNewContainers(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	validateInstanceMetrics(t, engine)
+	validateInstanceMetrics(t, engine, false)
 	// Verify the health metrics of container
 	validateTaskHealthMetrics(t, engine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	// Write the container change event to event stream
@@ -348,13 +366,16 @@ func TestStatsEngineWithNewContainersWithPolling(t *testing.T) {
 	// Create a new docker client with new config
 	dockerClientForNewContainersWithPolling, _ := dockerapi.NewDockerGoClient(sdkClientFactory, &cfg, ctx)
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClientForNewContainersWithPolling, eventStream("TestStatsEngineWithNewContainers"))
+	engine := NewDockerStatsEngine(&cfg, dockerClientForNewContainersWithPolling, eventStream("TestStatsEngineWithNewContainers"), nil, nil, nil)
 	defer engine.removeAll()
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	container, err := createHealthContainer(client)
 	require.NoError(t, err, "creating container failed")
@@ -365,9 +386,9 @@ func TestStatsEngineWithNewContainersWithPolling(t *testing.T) {
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithNewContainers")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 
-	testTask := createRunningTask()
+	testTask := createRunningTask("bridge")
 	// enable health check of the container
 	testTask.Containers[0].HealthCheckType = "docker"
 	// Populate Tasks and Container map in the engine.
@@ -387,7 +408,7 @@ func TestStatsEngineWithNewContainersWithPolling(t *testing.T) {
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	// Write the container change event to event stream
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -400,11 +421,11 @@ func TestStatsEngineWithNewContainersWithPolling(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(10 * time.Second)
-	validateInstanceMetrics(t, engine)
+	validateInstanceMetrics(t, engine, false)
 	// Verify the health metrics of container
 	validateTaskHealthMetrics(t, engine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	// Write the container change event to event stream
@@ -430,7 +451,7 @@ func TestStatsEngineWithNewContainersWithPolling(t *testing.T) {
 func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 	containerChangeEventStream := eventStream("TestStatsEngineWithDockerTaskEngine")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	container, err := createHealthContainer(client)
 	require.NoError(t, err, "creating container failed")
 	ctx, cancel := context.WithCancel(context.TODO())
@@ -440,7 +461,7 @@ func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 	unmappedContainer, err := createHealthContainer(client)
 	require.NoError(t, err, "creating container failed")
 	defer client.ContainerRemove(ctx, unmappedContainer.ID, types.ContainerRemoveOptions{Force: true})
-	testTask := createRunningTask()
+	testTask := createRunningTask("bridge")
 	// enable the health check of the container
 	testTask.Containers[0].HealthCheckType = "docker"
 	// Populate Tasks and Container map in the engine.
@@ -455,22 +476,25 @@ func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 		testTask)
 
 	// Create a new docker stats engine
-	statsEngine := NewDockerStatsEngine(&cfg, dockerClient, containerChangeEventStream)
+	statsEngine := NewDockerStatsEngine(&cfg, dockerClient, containerChangeEventStream, nil, nil, nil)
 	err = statsEngine.MustInit(ctx, taskEngine, defaultCluster, defaultContainerInstance)
 	require.NoError(t, err, "initializing stats engine failed")
 	defer statsEngine.removeAll()
 	defer statsEngine.containerChangeEventStream.Unsubscribe(containerChangeHandler)
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, unmappedContainer.ID, &timeout)
+	defer client.ContainerStop(ctx, unmappedContainer.ID, containerOptions)
 
 	err = containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
 		Status: apicontainerstatus.ContainerRunning,
@@ -490,10 +514,10 @@ func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	validateInstanceMetrics(t, statsEngine)
+	validateInstanceMetrics(t, statsEngine, false)
 	validateTaskHealthMetrics(t, statsEngine)
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	err = containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -514,14 +538,14 @@ func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 func TestStatsEngineWithDockerTaskEngineMissingRemoveEvent(t *testing.T) {
 	containerChangeEventStream := eventStream("TestStatsEngineWithDockerTaskEngineMissingRemoveEvent")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	container, err := createHealthContainer(client)
 	require.NoError(t, err, "creating container failed")
 	defer client.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{Force: true})
-	testTask := createRunningTask()
+	testTask := createRunningTask("")
 	// enable container health check of this container
 	testTask.Containers[0].HealthCheckType = "docker"
 	testTask.Containers[0].KnownStatusUnsafe = apicontainerstatus.ContainerStopped
@@ -538,7 +562,7 @@ func TestStatsEngineWithDockerTaskEngineMissingRemoveEvent(t *testing.T) {
 		testTask)
 
 	// Create a new docker stats engine
-	statsEngine := NewDockerStatsEngine(&cfg, dockerClient, containerChangeEventStream)
+	statsEngine := NewDockerStatsEngine(&cfg, dockerClient, containerChangeEventStream, nil, nil, nil)
 	err = statsEngine.MustInit(ctx, taskEngine, defaultCluster, defaultContainerInstance)
 	require.NoError(t, err, "initializing stats engine failed")
 	defer statsEngine.removeAll()
@@ -556,20 +580,22 @@ func TestStatsEngineWithDockerTaskEngineMissingRemoveEvent(t *testing.T) {
 	assert.NoError(t, err, "failed to write to container change event stream")
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 	err = client.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{Force: true})
 	require.NoError(t, err, "removing container failed")
 
 	time.Sleep(checkPointSleep)
 
-	// Simulate tcs client invoking GetInstanceMetrics.
-	_, _, err = statsEngine.GetInstanceMetrics()
-	assert.Error(t, err, "expect error 'no task metrics tp report' when getting instance metrics")
+	_, _, err = statsEngine.GetInstanceMetrics(false)
+	assert.Error(t, err, "expect error 'no task metrics to report' when getting instance metrics")
 
 	// Should not contain any metrics after cleanup.
 	validateIdleContainerMetrics(t, statsEngine)
@@ -577,17 +603,20 @@ func TestStatsEngineWithDockerTaskEngineMissingRemoveEvent(t *testing.T) {
 }
 
 func TestStatsEngineWithNetworkStatsDefaultMode(t *testing.T) {
-	testNetworkModeStats(t, "default", false)
+	testNetworkModeStatsInteg(t, "default", false)
 }
 
-func testNetworkModeStats(t *testing.T, networkMode string, statsEmpty bool) {
+func testNetworkModeStatsInteg(t *testing.T, networkMode string, statsEmpty bool) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNetworkStats"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithNetworkStats"), nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
 	// Create a container to get the container id.
 	container, err := createGremlin(client, networkMode)
@@ -599,12 +628,12 @@ func testNetworkModeStats(t *testing.T, networkMode string, statsEmpty bool) {
 
 	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithNetworkStats")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
-	testTask := createRunningTask()
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
+	testTask := createRunningTask(networkMode)
 
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine := taskEngine.(*ecsengine.DockerTaskEngine)
@@ -633,7 +662,7 @@ func testNetworkModeStats(t *testing.T, networkMode string, statsEmpty bool) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	_, taskMetrics, err := engine.GetInstanceMetrics()
+	_, taskMetrics, err := engine.GetInstanceMetrics(false)
 	assert.NoError(t, err, "getting instance metrics failed")
 	taskMetric := taskMetrics[0]
 	for _, containerMetric := range taskMetric.ContainerMetrics {
@@ -644,7 +673,7 @@ func testNetworkModeStats(t *testing.T, networkMode string, statsEmpty bool) {
 		}
 	}
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{
@@ -663,29 +692,46 @@ func testNetworkModeStats(t *testing.T, networkMode string, statsEmpty bool) {
 
 func TestStorageStats(t *testing.T) {
 	// Create a new docker stats engine
-	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithStorageStats"))
+	engine := NewDockerStatsEngine(&cfg, dockerClient, eventStream("TestStatsEngineWithStorageStats"), nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	// Assign ContainerStop timeout to addressable variable
-	timeout := defaultDockerTimeoutSeconds
+	timeout := int(defaultDockerTimeoutSeconds)
+	containerOptions := dockercontainer.StopOptions{
+		Timeout: &timeout,
+	}
 
-	// Create a container to get the container id.
-	container, err := createGremlin(client, "default")
-	require.NoError(t, err, "creating container failed")
+	var container *dockercontainer.CreateResponse
+	if runtime.GOOS == "windows" {
+		// Create a container to get the container id.
+		gremlinContainer, err := createGremlin(client, "default")
+		require.NoError(t, err, "creating container failed")
+		container = gremlinContainer
+	} else {
+		// Create a container that does explicit read and write I/O, runs long enough for stats to be collected.
+		// Uses busybox-based image (testContainerHealthImageName) since gremlin is scratch-based without shell.
+		rwIOContainer, err := client.ContainerCreate(ctx, &dockercontainer.Config{
+			Image: testContainerHealthImageName,
+			Cmd:   []string{"sh", "-c", "dd if=/dev/zero of=/tmp/test bs=4k count=100 oflag=direct && dd if=/tmp/test of=/dev/null bs=4k iflag=direct && sleep 30"},
+		}, nil, nil, nil, "")
+		require.NoError(t, err, "creating container failed")
+		container = &rwIOContainer
+	}
+
 	defer client.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{Force: true})
 
 	engine.cluster = defaultCluster
 	engine.containerInstanceArn = defaultContainerInstance
 
-	err = client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
+	err := client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{})
 	require.NoError(t, err, "starting container failed")
-	defer client.ContainerStop(ctx, container.ID, &timeout)
+	defer client.ContainerStop(ctx, container.ID, containerOptions)
 
 	containerChangeEventStream := eventStream("TestStatsEngineWithStorageStats")
 	taskEngine := ecsengine.NewTaskEngine(&config.Config{}, nil, nil, containerChangeEventStream,
-		nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
-	testTask := createRunningTask()
+		nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
+	testTask := createRunningTask("bridge")
 
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine := taskEngine.(*ecsengine.DockerTaskEngine)
@@ -693,7 +739,7 @@ func TestStorageStats(t *testing.T) {
 	dockerTaskEngine.State().AddContainer(
 		&apicontainer.DockerContainer{
 			DockerID:   container.ID,
-			DockerName: "gremlin",
+			DockerName: "storage",
 			Container:  testTask.Containers[0],
 		},
 		testTask)
@@ -713,14 +759,22 @@ func TestStorageStats(t *testing.T) {
 
 	// Wait for the stats collection go routine to start.
 	time.Sleep(checkPointSleep)
-	_, taskMetrics, err := engine.GetInstanceMetrics()
+	_, taskMetrics, err := engine.GetInstanceMetrics(false)
 	assert.NoError(t, err, "getting instance metrics failed")
 	taskMetric := taskMetrics[0]
 	for _, containerMetric := range taskMetric.ContainerMetrics {
 		assert.NotNil(t, containerMetric.StorageStatsSet, "storage stats should be non-empty")
+		// For Windows, ECS Agent does not do any further parsing on block I/O stat Op and takes
+		// storage read and write bytes at face value from a Windows-specific struct `StorageStats`.
+		if runtime.GOOS != "windows" {
+			assert.Greater(t, *containerMetric.StorageStatsSet.ReadSizeBytes.Sum,
+				int64(0), "expected non-zero storage read stats")
+			assert.Greater(t, *containerMetric.StorageStatsSet.WriteSizeBytes.Sum,
+				int64(0), "expected non-zero storage write stats")
+		}
 	}
 
-	err = client.ContainerStop(ctx, container.ID, &timeout)
+	err = client.ContainerStop(ctx, container.ID, containerOptions)
 	require.NoError(t, err, "stopping container failed")
 
 	err = engine.containerChangeEventStream.WriteToEventStream(dockerapi.DockerContainerChangeEvent{

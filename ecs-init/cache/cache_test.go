@@ -1,4 +1,3 @@
-// +build test
 // Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
@@ -20,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"testing"
@@ -100,7 +98,7 @@ func TestIsAgentCachedTrue(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 
-	file := ioutil.NopCloser(bytes.NewBufferString(fmt.Sprintf("%d", StatusCached)))
+	file := io.NopCloser(bytes.NewBufferString(fmt.Sprintf("%d", StatusCached)))
 	mockFS := NewMockfileSystem(mockCtrl)
 	mockFSInfo := NewMockfileSizeInfo(mockCtrl)
 	mockFS.EXPECT().Stat(config.CacheState()).Return(mockFSInfo, nil)
@@ -136,7 +134,7 @@ func TestAgentCacheStatus(t *testing.T) {
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
 
-			file := ioutil.NopCloser(bytes.NewBufferString(testcase.data))
+			file := io.NopCloser(bytes.NewBufferString(testcase.data))
 			mockFS := NewMockfileSystem(mockCtrl)
 			mockFSInfo := NewMockfileSizeInfo(mockCtrl)
 
@@ -225,7 +223,7 @@ func TestDownloadAgentReadPublishedMd5Failure(t *testing.T) {
 	mockS3Downloader := NewMocks3DownloaderAPI(mockCtrl)
 	mockMetadata := NewMockinstanceMetadata(mockCtrl)
 
-	tempMD5File, err := ioutil.TempFile("", "md5-test")
+	tempMD5File, err := os.CreateTemp("", "md5-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempMD5File.Close()
 
@@ -257,11 +255,11 @@ func TestDownloadAgentDownloadTarballFailure(t *testing.T) {
 	mockS3Downloader := NewMocks3DownloaderAPI(mockCtrl)
 	mockMetadata := NewMockinstanceMetadata(mockCtrl)
 
-	tempMD5File, err := ioutil.TempFile("", "md5-test")
+	tempMD5File, err := os.CreateTemp("", "md5-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempMD5File.Close()
 
-	tempAgentFile, err := ioutil.TempFile("", "agent-test")
+	tempAgentFile, err := os.CreateTemp("", "agent-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempAgentFile.Close()
 
@@ -294,15 +292,15 @@ func TestDownloadAgentCopyFailure(t *testing.T) {
 	mockS3Downloader := NewMocks3DownloaderAPI(mockCtrl)
 	mockMetadata := NewMockinstanceMetadata(mockCtrl)
 
-	tempMD5File, err := ioutil.TempFile("", "md5-test")
+	tempMD5File, err := os.CreateTemp("", "md5-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempMD5File.Close()
 
-	tempAgentFile, err := ioutil.TempFile("", "agent-test")
+	tempAgentFile, err := os.CreateTemp("", "agent-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempAgentFile.Close()
 
-	tempReader := ioutil.NopCloser(&bytes.Buffer{})
+	tempReader := io.NopCloser(&bytes.Buffer{})
 
 	gomock.InOrder(
 		mockFS.EXPECT().MkdirAll(config.CacheDirectory(), os.ModeDir|0700),
@@ -337,15 +335,15 @@ func TestDownloadAgentMD5Mismatch(t *testing.T) {
 	mockS3Downloader := NewMocks3DownloaderAPI(mockCtrl)
 	mockMetadata := NewMockinstanceMetadata(mockCtrl)
 
-	tempMD5File, err := ioutil.TempFile("", "md5-test")
+	tempMD5File, err := os.CreateTemp("", "md5-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempMD5File.Close()
 
-	tempAgentFile, err := ioutil.TempFile("", "agent-test")
+	tempAgentFile, err := os.CreateTemp("", "agent-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempAgentFile.Close()
 
-	tempReader := ioutil.NopCloser(&bytes.Buffer{})
+	tempReader := io.NopCloser(&bytes.Buffer{})
 
 	gomock.InOrder(
 		mockFS.EXPECT().MkdirAll(config.CacheDirectory(), os.ModeDir|0700),
@@ -375,14 +373,14 @@ func TestDownloadAgentSuccess(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	tarballContents := "tarball contents"
-	tarballReader := ioutil.NopCloser(bytes.NewBufferString(tarballContents))
+	tarballReader := io.NopCloser(bytes.NewBufferString(tarballContents))
 	expectedMd5Sum := fmt.Sprintf("%x\n", md5.Sum([]byte(tarballContents)))
 
-	tempMD5File, err := ioutil.TempFile("", "md5-test")
+	tempMD5File, err := os.CreateTemp("", "md5-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempMD5File.Close()
 
-	tempAgentFile, err := ioutil.TempFile("", "agent-test")
+	tempAgentFile, err := os.CreateTemp("", "agent-test")
 	assert.NoError(t, err, "Expect to successfully create a temporary file")
 	defer tempAgentFile.Close()
 
@@ -438,7 +436,7 @@ func TestLoadDesiredAgentFailReadDesired(t *testing.T) {
 
 	mockFS := NewMockfileSystem(mockCtrl)
 
-	mockFS.EXPECT().Open(config.DesiredImageLocatorFile()).Return(ioutil.NopCloser(&bytes.Buffer{}), nil)
+	mockFS.EXPECT().Open(config.DesiredImageLocatorFile()).Return(io.NopCloser(&bytes.Buffer{}), nil)
 
 	d := &Downloader{
 		fs: mockFS,
@@ -470,7 +468,7 @@ func TestLoadDesiredAgent(t *testing.T) {
 
 	mockFS := NewMockfileSystem(mockCtrl)
 
-	mockFS.EXPECT().Open(config.DesiredImageLocatorFile()).Return(ioutil.NopCloser(bytes.NewBufferString(desiredImage+"\n")), nil)
+	mockFS.EXPECT().Open(config.DesiredImageLocatorFile()).Return(io.NopCloser(bytes.NewBufferString(desiredImage+"\n")), nil)
 	mockFS.EXPECT().Base(gomock.Any()).Return(desiredImage + "\n")
 	mockFS.EXPECT().Open(config.CacheDirectory() + "/" + desiredImage)
 

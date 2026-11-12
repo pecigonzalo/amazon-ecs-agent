@@ -18,13 +18,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/logger"
-	"github.com/aws/amazon-ecs-agent/agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
 
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/stats/resolver"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
 
 	"github.com/docker/docker/api/types"
 	dockerstats "github.com/docker/docker/api/types"
@@ -57,7 +57,7 @@ func (taskStat *StatsTask) collect() {
 	backoff := retry.NewExponentialBackoff(time.Second*1, time.Second*10, 0.5, 2)
 
 	for {
-		err := taskStat.processStatsStream()
+		statStreamErr := taskStat.processStatsStream()
 		select {
 		case <-taskStat.Ctx.Done():
 			logger.Debug("Stopping stats collection for taskStat", logger.Fields{
@@ -65,14 +65,6 @@ func (taskStat *StatsTask) collect() {
 			})
 			return
 		default:
-			if err != nil {
-				d := backoff.Duration()
-				time.Sleep(d)
-				logger.Debug("Error querying stats for task", logger.Fields{
-					field.TaskID: taskId,
-					field.Error:  err,
-				})
-			}
 			// We were disconnected from the stats stream.
 			// Check if the task is terminal. If it is, stop collecting metrics.
 			terminal, err := taskStat.terminal()
@@ -83,11 +75,22 @@ func (taskStat *StatsTask) collect() {
 					field.Error:  err,
 				})
 				taskStat.StopStatsCollection()
+				continue
 			} else if terminal {
-				logger.Warn("Task is terminal, stopping stats collection", logger.Fields{
+				logger.Info("Task is terminal, stopping stats collection", logger.Fields{
 					field.TaskID: taskId,
 				})
 				taskStat.StopStatsCollection()
+				continue
+			}
+			// task stats were not stopped for terminal task, backoff before trying to reconnect
+			if statStreamErr != nil {
+				d := backoff.Duration()
+				time.Sleep(d)
+				logger.Debug("Error querying stats for task", logger.Fields{
+					field.TaskID: taskId,
+					field.Error:  err,
+				})
 			}
 		}
 	}
@@ -118,7 +121,7 @@ func (taskStat *StatsTask) processStatsStream() error {
 				}
 				return nil
 			}
-			if err := taskStat.StatsQueue.Add(rawStat); err != nil {
+			if err := taskStat.StatsQueue.Add(rawStat, NonDockerContainerStats{}); err != nil {
 				logger.Warn("Error converting task stats", logger.Fields{
 					field.TaskID: taskId,
 					field.Error:  err,

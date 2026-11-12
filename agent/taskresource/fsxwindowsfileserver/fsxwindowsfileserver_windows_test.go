@@ -17,29 +17,37 @@
 package fsxwindowsfileserver
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	mock_asm_factory "github.com/aws/amazon-ecs-agent/agent/asm/factory/mocks"
 	mock_secretsmanageriface "github.com/aws/amazon-ecs-agent/agent/asm/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	mock_credentials "github.com/aws/amazon-ecs-agent/agent/credentials/mocks"
 	mock_fsx_factory "github.com/aws/amazon-ecs-agent/agent/fsx/factory/mocks"
 	mock_fsxiface "github.com/aws/amazon-ecs-agent/agent/fsx/mocks"
 	mock_ssm_factory "github.com/aws/amazon-ecs-agent/agent/ssm/factory/mocks"
 	mock_ssmiface "github.com/aws/amazon-ecs-agent/agent/ssm/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/fsx"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
-	"github.com/aws/aws-sdk-go/service/ssm"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	mock_credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials/mocks"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/fsx"
+	"github.com/aws/aws-sdk-go-v2/service/fsx/types"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,6 +62,10 @@ const (
 	domain                 = "testdomain"
 	hostPath               = `Z:\`
 )
+
+var testConfig = &config.Config{
+	InstanceIPCompatibility: ipcompatibility.NewIPCompatibility(true, true),
+}
 
 func setup(t *testing.T) (
 	*FSxWindowsFileServerResource, *mock_credentials.MockManager, *mock_ssm_factory.MockSSMClientCreator,
@@ -76,14 +88,16 @@ func setup(t *testing.T) (
 		desiredStatusUnsafe: resourcestatus.ResourceCreated,
 		taskARN:             taskARN,
 	}
-	fv.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			SSMClientCreator:   ssmClientCreator,
-			ASMClientCreator:   asmClientCreator,
-			FSxClientCreator:   fsxClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
+	fv.Initialize(
+		testConfig,
+		&taskresource.ResourceFields{
+			ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+				SSMClientCreator:   ssmClientCreator,
+				ASMClientCreator:   asmClientCreator,
+				FSxClientCreator:   fsxClientCreator,
+				CredentialsManager: credentialsManager,
+			},
+		}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
 	return fv, credentialsManager, ssmClientCreator, asmClientCreator, fsxClientCreator, mockSSMClient, mockASMClient, mockFSxClient
 }
 
@@ -94,6 +108,7 @@ func TestInitialize(t *testing.T) {
 	assert.NotNil(t, fv.asmClientCreator)
 	assert.NotNil(t, fv.fsxClientCreator)
 	assert.NotNil(t, fv.statusToTransitions)
+	assert.NotNil(t, fv.ipCompatibility)
 }
 
 func TestMarshalUnmarshalJSON(t *testing.T) {
@@ -139,10 +154,10 @@ func TestRetrieveCredentials(t *testing.T) {
 
 	ssmTestData := "{\n\"username\": \"user\", \n\"password\": \"pass\"\n}"
 	ssmClientOutput := &ssm.GetParametersOutput{
-		InvalidParameters: []*string{},
-		Parameters: []*ssm.Parameter{
-			&ssm.Parameter{
-				Name:  aws.String("test"),
+		InvalidParameters: []string{},
+		Parameters: []ssmtypes.Parameter{
+			ssmtypes.Parameter{
+				Name:  aws.String("/test"),
 				Value: aws.String(ssmTestData),
 			},
 		},
@@ -153,8 +168,8 @@ func TestRetrieveCredentials(t *testing.T) {
 	}
 
 	gomock.InOrder(
-		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any()).Return(mockSSMClient),
-		mockSSMClient.EXPECT().GetParameters(gomock.Any()).Return(ssmClientOutput, nil).Times(1),
+		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any(), testConfig.InstanceIPCompatibility).Return(mockSSMClient, nil),
+		mockSSMClient.EXPECT().GetParameters(gomock.Any(), gomock.Any()).Return(ssmClientOutput, nil).Times(1),
 	)
 
 	err := fv.retrieveCredentials(credentialsParameterARN, iamCredentials)
@@ -166,35 +181,74 @@ func TestRetrieveCredentials(t *testing.T) {
 }
 
 func TestRetrieveSSMCredentials(t *testing.T) {
-	fv, _, ssmClientCreator, _, _, mockSSMClient, _, _ := setup(t)
-	credentialsParameterARN := "arn:aws:ssm:us-west-2:123456789012:parameter/test"
-
-	ssmTestData := "{\n\"username\": \"user\", \n\"password\": \"pass\"\n}"
-	ssmClientOutput := &ssm.GetParametersOutput{
-		InvalidParameters: []*string{},
-		Parameters: []*ssm.Parameter{
-			&ssm.Parameter{
-				Name:  aws.String("test"),
-				Value: aws.String(ssmTestData),
-			},
+	cases := []struct {
+		Name                     string
+		CredentialsParameterARN  string
+		CredentialsParameterName string
+	}{
+		{
+			Name:                     "TestRetrieveSSMCredentialsSimple",
+			CredentialsParameterARN:  "arn:aws:ssm:us-west-2:123456789012:parameter/hello",
+			CredentialsParameterName: "/hello",
+		},
+		{
+			Name:                     "TestRetrieveSSMCredentialsPath",
+			CredentialsParameterARN:  "arn:aws:ssm:us-west-2:123456789012:parameter/path1/path2/hello",
+			CredentialsParameterName: "/path1/path2/hello",
+		},
+		{
+			Name:                     "TestRetrieveSSMCredentialsSimpleWithParameter",
+			CredentialsParameterARN:  "arn:aws:ssm:us-east-2:958991572715:parameter/parameter",
+			CredentialsParameterName: "/parameter",
+		},
+		{
+			Name:                     "TestRetrieveSSMCredentialsPathWithParameter",
+			CredentialsParameterARN:  "arn:aws:ssm:us-east-2:958991572715:parameter/path1/path2/parameter",
+			CredentialsParameterName: "/path1/path2/parameter",
+		},
+		{
+			Name:                     "TestRetrieveSSMCredentialsPathWithParameter2",
+			CredentialsParameterARN:  "arn:aws:ssm:us-east-2:958991572715:parameter/path1/parameter/hello",
+			CredentialsParameterName: "/path1/parameter/hello",
 		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			fv, _, ssmClientCreator, _, _, mockSSMClient, _, _ := setup(t)
+			credentialsParameterARN := tc.CredentialsParameterARN
 
-	iamCredentials := credentials.IAMRoleCredentials{
-		CredentialsID: "test-cred-id",
+			ssmTestData := "{\n\"username\": \"user\", \n\"password\": \"pass\"\n}"
+			ssmClientOutput := &ssm.GetParametersOutput{
+				InvalidParameters: []string{},
+				Parameters: []ssmtypes.Parameter{
+					ssmtypes.Parameter{
+						Name:  aws.String(tc.CredentialsParameterName),
+						Value: aws.String(ssmTestData),
+					},
+				},
+			}
+
+			iamCredentials := credentials.IAMRoleCredentials{
+				CredentialsID: "test-cred-id",
+			}
+
+			gomock.InOrder(
+				ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any(), testConfig.InstanceIPCompatibility).Return(mockSSMClient, nil),
+				mockSSMClient.EXPECT().GetParameters(gomock.Any(), &ssm.GetParametersInput{
+					Names:          []string{tc.CredentialsParameterName},
+					WithDecryption: aws.Bool(false),
+				}).Return(ssmClientOutput, nil).Times(1),
+			)
+
+			err := fv.retrieveSSMCredentials(credentialsParameterARN, iamCredentials)
+			assert.NoError(t, err)
+
+			credentials := fv.Credentials
+			assert.Equal(t, "user", credentials.Username)
+			assert.Equal(t, "pass", credentials.Password)
+		})
 	}
 
-	gomock.InOrder(
-		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any()).Return(mockSSMClient),
-		mockSSMClient.EXPECT().GetParameters(gomock.Any()).Return(ssmClientOutput, nil).Times(1),
-	)
-
-	err := fv.retrieveSSMCredentials(credentialsParameterARN, iamCredentials)
-	assert.NoError(t, err)
-
-	credentials := fv.Credentials
-	assert.Equal(t, "user", credentials.Username)
-	assert.Equal(t, "pass", credentials.Password)
 }
 
 func TestRetrieveASMCredentials(t *testing.T) {
@@ -207,9 +261,13 @@ func TestRetrieveASMCredentials(t *testing.T) {
 	}
 
 	gomock.InOrder(
-		asmClientCreator.EXPECT().NewASMClient(gomock.Any(), gomock.Any()).Return(mockASMClient),
-		mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-			assert.Equal(t, aws.StringValue(in.SecretId), credentialsParameterARN)
+		asmClientCreator.EXPECT().NewASMClient(gomock.Any(), gomock.Any()).Return(mockASMClient, nil),
+		mockASMClient.EXPECT().GetSecretValue(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+		).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+			assert.Equal(t, aws.ToString(in.SecretId), credentialsParameterARN)
 		}).Return(asmClientOutput, nil),
 	)
 
@@ -276,7 +334,7 @@ func TestRetrieveASMCredentialsARNParseErr(t *testing.T) {
 func TestRetrieveFSxWindowsFileServerDNSName(t *testing.T) {
 	fv, _, _, _, fsxClientCreator, _, _, mockFSxClient := setup(t)
 	fsxClientOutput := &fsx.DescribeFileSystemsOutput{
-		FileSystems: []*fsx.FileSystem{
+		FileSystems: []types.FileSystem{
 			{
 				FileSystemId: aws.String(fileSystemId),
 				DNSName:      aws.String("test"),
@@ -285,8 +343,8 @@ func TestRetrieveFSxWindowsFileServerDNSName(t *testing.T) {
 	}
 
 	gomock.InOrder(
-		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient),
-		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any()).Return(fsxClientOutput, nil).Times(1),
+		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient, nil),
+		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any(), gomock.Any()).Return(fsxClientOutput, nil).Times(1),
 	)
 
 	iamCredentials := credentials.IAMRoleCredentials{
@@ -474,28 +532,30 @@ func TestCreateUnavailableLocalPath(t *testing.T) {
 		taskARN:                taskARN,
 		executionCredentialsID: executionCredentialsID,
 	}
-	fv.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			SSMClientCreator:   ssmClientCreator,
-			ASMClientCreator:   asmClientCreator,
-			FSxClientCreator:   fsxClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
+	fv.Initialize(
+		testConfig,
+		&taskresource.ResourceFields{
+			ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+				SSMClientCreator:   ssmClientCreator,
+				ASMClientCreator:   asmClientCreator,
+				FSxClientCreator:   fsxClientCreator,
+				CredentialsManager: credentialsManager,
+			},
+		}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
 
 	ssmTestData := "{\n\"username\": \"user\", \n\"password\": \"pass\"\n}"
 	ssmClientOutput := &ssm.GetParametersOutput{
-		InvalidParameters: []*string{},
-		Parameters: []*ssm.Parameter{
-			&ssm.Parameter{
-				Name:  aws.String("test"),
+		InvalidParameters: []string{},
+		Parameters: []ssmtypes.Parameter{
+			ssmtypes.Parameter{
+				Name:  aws.String("/test"),
 				Value: aws.String(ssmTestData),
 			},
 		},
 	}
 
 	fsxClientOutput := &fsx.DescribeFileSystemsOutput{
-		FileSystems: []*fsx.FileSystem{
+		FileSystems: []types.FileSystem{
 			{
 				FileSystemId: aws.String(fileSystemId),
 				DNSName:      aws.String("test"),
@@ -513,10 +573,10 @@ func TestCreateUnavailableLocalPath(t *testing.T) {
 
 	gomock.InOrder(
 		credentialsManager.EXPECT().GetTaskCredentials(gomock.Any()).Return(creds, true),
-		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any()).Return(mockSSMClient),
-		mockSSMClient.EXPECT().GetParameters(gomock.Any()).Return(ssmClientOutput, nil).Times(1),
-		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient),
-		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any()).Return(fsxClientOutput, nil).Times(1),
+		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any(), testConfig.InstanceIPCompatibility).Return(mockSSMClient, nil),
+		mockSSMClient.EXPECT().GetParameters(gomock.Any(), gomock.Any()).Return(ssmClientOutput, nil).Times(1),
+		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient, nil),
+		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any(), gomock.Any()).Return(fsxClientOutput, nil).Times(1),
 	)
 
 	DriveLetterAvailable = func(string) bool {
@@ -559,28 +619,30 @@ func TestCreateSSM(t *testing.T) {
 		taskARN:                taskARN,
 		executionCredentialsID: executionCredentialsID,
 	}
-	fv.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			SSMClientCreator:   ssmClientCreator,
-			ASMClientCreator:   asmClientCreator,
-			FSxClientCreator:   fsxClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
+	fv.Initialize(
+		testConfig,
+		&taskresource.ResourceFields{
+			ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+				SSMClientCreator:   ssmClientCreator,
+				ASMClientCreator:   asmClientCreator,
+				FSxClientCreator:   fsxClientCreator,
+				CredentialsManager: credentialsManager,
+			},
+		}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
 
 	ssmTestData := "{\n\"username\": \"user\", \n\"password\": \"pass\"\n}"
 	ssmClientOutput := &ssm.GetParametersOutput{
-		InvalidParameters: []*string{},
-		Parameters: []*ssm.Parameter{
-			&ssm.Parameter{
-				Name:  aws.String("test"),
+		InvalidParameters: []string{},
+		Parameters: []ssmtypes.Parameter{
+			ssmtypes.Parameter{
+				Name:  aws.String("/test"),
 				Value: aws.String(ssmTestData),
 			},
 		},
 	}
 
 	fsxClientOutput := &fsx.DescribeFileSystemsOutput{
-		FileSystems: []*fsx.FileSystem{
+		FileSystems: []types.FileSystem{
 			{
 				FileSystemId: aws.String(fileSystemId),
 				DNSName:      aws.String("test"),
@@ -598,10 +660,10 @@ func TestCreateSSM(t *testing.T) {
 
 	gomock.InOrder(
 		credentialsManager.EXPECT().GetTaskCredentials(gomock.Any()).Return(creds, true),
-		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any()).Return(mockSSMClient),
-		mockSSMClient.EXPECT().GetParameters(gomock.Any()).Return(ssmClientOutput, nil).Times(1),
-		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient),
-		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any()).Return(fsxClientOutput, nil).Times(1),
+		ssmClientCreator.EXPECT().NewSSMClient(gomock.Any(), gomock.Any(), testConfig.InstanceIPCompatibility).Return(mockSSMClient, nil),
+		mockSSMClient.EXPECT().GetParameters(gomock.Any(), gomock.Any()).Return(ssmClientOutput, nil).Times(1),
+		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient, nil),
+		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any(), gomock.Any()).Return(fsxClientOutput, nil).Times(1),
 	)
 
 	DriveLetterAvailable = func(string) bool {
@@ -646,14 +708,16 @@ func TestCreateASM(t *testing.T) {
 		taskARN:                taskARN,
 		executionCredentialsID: executionCredentialsID,
 	}
-	fv.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			SSMClientCreator:   ssmClientCreator,
-			ASMClientCreator:   asmClientCreator,
-			FSxClientCreator:   fsxClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
+	fv.Initialize(
+		&config.Config{},
+		&taskresource.ResourceFields{
+			ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+				SSMClientCreator:   ssmClientCreator,
+				ASMClientCreator:   asmClientCreator,
+				FSxClientCreator:   fsxClientCreator,
+				CredentialsManager: credentialsManager,
+			},
+		}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
 
 	asmTestData := "{\"username\":\"user\",\"password\":\"pass\"}"
 	asmClientOutput := &secretsmanager.GetSecretValueOutput{
@@ -661,7 +725,7 @@ func TestCreateASM(t *testing.T) {
 	}
 
 	fsxClientOutput := &fsx.DescribeFileSystemsOutput{
-		FileSystems: []*fsx.FileSystem{
+		FileSystems: []types.FileSystem{
 			{
 				FileSystemId: aws.String(fileSystemId),
 				DNSName:      aws.String("test"),
@@ -679,12 +743,16 @@ func TestCreateASM(t *testing.T) {
 
 	gomock.InOrder(
 		credentialsManager.EXPECT().GetTaskCredentials(gomock.Any()).Return(creds, true),
-		asmClientCreator.EXPECT().NewASMClient(gomock.Any(), gomock.Any()).Return(mockASMClient),
-		mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-			assert.Equal(t, aws.StringValue(in.SecretId), credentialsParameter)
+		asmClientCreator.EXPECT().NewASMClient(gomock.Any(), gomock.Any()).Return(mockASMClient, nil),
+		mockASMClient.EXPECT().GetSecretValue(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+		).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+			assert.Equal(t, aws.ToString(in.SecretId), credentialsParameter)
 		}).Return(asmClientOutput, nil),
-		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient),
-		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any()).Return(fsxClientOutput, nil).Times(1),
+		fsxClientCreator.EXPECT().NewFSxClient(gomock.Any(), gomock.Any()).Return(mockFSxClient, nil),
+		mockFSxClient.EXPECT().DescribeFileSystems(gomock.Any(), gomock.Any()).Return(fsxClientOutput, nil).Times(1),
 	)
 
 	DriveLetterAvailable = func(string) bool {
@@ -708,5 +776,57 @@ func TestClearFSxWindowsFileServerResource(t *testing.T) {
 	defer func() { execCommand = exec.Command }()
 
 	err := fv.Cleanup()
+	assert.NoError(t, err)
+}
+
+func TestSpecialCharactersInPasswordPSCommand(t *testing.T) {
+	username := "Administrator"
+	password := "AWS@`~!@#$var%^&*()/1asd"
+
+	// Perform actual exec to determine if the credentials are generated.
+	// Go tests are platform specific and therefore, this would work.
+	cmd := exec.Command("pwsh.exe", "-Command", psCredentialCommandFormat)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("fsxUsername=%s", username))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("fsxPassword=%s", password))
+	_, err := cmd.CombinedOutput()
+
+	assert.NoError(t, err)
+}
+
+func TestCommandChainingInPSCommand(t *testing.T) {
+	username := "Administrator'); echo hello; ('"
+	password := "AWS@`~!@#$var%^&*()/1asd"
+
+	// Perform actual exec to determine if the credentials are generated with multiple commands.
+	// Go tests are platform specific and therefore, this would work.
+	cmd := exec.Command("pwsh.exe", "-Command", psCredentialCommandFormat)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("fsxUsername=%s", username))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("fsxPassword=%s", password))
+
+	out, err := cmd.CombinedOutput()
+
+	assert.Contains(t, string(out), "echo")
+	assert.NoError(t, err)
+}
+
+func TestSpecialPasswordInPSCommand(t *testing.T) {
+	password := "AWS@`~!@#$var%^&*()/1asd"
+
+	tempPsCredentialCommandUsingEnv := "$Env:fsxPassword"
+	// Wrap password in single quotes to prevent PowerShell from interpreting special characters.
+	// Escape any single quotes within the password by doubling them.
+	escapedPassword := strings.ReplaceAll(password, "'", "''")
+	tempPsCredentialCommandUsingValue := fmt.Sprintf("'%s'", escapedPassword)
+
+	cmd := exec.Command("pwsh.exe", "-Command", tempPsCredentialCommandUsingEnv)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("fsxPassword=%s", password))
+
+	outEnv, err := cmd.CombinedOutput()
+	assert.NoError(t, err)
+
+	cmd = exec.Command("pwsh.exe", "-Command", tempPsCredentialCommandUsingValue)
+	outValue, err := cmd.CombinedOutput()
+
+	assert.Equal(t, string(outEnv), string(outValue))
 	assert.NoError(t, err)
 }

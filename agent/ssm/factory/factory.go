@@ -14,15 +14,21 @@
 package factory
 
 import (
+	"context"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	"github.com/aws/amazon-ecs-agent/agent/httpclient"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	ssmclient "github.com/aws/amazon-ecs-agent/agent/ssm"
-	"github.com/aws/aws-sdk-go/aws"
-	awscreds "github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ssm"
+	agentversion "github.com/aws/amazon-ecs-agent/agent/version"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/httpclient"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 const (
@@ -30,7 +36,7 @@ const (
 )
 
 type SSMClientCreator interface {
-	NewSSMClient(region string, creds credentials.IAMRoleCredentials) ssmclient.SSMClient
+	NewSSMClient(region string, creds credentials.IAMRoleCredentials, ipCompatibility ipcompatibility.IPCompatibility) (ssmclient.SSMClient, error)
 }
 
 func NewSSMClientCreator() SSMClientCreator {
@@ -39,15 +45,30 @@ func NewSSMClientCreator() SSMClientCreator {
 
 type ssmClientCreator struct{}
 
-//SSM Client will automatically retry 3 times when has throttling error
+// SSM Client will automatically retry 3 times when has throttling error
 func (*ssmClientCreator) NewSSMClient(region string,
-	creds credentials.IAMRoleCredentials) ssmclient.SSMClient {
-	cfg := aws.NewConfig().
-		WithHTTPClient(httpclient.New(roundtripTimeout, false)).
-		WithRegion(region).
-		WithCredentials(
-			awscreds.NewStaticCredentials(creds.AccessKeyID, creds.SecretAccessKey,
-				creds.SessionToken))
-	sess := session.Must(session.NewSession(cfg))
-	return ssm.New(sess)
+	creds credentials.IAMRoleCredentials,
+	ipCompatibility ipcompatibility.IPCompatibility) (ssmclient.SSMClient, error) {
+
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithHTTPClient(httpclient.New(roundtripTimeout, false, agentversion.String(), config.OSType, "")),
+		awsconfig.WithRegion(region),
+		awsconfig.WithCredentialsProvider(
+			awscreds.NewStaticCredentialsProvider(creds.AccessKeyID, creds.SecretAccessKey,
+				creds.SessionToken),
+		),
+	}
+
+	if ipCompatibility.IsIPv6Only() {
+		logger.Debug("Configuring SSM Client DualStack endpoint")
+		opts = append(opts, awsconfig.WithUseDualStackEndpoint(aws.DualStackEndpointStateEnabled))
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(context.TODO(), opts...)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return ssm.NewFromConfig(cfg), nil
 }

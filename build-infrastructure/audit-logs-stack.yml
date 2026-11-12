@@ -45,6 +45,12 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'audit-logs-bucket-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
 
   AuditLogsBucketPolicy:
     DependsOn: AuditLogsBucket

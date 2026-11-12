@@ -19,16 +19,17 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/asm"
 	"github.com/aws/amazon-ecs-agent/agent/asm/factory"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/docker/docker/api/types/registry"
 
 	"github.com/cihub/seelog"
-	"github.com/docker/docker/api/types"
 	"github.com/pkg/errors"
 )
 
@@ -55,7 +56,7 @@ type ASMAuthResource struct {
 
 	// required for asm private registry auth
 	requiredASMResources []*apicontainer.ASMAuthData
-	dockerAuthData       map[string]types.AuthConfig
+	dockerAuthData       map[string]registry.AuthConfig
 	// asmClientCreator is a factory interface that creates new ASM clients. This is
 	// needed mostly for testing as we're creating an asm client per every item in
 	// the requiredASMResources list. Each of these items could be from different
@@ -250,7 +251,7 @@ func (auth *ASMAuthResource) GetCreatedAt() time.Time {
 func (auth *ASMAuthResource) Create() error {
 	seelog.Infof("ASM Auth: Retrieving credentials for containers in task: [%s]", auth.taskARN)
 	if auth.dockerAuthData == nil {
-		auth.dockerAuthData = make(map[string]types.AuthConfig)
+		auth.dockerAuthData = make(map[string]registry.AuthConfig)
 	}
 	for _, a := range auth.GetRequiredASMResources() {
 		err := auth.retrieveASMDockerAuthData(a)
@@ -276,7 +277,10 @@ func (auth *ASMAuthResource) retrieveASMDockerAuthData(asmAuthData *apicontainer
 		return errors.New("asm resource: unable to find execution role credentials")
 	}
 	iamCredentials := executionCredentials.GetIAMRoleCredentials()
-	asmClient := auth.asmClientCreator.NewASMClient(asmAuthData.Region, iamCredentials)
+	asmClient, err := auth.asmClientCreator.NewASMClient(asmAuthData.Region, iamCredentials)
+	if err != nil {
+		return errors.Errorf("unable to create ASM client: %v", err)
+	}
 	seelog.Debugf("ASM Auth: Retrieving resource with ID [%s] in task: [%s]", secretID, auth.taskARN)
 	dac, err := asm.GetDockerAuthFromASM(secretID, asmClient)
 	if err != nil {
@@ -328,7 +332,7 @@ func (auth *ASMAuthResource) clearASMDockerAuthConfig() {
 
 // GetASMDockerAuthConfig retrieves the docker private registry auth data from
 // the task
-func (auth *ASMAuthResource) GetASMDockerAuthConfig(secretID string) (types.AuthConfig, bool) {
+func (auth *ASMAuthResource) GetASMDockerAuthConfig(secretID string) (registry.AuthConfig, bool) {
 	auth.lock.RLock()
 	defer auth.lock.RUnlock()
 
@@ -336,7 +340,19 @@ func (auth *ASMAuthResource) GetASMDockerAuthConfig(secretID string) (types.Auth
 	return d, ok
 }
 
-func (auth *ASMAuthResource) Initialize(resourceFields *taskresource.ResourceFields,
+// Stores provided docker auth config against the provided secret ID.
+func (auth *ASMAuthResource) PutASMDockerAuthConfig(secretID string, authCfg registry.AuthConfig) {
+	auth.lock.Lock()
+	defer auth.lock.Unlock()
+	if auth.dockerAuthData == nil {
+		auth.dockerAuthData = make(map[string]registry.AuthConfig)
+	}
+	auth.dockerAuthData[secretID] = authCfg
+}
+
+func (auth *ASMAuthResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 	auth.initStatusToTransition()
@@ -427,4 +443,10 @@ func (auth *ASMAuthResource) BuildContainerDependency(containerName string, sati
 
 func (auth *ASMAuthResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// ASM auth resource always requires the task execution role credentials.
+func (auth *ASMAuthResource) RequiresExecutionRoleCredentials() bool {
+	return true
 }

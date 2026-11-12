@@ -21,10 +21,11 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
 )
 
 // CgroupResource represents Cgroup resource
@@ -131,7 +132,9 @@ func (c *CgroupResource) UnmarshalJSON(b []byte) error {
 }
 
 // Initialize fills the resource fileds
-func (cgroup *CgroupResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (cgroup *CgroupResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 }
@@ -146,4 +149,9 @@ func (cgroup *CgroupResource) BuildContainerDependency(containerName string, sat
 
 func (cgroup *CgroupResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials
+func (cgroup *CgroupResource) RequiresExecutionRoleCredentials() bool {
+	return false
 }

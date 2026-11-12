@@ -1,0 +1,934 @@
+//go:build unit
+// +build unit
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"). You may
+// not use this file except in compliance with the License. A copy of the
+// License is located at
+//
+//	http://aws.amazon.com/apache2.0/
+//
+// or in the "license" file accompanying this file. This file is distributed
+// on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+// express or implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
+package tcshandler
+
+import (
+	"errors"
+	"io"
+	"math/rand"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"context"
+
+	"github.com/aws/amazon-ecs-agent/ecs-agent/doctor"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/metrics"
+	mock_metrics "github.com/aws/amazon-ecs-agent/ecs-agent/metrics/mocks"
+	tcsclient "github.com/aws/amazon-ecs-agent/ecs-agent/tcs/client"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tcs/model/ecstcs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/wsclient"
+	wsmock "github.com/aws/amazon-ecs-agent/ecs-agent/wsclient/mock/utils"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/golang/mock/gomock"
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
+)
+
+const (
+	testTaskArn                           = "arn:aws:ecs:us-east-1:123:task/def"
+	testTaskDefinitionFamily              = "task-def"
+	testClusterArn                        = "arn:aws:ecs:us-east-1:123:cluster/default"
+	testInstanceArn                       = "arn:aws:ecs:us-east-1:123:container-instance/abc"
+	testMessageId                         = "testMessageId"
+	testPublishMetricsInterval            = 1 * time.Second
+	testSendMetricsToChannelWaitTime      = 100 * time.Millisecond
+	testTelemetryChannelDefaultBufferSize = 10
+	testDockerEndpoint                    = "testEndpoint"
+	testAgentVersion                      = "testAgentVersion"
+	testAgentHash                         = "testAgentHash"
+	testContainerRuntimeVersion           = "testContainerRuntimeVersion"
+	testInvalidURL                        = "invalid-url"
+	testHeartbeatTimeout                  = 1 * time.Minute
+	testHeartbeatJitter                   = 1 * time.Minute
+	testDisconnectionTimeout              = 30 * time.Minute
+	testDisconnectionJitter               = 5 * time.Minute
+)
+
+type mockStatsSource struct {
+	metricsChannel       chan<- ecstcs.TelemetryMessage
+	healthChannel        chan<- ecstcs.HealthMessage
+	publishMetricsTicker *time.Ticker
+}
+
+var testCreds = credentials.NewStaticCredentialsProvider("test-id", "test-secret", "test-token")
+
+var testCfg = &wsclient.WSClientMinAgentConfig{
+	AWSRegion:          "us-east-1",
+	AcceptInsecureCert: true,
+	DockerEndpoint:     testDockerEndpoint,
+	IsDocker:           true,
+}
+
+var emptyDoctor, _ = doctor.NewDoctor([]doctor.Healthcheck{}, "test-cluster", "this:is:an:instance:arn")
+
+func (*mockStatsSource) GetInstanceMetrics(includeServiceConnectStats bool) (*ecstcs.MetricsMetadata, []*ecstcs.TaskMetric, error) {
+	req := createPublishMetricsRequest()
+	return req.Metadata, req.TaskMetrics, nil
+}
+
+func (*mockStatsSource) GetTaskHealthMetrics() (*ecstcs.HealthMetadata, []*ecstcs.TaskHealth, error) {
+	return nil, nil, nil
+}
+
+func (*mockStatsSource) GetPublishServiceConnectTickerInterval() int32 {
+	return 0
+}
+
+func (*mockStatsSource) SetPublishServiceConnectTickerInterval(counter int32) {
+	return
+}
+
+func (Source *mockStatsSource) GetPublishMetricsTicker() *time.Ticker {
+	return Source.publishMetricsTicker
+}
+
+// SimulateMetricsPublishToChannel simulates the behavior of `StartMetricsPublish` in DockerStatsSource, which feeds metrics
+// to channel to TCS Client. There has to be at least one valid metrics sent, otherwise no request will be made to mockServer
+// in TestStartTelemetrySession, specifically blocking `request := <-requestChan`
+func (Source *mockStatsSource) SimulateMetricsPublishToChannel(ctx context.Context) {
+	Source.publishMetricsTicker = time.NewTicker(testPublishMetricsInterval)
+	for {
+		select {
+		case <-Source.publishMetricsTicker.C:
+			Source.metricsChannel <- ecstcs.TelemetryMessage{
+				Metadata: &ecstcs.MetricsMetadata{
+					Cluster:           aws.String(testClusterArn),
+					ContainerInstance: aws.String(testInstanceArn),
+					Fin:               aws.Bool(false),
+					Idle:              aws.Bool(false),
+					MessageId:         aws.String(testMessageId),
+				},
+				TaskMetrics: []*ecstcs.TaskMetric{
+					&ecstcs.TaskMetric{},
+				},
+			}
+
+			Source.healthChannel <- ecstcs.HealthMessage{
+				Metadata:      &ecstcs.HealthMetadata{},
+				HealthMetrics: []*ecstcs.TaskHealth{},
+			}
+
+		case <-ctx.Done():
+			defer close(Source.metricsChannel)
+			defer close(Source.healthChannel)
+			return
+		}
+	}
+}
+
+func TestFormatURL(t *testing.T) {
+	endpoint := "http://127.0.0.0.1/"
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	wsurl := formatURL(endpoint, testClusterArn, testInstanceArn, testAgentVersion, testAgentHash,
+		ContainerRuntimeDocker, testContainerRuntimeVersion)
+	parsed, err := url.Parse(wsurl)
+	assert.NoError(t, err, "should be able to parse URL")
+	assert.Equal(t, "/ws", parsed.Path, "wrong path")
+	assert.Equal(t, testClusterArn, parsed.Query().Get("cluster"), "wrong cluster")
+	assert.Equal(t, testInstanceArn, parsed.Query().Get("containerInstance"), "wrong container instance")
+	assert.Equal(t, testAgentVersion, parsed.Query().Get("agentVersion"), "wrong agent version")
+	assert.Equal(t, testAgentHash, parsed.Query().Get("agentHash"), "wrong agent hash")
+	assert.Equal(t, testContainerRuntimeVersion, parsed.Query().Get("dockerVersion"), "wrong docker version")
+}
+
+func TestStartTelemetrySession(t *testing.T) {
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, serverChan, requestChan, serverErr, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	wait := &sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+	wait.Add(1)
+	go func() {
+		select {
+		case sErr := <-serverErr:
+			t.Error(sErr)
+		case <-ctx.Done():
+		}
+		wait.Done()
+	}()
+	defer func() {
+		closeSocket(closeWS)
+		close(serverChan)
+	}()
+
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", context.Background())
+
+	mockSource := &mockStatsSource{
+		metricsChannel: telemetryMessages,
+		healthChannel:  healthMessages,
+	}
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Start a session with the test server.
+	go session.StartTelemetrySession(ctx)
+
+	// Wait for 100 ms to make sure the session is ready to receive message from channel
+	time.Sleep(testSendMetricsToChannelWaitTime)
+	go mockSource.SimulateMetricsPublishToChannel(ctx)
+
+	// startTelemetrySession internally starts publishing metrics from the mockStatsSource object (poll msg out of channel).
+	time.Sleep(testPublishMetricsInterval * 2)
+
+	// Read request channel to get the metric data published to the server.
+	request := <-requestChan
+	cancel()
+	wait.Wait()
+	go func() {
+		for {
+			select {
+			case <-requestChan:
+			}
+		}
+	}()
+
+	// Decode and verify the metric data.
+	payload, err := getPayloadFromRequest(request)
+	if err != nil {
+		t.Fatal("Error decoding payload: ", err)
+	}
+
+	// Decode and verify the metric data.
+	_, responseType, err := wsclient.DecodeData([]byte(payload), tcsclient.NewTCSDecoder())
+	if err != nil {
+		t.Fatal("error decoding data: ", err)
+	}
+	if responseType != "PublishMetricsRequest" {
+		t.Fatal("Unexpected responseType: ", responseType)
+	}
+}
+
+func TestSessionConnectionClosedByRemote(t *testing.T) {
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, serverChan, _, serverErr, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	go func() {
+		serr := <-serverErr
+		if !websocket.IsCloseError(serr, websocket.CloseNormalClosure) {
+			t.Error(serr)
+		}
+	}()
+	sleepBeforeClose := 10 * time.Millisecond
+	go func() {
+		time.Sleep(sleepBeforeClose)
+		closeSocket(closeWS)
+		close(serverChan)
+	}()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+	defer cancel()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Start a session with the test server.
+	err = session.StartTelemetrySession(ctx)
+
+	if err == nil {
+		t.Error("Expected io.EOF on closed connection")
+	}
+	if err != io.EOF {
+		t.Error("Expected io.EOF on closed connection, got: ", err)
+	}
+}
+
+// TestConnectionInactiveTimeout tests the tcs client should time out when it's inactive for too long
+func TestConnectionInactiveTimeout(t *testing.T) {
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, _, requestChan, serverErr, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	go func() {
+		for {
+			select {
+			case <-requestChan:
+			}
+		}
+	}()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+	defer cancel()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		5*time.Second,
+		100*time.Millisecond,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Start a session with the test server.
+	err = session.StartTelemetrySession(ctx)
+	assert.Equal(t, err.Error(), io.EOF.Error(), "EOF error expected.")
+
+	msg := <-serverErr
+	assert.True(t, websocket.IsCloseError(msg, websocket.CloseNormalClosure),
+		"Expected normal closure code message to be received on server side after periodic disconnect.")
+
+	closeSocket(closeWS)
+}
+
+// TestTACSDurationMetrics tests that the TACSSessionCallDurationName and TACSDisconnectedDuration and metrics are
+// emitted when they should be.
+func TestTACSDurationMetrics(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	numTimesConnectToTACS := 2
+	mockMetricsFactory := mock_metrics.NewMockEntryFactory(ctrl)
+
+	// TACSSessionCallDuration is emitted on all connections to TACS.
+	mockDurationEntry := mock_metrics.NewMockEntry(ctrl)
+	mockDurationEntry.EXPECT().WithGauge(gomock.Any()).Return(mockDurationEntry).Times(numTimesConnectToTACS)
+	mockDurationEntry.EXPECT().Done(gomock.Any()).Times(numTimesConnectToTACS)
+	mockMetricsFactory.EXPECT().New(metrics.TACSSessionCallDurationName).Return(mockDurationEntry).
+		Times(numTimesConnectToTACS)
+
+	// TACSDisconnectedDuration should be emitted upon reconnection to TACS only (i.e., all connections to TACS except
+	// the very first one).
+	mockDisconnectedEntry := mock_metrics.NewMockEntry(ctrl)
+	mockDisconnectedEntry.EXPECT().WithGauge(gomock.Any()).Return(mockDisconnectedEntry).Times(numTimesConnectToTACS - 1)
+	mockDisconnectedEntry.EXPECT().Done(gomock.Any()).Times(numTimesConnectToTACS - 1)
+	mockMetricsFactory.EXPECT().New(metrics.TACSDisconnectedDurationName).Return(mockDisconnectedEntry).
+		Times(numTimesConnectToTACS - 1)
+
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, _, requestChan, _, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	go func() {
+		for {
+			select {
+			case <-requestChan:
+			}
+		}
+	}()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	tacsSession := telemetrySession{
+		containerInstanceArn:          testInstanceArn,
+		cluster:                       testClusterArn,
+		agentVersion:                  testAgentVersion,
+		agentHash:                     testAgentHash,
+		containerRuntimeVersion:       testContainerRuntimeVersion,
+		disableMetrics:                false,
+		credentialsCache:              aws.NewCredentialsCache(testCreds),
+		cfg:                           testCfg,
+		deregisterInstanceEventStream: deregisterInstanceEventStream,
+		heartbeatTimeout:              50 * time.Millisecond, // use smaller value than testHeartbeatTimeout
+		heartbeatJitterMax:            10 * time.Millisecond, // use smaller value than testHeartbeatJitter
+		disconnectTimeout:             testDisconnectionTimeout,
+		disconnectJitterMax:           testDisconnectionJitter,
+		metricsFactory:                mockMetricsFactory, // use the mock metrics factory
+		metricsChannel:                telemetryMessages,
+		healthChannel:                 healthMessages,
+		instanceStatusChannel:         instanceStatusMessages,
+		doctor:                        emptyDoctor,
+		ecsClient:                     testecsclient,
+		lastDisconnectedTime:          time.Time{},
+	}
+
+	for i := 0; i < numTimesConnectToTACS; i++ {
+		tacsSession.StartTelemetrySession(ctx)
+		tacsSession.lastDisconnectedTime = time.Now()
+	}
+}
+
+// TestTACSConnectionFailureMetric tests that the TACSConnectionFailure metric is recorded when there's a connection error
+func TestTACSConnectionFailureMetric(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create mock metrics factory and entry
+	mockMetricsFactory := mock_metrics.NewMockEntryFactory(ctrl)
+	mockEntry := mock_metrics.NewMockEntry(ctrl)
+
+	// Create a test ECS client that will cause StartTelemetrySession to fail
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: testInvalidURL, // This will cause an error
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		mockMetricsFactory, // Use the mock metrics factory
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Set expectations for the metrics calls
+	mockMetricsFactory.EXPECT().New(metrics.TACSConnectionFailure).Return(mockEntry).Times(1)
+	mockEntry.EXPECT().Done(gomock.Any()).Times(1) // Expecting Done to be called with any error
+
+	// Start the session in a goroutine since it will run in a loop
+	go func() {
+		// This will fail and trigger the metrics call
+		session.Start(ctx)
+	}()
+
+	// Give some time for the session to start and fail
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel the context to stop the session loop
+	cancel()
+
+	// Give some time for the goroutine to exit
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestClientReconnectsAfterInactiveTimeout tests the tcs client reconnects when it loses network
+// connection, or it's inactive for too long
+func TestClientReconnectsAfterInactiveTimeout(t *testing.T) {
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, _, requestChan, _, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	go func() {
+		for {
+			select {
+			case <-requestChan:
+			}
+		}
+	}()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+	ctx := context.Background()
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	ctx, cancelCtx := context.WithDeadline(ctx, deadline)
+	defer cancelCtx()
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		50*time.Millisecond,
+		10*time.Millisecond,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Start a session with the test server. Start() runs in for loop to attempt reconnection
+	// until ctx is cancelled or done.
+	err = session.Start(ctx)
+	// The session should reconnect and the closure of connection should not be because of io.EOF error,
+	// since the connection was closed as part of context cancelled. If we do not send context cancelled
+	// it would continue to reconnect and test will be in forever loop.
+	assert.False(t, websocket.IsCloseError(err, websocket.CloseAbnormalClosure),
+		"Read from closed connection should produce an io.EOF error")
+}
+
+func getPayloadFromRequest(request string) (string, error) {
+	lines := strings.Split(request, "\r\n")
+	if len(lines) > 0 {
+		return lines[len(lines)-1], nil
+	}
+
+	return "", errors.New("Could not get payload")
+}
+
+// closeSocket tells the server to send a close frame. This lets us test
+// what happens if the connection is closed by the remote server.
+func closeSocket(ws chan<- []byte) {
+	ws <- websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	close(ws)
+}
+
+func createPublishMetricsRequest() *ecstcs.PublishMetricsRequest {
+	cluster := testClusterArn
+	ci := testInstanceArn
+	taskArn := testTaskArn
+	taskDefinitionFamily := testTaskDefinitionFamily
+	var fval float64
+	fval = rand.Float64()
+	var ival int64
+	ival = rand.Int63n(10)
+	ts := (utils.Timestamp)(time.Now())
+	idle := false
+	messageId := testMessageId
+	return &ecstcs.PublishMetricsRequest{
+		Metadata: &ecstcs.MetricsMetadata{
+			Cluster:           &cluster,
+			ContainerInstance: &ci,
+			Idle:              &idle,
+			MessageId:         &messageId,
+		},
+		TaskMetrics: []*ecstcs.TaskMetric{
+			{
+				ContainerMetrics: []*ecstcs.ContainerMetric{
+					{
+						CpuStatsSet: &ecstcs.CWStatsSet{
+							Max:         &fval,
+							Min:         &fval,
+							SampleCount: &ival,
+							Sum:         &fval,
+						},
+						MemoryStatsSet: &ecstcs.CWStatsSet{
+							Max:         &fval,
+							Min:         &fval,
+							SampleCount: &ival,
+							Sum:         &fval,
+						},
+					},
+				},
+				TaskArn:              &taskArn,
+				TaskDefinitionFamily: &taskDefinitionFamily,
+			},
+		},
+		Timestamp: &ts,
+	}
+}
+
+func TestStartTelemetrySessionMetricsChannelPauseWhenClientClosed(t *testing.T) {
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, _, _, _, _ := wsmock.GetMockServer(closeWS)
+	server.StartTLS()
+	defer server.Close()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", context.Background())
+	deregisterInstanceEventStream.StartListening()
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	go session.StartTelemetrySession(ctx)
+	telemetryMessages <- ecstcs.TelemetryMessage{}
+	for len(telemetryMessages) != 0 {
+		time.Sleep(1 * time.Second)
+	} // wait till tcs client is up and is polling message
+
+	cancel()
+	time.Sleep(5 * time.Second) // wait till tcs client is stopped (returned from StartTelemetrySession)
+
+	// Send message while TCS Client is closed and verify the message is not polled but stays in the channel
+	for it := 0; it < testTelemetryChannelDefaultBufferSize; it++ {
+		telemetryMessages <- ecstcs.TelemetryMessage{}
+	}
+
+	// check messages filled the channel
+	assert.Len(t, telemetryMessages, testTelemetryChannelDefaultBufferSize)
+	// check after channel is full, message will be dropped
+
+	// simulating retry after backoff
+	newCtx, _ := context.WithCancel(context.Background())
+	go session.StartTelemetrySession(newCtx)
+	for len(telemetryMessages) != 0 {
+		time.Sleep(1 * time.Second)
+	} // test will time out if after tcs client startup, message does not resume flowing
+}
+
+// TestPeriodicDisconnectonTCSClient tests for tcs session disconnects at regular intervals.
+func TestPeriodicDisconnectonTCSClient(t *testing.T) {
+
+	// Start test server.
+	closeWS := make(chan []byte)
+	server, _, requestChan, serverErr, err := wsmock.GetMockServer(closeWS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+	go func() {
+		for {
+			select {
+			case <-requestChan:
+			}
+		}
+	}()
+
+	testecsclient := &wsmock.TestECSClient{
+		TCSurl: server.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+	defer cancel()
+
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	// Setting disconnect timer(10 secs) to be less than heartbeat timer(1min)
+	// in order to disconnect because of periodic timer instead of heartbeat timer due to inactivity.
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		deregisterInstanceEventStream,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		10*time.Second,
+		2*time.Second,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+	)
+
+	// Start a session with the test server.
+	err = session.StartTelemetrySession(ctx)
+	assert.Equal(t, err.Error(), io.EOF.Error(), "EOF error expected.")
+
+	msg := <-serverErr
+	assert.True(t, websocket.IsCloseError(msg, websocket.CloseNormalClosure),
+		"Expected normal closure code message to be received on server side after periodic disconnect.")
+
+	closeSocket(closeWS)
+}
+
+func TestDPEAndTCSConnFailureTrackingRecordFailure(t *testing.T) {
+	testCases := []struct {
+		name             string
+		tcsURL           string
+		expectDPEFailing bool
+		expectTCSFailing bool
+	}{
+		{
+			name: "DPE error records both DPE and TCS connectivity failure",
+			// Empty TCS URL will cause DPE call via test ECS client to fail.
+			tcsURL:           "",
+			expectDPEFailing: true,
+			expectTCSFailing: true,
+		},
+		{
+			name: "DPE success and TCS connect error records TCS connectivity failure only",
+			// Invalid TCS URL returned by test ECS client will cause TCS connect to fail.
+			tcsURL:           testInvalidURL,
+			expectDPEFailing: false,
+			expectTCSFailing: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dpeFailureTracker := metrics.NewFailureTracker(
+				metrics.DPEConnectivityFailureMetricName,
+				metrics.NewNopEntryFactory(),
+			)
+			tcsConnFailureTracker := metrics.NewFailureTracker(
+				metrics.TCSConnectivityFailureMetricName,
+				metrics.NewNopEntryFactory(),
+			)
+
+			testecsclient := &wsmock.TestECSClient{TCSurl: tc.tcsURL}
+			telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+			healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+			instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+			session := NewTelemetrySession(
+				testInstanceArn,
+				testClusterArn,
+				testAgentVersion,
+				testAgentHash,
+				testContainerRuntimeVersion,
+				false,
+				aws.NewCredentialsCache(testCreds),
+				testCfg,
+				nil,
+				testHeartbeatTimeout,
+				testHeartbeatJitter,
+				testDisconnectionTimeout,
+				testDisconnectionJitter,
+				metrics.NewNopEntryFactory(),
+				telemetryMessages,
+				healthMessages,
+				instanceStatusMessages,
+				emptyDoctor,
+				testecsclient,
+				WithDPEFailureTracker(dpeFailureTracker),
+				WithTCSConnFailureTracker(tcsConnFailureTracker),
+			)
+
+			err := session.StartTelemetrySession(context.Background())
+			assert.Error(t, err)
+			assert.Equal(t, tc.expectDPEFailing, dpeFailureTracker.IsFailing())
+			assert.Equal(t, tc.expectTCSFailing, tcsConnFailureTracker.IsFailing())
+		})
+	}
+}
+
+func TestDPEAndTCSConnFailureTrackersRecordSuccess(t *testing.T) {
+	closeWS := make(chan []byte)
+	server, _, _, _, err := wsmock.GetMockServer(closeWS)
+	assert.NoError(t, err)
+	server.StartTLS()
+	defer server.Close()
+	defer close(closeWS)
+
+	dpeFailureTracker := metrics.NewFailureTracker(
+		metrics.DPEConnectivityFailureMetricName,
+		metrics.NewNopEntryFactory(),
+	)
+	tcsConnFailureTracker := metrics.NewFailureTracker(
+		metrics.TCSConnectivityFailureMetricName,
+		metrics.NewNopEntryFactory(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start in a failing state to verify later that RecordSuccess resets it.
+	dpeFailureTracker.RecordFailure()
+	tcsConnFailureTracker.RecordFailure()
+
+	// Call cancel upfront to ensure that TCS client does not serve traffic
+	// indefinitely once TCS connection is successful.
+	cancel()
+
+	testecsclient := &wsmock.TestECSClient{TCSurl: server.URL}
+	telemetryMessages := make(chan ecstcs.TelemetryMessage, testTelemetryChannelDefaultBufferSize)
+	healthMessages := make(chan ecstcs.HealthMessage, testTelemetryChannelDefaultBufferSize)
+	instanceStatusMessages := make(chan ecstcs.InstanceStatusMessage, testTelemetryChannelDefaultBufferSize)
+
+	session := NewTelemetrySession(
+		testInstanceArn,
+		testClusterArn,
+		testAgentVersion,
+		testAgentHash,
+		testContainerRuntimeVersion,
+		false,
+		aws.NewCredentialsCache(testCreds),
+		testCfg,
+		nil,
+		testHeartbeatTimeout,
+		testHeartbeatJitter,
+		testDisconnectionTimeout,
+		testDisconnectionJitter,
+		metrics.NewNopEntryFactory(),
+		telemetryMessages,
+		healthMessages,
+		instanceStatusMessages,
+		emptyDoctor,
+		testecsclient,
+		WithDPEFailureTracker(dpeFailureTracker),
+		WithTCSConnFailureTracker(tcsConnFailureTracker),
+	)
+
+	err = session.StartTelemetrySession(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, dpeFailureTracker.IsFailing())
+	assert.False(t, tcsConnFailureTracker.IsFailing())
+}

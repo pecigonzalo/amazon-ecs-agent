@@ -19,10 +19,11 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/app/args"
-	"github.com/aws/amazon-ecs-agent/agent/logger"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers/exitcodes"
 	"github.com/aws/amazon-ecs-agent/agent/version"
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 	log "github.com/cihub/seelog"
 )
 
@@ -60,13 +61,19 @@ func Run(arguments []string) int {
 	}
 
 	if *parsedArgs.LogLevel != "" {
-		logger.SetLevel(*parsedArgs.LogLevel, *parsedArgs.LogLevel)
+		logger.SetDriverLogLevel(*parsedArgs.LogLevel)
+		logger.SetInstanceLogLevel(*parsedArgs.LogLevel)
 	} else {
-		logger.SetLevel(*parsedArgs.DriverLogLevel, *parsedArgs.InstanceLogLevel)
+		if *parsedArgs.DriverLogLevel != "" {
+			logger.SetDriverLogLevel(*parsedArgs.DriverLogLevel)
+		}
+		if *parsedArgs.InstanceLogLevel != "" {
+			logger.SetInstanceLogLevel(*parsedArgs.InstanceLogLevel)
+		}
 	}
 
 	// Create an Agent object
-	agent, err := newAgent(aws.BoolValue(parsedArgs.BlackholeEC2Metadata), parsedArgs.AcceptInsecureCert)
+	agent, err := newAgent(aws.ToBool(parsedArgs.BlackholeEC2Metadata), parsedArgs.AcceptInsecureCert)
 	if err != nil {
 		// Failure to initialize either the docker client or the EC2 metadata
 		// service client are non terminal errors as they could be transient
@@ -74,7 +81,7 @@ func Run(arguments []string) int {
 	}
 
 	if agent.getConfig().EnableRuntimeStats.Enabled() {
-		defer logger.StartRuntimeStatsLogger(agent.getConfig())()
+		defer logger.StartRuntimeStatsLogger(agent.getConfig().RuntimeStatsLogFile)()
 	}
 
 	switch {

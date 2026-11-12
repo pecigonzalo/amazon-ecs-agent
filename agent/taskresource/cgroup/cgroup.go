@@ -27,16 +27,16 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
-	control "github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup/control"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup/control"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
 	"github.com/cihub/seelog"
-	"github.com/containerd/cgroups"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	cgroups "github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const (
@@ -379,7 +379,9 @@ func (cgroup *CgroupResource) GetCgroupMountPath() string {
 }
 
 // Initialize initializes the resource fileds in cgroup
-func (cgroup *CgroupResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (cgroup *CgroupResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 	cgroup.lock.Lock()
@@ -400,4 +402,10 @@ func (cgroup *CgroupResource) BuildContainerDependency(containerName string, sat
 
 func (cgroup *CgroupResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// cgroup resource does not rely on task execution role credentials.
+func (cgroup *CgroupResource) RequiresExecutionRoleCredentials() bool {
+	return false
 }

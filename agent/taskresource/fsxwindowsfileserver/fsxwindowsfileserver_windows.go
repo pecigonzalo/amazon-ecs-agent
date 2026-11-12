@@ -19,33 +19,37 @@ package fsxwindowsfileserver
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/asm"
-	"github.com/aws/amazon-ecs-agent/agent/ssm"
-	"github.com/aws/amazon-ecs-agent/agent/utils"
-	"github.com/aws/aws-sdk-go/aws/arn"
-
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/agent/asm"
 	asmfactory "github.com/aws/amazon-ecs-agent/agent/asm/factory"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/fsx"
 	fsxfactory "github.com/aws/amazon-ecs-agent/agent/fsx/factory"
+	"github.com/aws/amazon-ecs-agent/agent/ssm"
 	ssmfactory "github.com/aws/amazon-ecs-agent/agent/ssm/factory"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	"github.com/aws/amazon-ecs-agent/agent/utils"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
+
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
 
 const (
+	psCredentialCommandFormat = "$(New-Object System.Management.Automation.PSCredential($Env:fsxUsername, $(ConvertTo-SecureString $Env:fsxPassword -AsPlainText -Force)))"
 	resourceProvisioningError = "VolumeError: Agent could not create task's volume resources"
+	fsxVolumeType             = "fsx"
 )
 
 // FSxWindowsFileServerResource represents a fsxwindowsfileserver resource
@@ -64,6 +68,7 @@ type FSxWindowsFileServerResource struct {
 	asmClientCreator asmfactory.ClientCreator
 	// fsxClientCreator is a factory interface that creates new FSx clients.
 	fsxClientCreator fsxfactory.FSxClientCreator
+	ipCompatibility  ipcompatibility.IPCompatibility
 
 	// fields that are set later during resource creation
 	FSxWindowsFileServerDNSName string
@@ -112,7 +117,8 @@ func NewFSxWindowsFileServerResource(
 	credentialsManager credentials.Manager,
 	ssmClientCreator ssmfactory.SSMClientCreator,
 	asmClientCreator asmfactory.ClientCreator,
-	fsxClientCreator fsxfactory.FSxClientCreator) (*FSxWindowsFileServerResource, error) {
+	fsxClientCreator fsxfactory.FSxClientCreator,
+	ipCompatibility ipcompatibility.IPCompatibility) (*FSxWindowsFileServerResource, error) {
 
 	fv := &FSxWindowsFileServerResource{
 		Name:       name,
@@ -129,13 +135,16 @@ func NewFSxWindowsFileServerResource(
 		ssmClientCreator:       ssmClientCreator,
 		asmClientCreator:       asmClientCreator,
 		fsxClientCreator:       fsxClientCreator,
+		ipCompatibility:        ipCompatibility,
 	}
 
 	fv.initStatusToTransition()
 	return fv, nil
 }
 
-func (fv *FSxWindowsFileServerResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (fv *FSxWindowsFileServerResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 
@@ -143,6 +152,7 @@ func (fv *FSxWindowsFileServerResource) Initialize(resourceFields *taskresource.
 	fv.ssmClientCreator = resourceFields.SSMClientCreator
 	fv.asmClientCreator = resourceFields.ASMClientCreator
 	fv.fsxClientCreator = resourceFields.FSxClientCreator
+	fv.ipCompatibility = config.InstanceIPCompatibility
 	fv.initStatusToTransition()
 }
 
@@ -290,6 +300,20 @@ func (fv *FSxWindowsFileServerResource) SetCreatedAt(createdAt time.Time) {
 // Source returns the host path of the fsxwindowsfileserver resource which is used as the source of the volume mount
 func (cfg *FSxWindowsFileServerVolumeConfig) Source() string {
 	return utils.GetCanonicalPath(cfg.HostPath)
+}
+
+func (cfg *FSxWindowsFileServerVolumeConfig) GetType() string {
+	return fsxVolumeType
+}
+
+func (cfg *FSxWindowsFileServerVolumeConfig) GetVolumeId() string {
+	return cfg.FileSystemID
+}
+
+// Note: The name is within the FSxWindowsFileServerResource struct. In order to use this in the future, this needs to be modified.
+// Currently not meant for use
+func (cfg *FSxWindowsFileServerVolumeConfig) GetVolumeName() string {
+	return ""
 }
 
 // GetName safely returns the name of the fsxwindowsfileserver resource
@@ -462,16 +486,28 @@ func (fv *FSxWindowsFileServerResource) retrieveSSMCredentials(credentialsParame
 		return err
 	}
 
-	ssmClient := fv.ssmClientCreator.NewSSMClient(fv.region, iamCredentials)
-	ssmParam := filepath.Base(parsedARN.Resource)
-	ssmParams := []string{ssmParam}
+	ssmClient, err := fv.ssmClientCreator.NewSSMClient(fv.region, iamCredentials, fv.ipCompatibility)
+	if err != nil {
+		return err
+	}
+	// parsedARN.Resource looks like "arn:aws:ssm:us-west-2:123456789012:parameter/sample1/sample2/parameter1"
+	// We cut by parameter and get "arn:aws:ssm:us-west-2:123456789012:parameter", "/sample1/sample2/parameter1", True/False
+	_, ssmParamName, found := strings.Cut(parsedARN.Resource, "parameter")
+	if !found {
+		err = errors.New("unxpected error. expected fsx credential ssm arn but did not find string 'parameter' in the arn")
+		fv.setTerminalReason(err.Error())
+		return err
+
+	}
+
+	ssmParams := []string{ssmParamName}
 
 	ssmParamMap, err := ssm.GetParametersFromSSM(ssmParams, ssmClient)
 	if err != nil {
 		return err
 	}
 
-	ssmParamData, _ := ssmParamMap[ssmParam]
+	ssmParamData, _ := ssmParamMap[ssmParamName]
 	creds := FSxWindowsFileServerCredentials{}
 
 	if err := json.Unmarshal([]byte(ssmParamData), &creds); err != nil {
@@ -488,7 +524,10 @@ func (fv *FSxWindowsFileServerResource) retrieveASMCredentials(credentialsParame
 		return err
 	}
 
-	asmClient := fv.asmClientCreator.NewASMClient(fv.region, iamCredentials)
+	asmClient, err := fv.asmClientCreator.NewASMClient(fv.region, iamCredentials)
+	if err != nil {
+		return err
+	}
 	asmData, err := asm.GetSecretFromASM(credentialsParameterARN, asmClient)
 	if err != nil {
 		return err
@@ -505,7 +544,11 @@ func (fv *FSxWindowsFileServerResource) retrieveASMCredentials(credentialsParame
 
 func (fv *FSxWindowsFileServerResource) retrieveFileSystemDNSName(fileSystemId string, iamCredentials credentials.IAMRoleCredentials) error {
 	fileSystemIds := []string{fileSystemId}
-	fsxClient := fv.fsxClientCreator.NewFSxClient(fv.region, iamCredentials)
+	fsxClient, err := fv.fsxClientCreator.NewFSxClient(fv.region, iamCredentials)
+	if err != nil {
+		fv.setTerminalReason(err.Error())
+		return err
+	}
 	fileSystemDNSMap, err := fsx.GetFileSystemDNSNames(fileSystemIds, fsxClient)
 	if err != nil {
 		fv.setTerminalReason(err.Error())
@@ -547,9 +590,9 @@ func (fv *FSxWindowsFileServerResource) performHostMount(remotePath string, user
 		}
 	}
 
-	// formatting to keep powershell happy
-	creds := fmt.Sprintf("-Credential $(New-Object System.Management.Automation.PSCredential(\"%s\", $(ConvertTo-SecureString \"%s\" -AsPlainText -Force)))", username, password)
-	remotePathArg := fmt.Sprintf("-RemotePath \"%s\"", remotePath)
+	credsArg := fmt.Sprintf("-Credential %s", psCredentialCommandFormat)
+
+	remotePathArg := "-RemotePath $Env:fsxRemotePath"
 
 	// New-SmbGlobalMapping cmdlet creates an SMB mapping between the container instance
 	// and SMB share (FSx for Windows File Server file-system)
@@ -558,7 +601,7 @@ func (fv *FSxWindowsFileServerResource) performHostMount(remotePath string, user
 		"New-SmbGlobalMapping",
 		localPathArg,
 		remotePathArg,
-		creds,
+		credsArg,
 		"-Persistent $true",
 		"-RequirePrivacy $true",
 		"-ErrorAction Stop",
@@ -566,6 +609,9 @@ func (fv *FSxWindowsFileServerResource) performHostMount(remotePath string, user
 	seelog.Debugf("Executing mapping of fsxwindowsfileserver with cmd: %v %v", strings.Join(args[:3], " "), strings.Join(args[4:], " "))
 
 	cmd := execCommand("powershell.exe", args...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("fsxUsername=%s", username))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("fsxPassword=%s", password))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("fsxRemotePath=%s", remotePath))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		safeOutput := strings.ReplaceAll(string(out), password, "<pass>")
@@ -691,7 +737,7 @@ func (fv *FSxWindowsFileServerResource) updateAppliedStatusUnsafe(knownStatus re
 // GetAppliedStatus safely returns the currently applied status of the resource
 func (fv *FSxWindowsFileServerResource) GetAppliedStatus() resourcestatus.ResourceStatus {
 	fv.lock.RLock()
-	defer fv.lock.RLock()
+	defer fv.lock.RUnlock()
 
 	return fv.appliedStatusUnsafe
 }
@@ -709,4 +755,11 @@ func (fv *FSxWindowsFileServerResource) BuildContainerDependency(containerName s
 // GetContainerDependencies returns the container dependencies of the resource.
 func (fv *FSxWindowsFileServerResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// FSx windows file server resource always requires the task execution role credentials to
+// query the file-system domain and retrieve authorization credentials.
+func (fv *FSxWindowsFileServerResource) RequiresExecutionRoleCredentials() bool {
+	return true
 }

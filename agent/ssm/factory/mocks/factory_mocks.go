@@ -21,44 +21,46 @@ package mock_factory
 import (
 	reflect "reflect"
 
-	credentials "github.com/aws/amazon-ecs-agent/agent/credentials"
 	ssm "github.com/aws/amazon-ecs-agent/agent/ssm"
+	credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	ipcompatibility "github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockSSMClientCreator is a mock of SSMClientCreator interface
+// MockSSMClientCreator is a mock of SSMClientCreator interface.
 type MockSSMClientCreator struct {
 	ctrl     *gomock.Controller
 	recorder *MockSSMClientCreatorMockRecorder
 }
 
-// MockSSMClientCreatorMockRecorder is the mock recorder for MockSSMClientCreator
+// MockSSMClientCreatorMockRecorder is the mock recorder for MockSSMClientCreator.
 type MockSSMClientCreatorMockRecorder struct {
 	mock *MockSSMClientCreator
 }
 
-// NewMockSSMClientCreator creates a new mock instance
+// NewMockSSMClientCreator creates a new mock instance.
 func NewMockSSMClientCreator(ctrl *gomock.Controller) *MockSSMClientCreator {
 	mock := &MockSSMClientCreator{ctrl: ctrl}
 	mock.recorder = &MockSSMClientCreatorMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockSSMClientCreator) EXPECT() *MockSSMClientCreatorMockRecorder {
 	return m.recorder
 }
 
-// NewSSMClient mocks base method
-func (m *MockSSMClientCreator) NewSSMClient(arg0 string, arg1 credentials.IAMRoleCredentials) ssm.SSMClient {
+// NewSSMClient mocks base method.
+func (m *MockSSMClientCreator) NewSSMClient(arg0 string, arg1 credentials.IAMRoleCredentials, arg2 ipcompatibility.IPCompatibility) (ssm.SSMClient, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NewSSMClient", arg0, arg1)
+	ret := m.ctrl.Call(m, "NewSSMClient", arg0, arg1, arg2)
 	ret0, _ := ret[0].(ssm.SSMClient)
-	return ret0
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
-// NewSSMClient indicates an expected call of NewSSMClient
-func (mr *MockSSMClientCreatorMockRecorder) NewSSMClient(arg0, arg1 interface{}) *gomock.Call {
+// NewSSMClient indicates an expected call of NewSSMClient.
+func (mr *MockSSMClientCreatorMockRecorder) NewSSMClient(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewSSMClient", reflect.TypeOf((*MockSSMClientCreator)(nil).NewSSMClient), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewSSMClient", reflect.TypeOf((*MockSSMClientCreator)(nil).NewSSMClient), arg0, arg1, arg2)
 }

@@ -17,27 +17,40 @@
 package app
 
 import (
+	"context"
+	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/capability"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds/utils/netconfig"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/execwrapper"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/gpu"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/cihub/seelog"
 )
 
 const (
-	AVX                   = "avx"
-	AVX2                  = "avx2"
-	SSE41                 = "sse4_1"
-	SSE42                 = "sse4_2"
-	CpuInfoPath           = "/proc/cpuinfo"
-	capabilityDepsRootDir = "/managed-agents"
+	AVX                         = "avx"
+	AVX2                        = "avx2"
+	SSE41                       = "sse4_1"
+	SSE42                       = "sse4_2"
+	CpuInfoPath                 = "/proc/cpuinfo"
+	capabilityDepsRootDir       = "/managed-agents"
+	modInfoCmd                  = "modinfo"
+	faultInjectionKernelModules = "sch_netem"
+	ctxTimeoutDuration          = 60 * time.Second
+	tcShowCmdString             = "tc -j q show dev %s parent 1:1"
 )
 
 var (
@@ -59,7 +72,7 @@ var (
 	}
 )
 
-func (agent *ecsAgent) appendVolumeDriverCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendVolumeDriverCapabilities(capabilities []types.Attribute) []types.Attribute {
 	// "local" is default docker driver
 	capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+capabilityDockerPluginInfix+volume.DockerLocalVolumeDriver)
 
@@ -99,17 +112,59 @@ func (agent *ecsAgent) appendVolumeDriverCapabilities(capabilities []*ecs.Attrib
 	return capabilities
 }
 
-func (agent *ecsAgent) appendNvidiaDriverVersionAttribute(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendNvidiaDriverVersionAttribute(capabilities []types.Attribute) []types.Attribute {
 	if agent.resourceFields != nil && agent.resourceFields.NvidiaGPUManager != nil {
 		driverVersion := agent.resourceFields.NvidiaGPUManager.GetDriverVersion()
 		if driverVersion != "" {
 			capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+capabilityNvidiaDriverVersionInfix+driverVersion)
+			capabilities = append(capabilities, types.Attribute{
+				Name:  aws.String(attributePrefix + capabilityGpuDriverVersion),
+				Value: aws.String(driverVersion),
+			})
 		}
 	}
 	return capabilities
 }
 
-func (agent *ecsAgent) appendENITrunkingCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+// mpsCapabilityInputs gathers the host facts the MPS gate decision is made from,
+// reading them off the NvidiaGPUManager. ok is false when there is no GPU manager, in
+// which case MPS cannot be evaluated on this instance. It is the single source of truth
+// shared by the gpu-sharing-mps capability and the MPS daemon health check.
+func (agent *ecsAgent) mpsCapabilityInputs() (gpu.MpsCapabilityInputs, bool) {
+	if agent.resourceFields == nil || agent.resourceFields.NvidiaGPUManager == nil {
+		return gpu.MpsCapabilityInputs{}, false
+	}
+	mgr := agent.resourceFields.NvidiaGPUManager
+	return gpu.MpsCapabilityInputs{
+		GPUPresent:        len(mgr.GetDevices()) > 0,
+		MpsBinaryPresent:  mgr.GetMpsControlBinaryPresent(),
+		MpsServiceEnabled: mgr.GetMpsServiceEnabled(),
+		IsVGPU:            mgr.GetHasVGPU(),
+		AllGPUsHaveMemory: gpu.AllGPUMemoryReported(mgr.GetGPUIDsUnsafe(), mgr.GetGPUMemoryMiBUnsafe()),
+	}, true
+}
+
+// appendGpuSharingMpsCapability advertises ecs.capability.gpu-sharing-mps when the
+// instance can run MPS: a GPU is present, the MPS control binary and its systemd unit
+// are installed and enabled, the GPU is not a vGPU slice, and every discovered GPU has
+// a usable-memory value. The facts are gathered by ecs-init and read from the NvidiaGPUManager;
+// the decision itself lives in the shared gpu package so the MI agent reaches the same verdict from the same inputs.
+func (agent *ecsAgent) appendGpuSharingMpsCapability(capabilities []types.Attribute) []types.Attribute {
+	inputs, ok := agent.mpsCapabilityInputs()
+	if !ok {
+		return capabilities
+	}
+	advertise, conditions := gpu.ShouldAdvertiseMpsCapability(inputs)
+	if !advertise {
+		for _, c := range gpu.UnmetMpsConditions(conditions) {
+			seelog.Warnf("Not advertising %s: %s", capability.GPUSharingMps, c.UnmetReason())
+		}
+		return capabilities
+	}
+	return appendNameOnlyAttribute(capabilities, capability.GPUSharingMps)
+}
+
+func (agent *ecsAgent) appendENITrunkingCapabilities(capabilities []types.Attribute) []types.Attribute {
 	if !agent.cfg.ENITrunkingEnabled.Enabled() {
 		return capabilities
 	}
@@ -117,7 +172,7 @@ func (agent *ecsAgent) appendENITrunkingCapabilities(capabilities []*ecs.Attribu
 	return agent.appendBranchENIPluginVersionAttribute(capabilities)
 }
 
-func (agent *ecsAgent) appendBranchENIPluginVersionAttribute(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendBranchENIPluginVersionAttribute(capabilities []types.Attribute) []types.Attribute {
 	version, err := agent.cniClient.Version(ecscni.ECSBranchENIPluginName)
 	if err != nil {
 		seelog.Warnf(
@@ -126,13 +181,13 @@ func (agent *ecsAgent) appendBranchENIPluginVersionAttribute(capabilities []*ecs
 		return capabilities
 	}
 
-	return append(capabilities, &ecs.Attribute{
+	return append(capabilities, types.Attribute{
 		Name:  aws.String(attributePrefix + branchCNIPluginVersionSuffix),
 		Value: aws.String(version),
 	})
 }
 
-func (agent *ecsAgent) appendPIDAndIPCNamespaceSharingCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendPIDAndIPCNamespaceSharingCapabilities(capabilities []types.Attribute) []types.Attribute {
 	isLoaded, err := agent.pauseLoader.IsLoaded(agent.dockerClient)
 	if !isLoaded || err != nil {
 		seelog.Warnf("Pause container is not loaded, did not append PID and IPC capabilities: %v", err)
@@ -141,11 +196,11 @@ func (agent *ecsAgent) appendPIDAndIPCNamespaceSharingCapabilities(capabilities 
 	return appendNameOnlyAttribute(capabilities, attributePrefix+capabiltyPIDAndIPCNamespaceSharing)
 }
 
-func (agent *ecsAgent) appendAppMeshCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendAppMeshCapabilities(capabilities []types.Attribute) []types.Attribute {
 	return appendNameOnlyAttribute(capabilities, attributePrefix+appMeshAttributeSuffix)
 }
 
-func (agent *ecsAgent) appendTaskEIACapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendTaskEIACapabilities(capabilities []types.Attribute) []types.Attribute {
 	capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+taskEIAAttributeSuffix)
 
 	eiaRequiredFlags := []string{AVX, AVX2, SSE41, SSE42}
@@ -171,44 +226,53 @@ func (agent *ecsAgent) appendTaskEIACapabilities(capabilities []*ecs.Attribute) 
 	return appendNameOnlyAttribute(capabilities, attributePrefix+taskEIAWithOptimizedCPU)
 }
 
-func (agent *ecsAgent) appendFirelensFluentdCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendFirelensFluentdCapabilities(capabilities []types.Attribute) []types.Attribute {
 	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensFluentd)
 }
 
-func (agent *ecsAgent) appendFirelensFluentbitCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendFirelensFluentbitCapabilities(capabilities []types.Attribute) []types.Attribute {
 	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensFluentbit)
 }
 
-func (agent *ecsAgent) appendEFSCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
-	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityEFS)
+func (agent *ecsAgent) appendFirelensNonRootUserCapability(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensNonRootUser)
 }
 
-func (agent *ecsAgent) appendEFSVolumePluginCapabilities(capabilities []*ecs.Attribute, pluginCapability string) []*ecs.Attribute {
-	return appendNameOnlyAttribute(capabilities, attributePrefix+pluginCapability)
+func (agent *ecsAgent) appendEBSTANonRootUserCapabilities(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityEBSTANonRootUser)
 }
 
-func (agent *ecsAgent) appendFirelensLoggingDriverCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendFirelensLoggingDriverCapabilities(capabilities []types.Attribute) []types.Attribute {
 	return appendNameOnlyAttribute(capabilities, capabilityPrefix+capabilityFirelensLoggingDriver)
 }
 
-func (agent *ecsAgent) appendFirelensLoggingDriverConfigCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
-	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensLoggingDriver+capabilityFireLensLoggingDriverConfigBufferLimitSuffix)
+func (agent *ecsAgent) appendFirelensLoggingDriverConfigCapabilities(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities,
+		attributePrefix+capabilityFirelensLoggingDriver+capabilityFireLensLoggingDriverConfigBufferLimitSuffix)
 }
 
-func (agent *ecsAgent) appendFirelensConfigCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendFirelensConfigCapabilities(capabilities []types.Attribute) []types.Attribute {
 	capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensConfigFile)
 	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityFirelensConfigS3)
 }
 
-func (agent *ecsAgent) appendGMSACapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
-	return capabilities
+func (agent *ecsAgent) appendEFSCapabilities(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityEFS)
 }
 
-func (agent *ecsAgent) appendIPv6Capability(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendS3FilesCapabilities(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityS3Files)
+}
+
+func (agent *ecsAgent) appendEFSVolumePluginCapabilities(capabilities []types.Attribute, pluginCapability string) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+pluginCapability)
+}
+
+func (agent *ecsAgent) appendIPv6Capability(capabilities []types.Attribute) []types.Attribute {
 	return appendNameOnlyAttribute(capabilities, attributePrefix+taskENIIPv6AttributeSuffix)
 }
 
-func (agent *ecsAgent) appendFSxWindowsFileServerCapabilities(capabilities []*ecs.Attribute) []*ecs.Attribute {
+func (agent *ecsAgent) appendFSxWindowsFileServerCapabilities(capabilities []types.Attribute) []types.Attribute {
 	return capabilities
 }
 
@@ -218,16 +282,16 @@ func (agent *ecsAgent) appendFSxWindowsFileServerCapabilities(capabilities []*ec
 // should also emit the same version information. Also, the version information
 // doesn't contribute to placement decisions and just serves as additional
 // debugging information
-func (agent *ecsAgent) getTaskENIPluginVersionAttribute() (*ecs.Attribute, error) {
-	version, err := agent.cniClient.Version(ecscni.ECSENIPluginName)
+func (agent *ecsAgent) getTaskENIPluginVersionAttribute() (types.Attribute, error) {
+	version, err := agent.cniClient.Version(ecscni.VPCENIPluginName)
 	if err != nil {
 		seelog.Warnf(
 			"Unable to determine the version of the plugin '%s': %v",
-			ecscni.ECSENIPluginName, err)
-		return nil, err
+			ecscni.VPCENIPluginName, err)
+		return types.Attribute{}, err
 	}
 
-	return &ecs.Attribute{
+	return types.Attribute{
 		Name:  aws.String(attributePrefix + cniPluginVersionSuffix),
 		Value: aws.String(version),
 	}, nil
@@ -235,4 +299,69 @@ func (agent *ecsAgent) getTaskENIPluginVersionAttribute() (*ecs.Attribute, error
 
 func defaultIsPlatformExecSupported() (bool, error) {
 	return true, nil
+}
+
+// var to allow mocking for checkNetworkTooling
+var isFaultInjectionToolingAvailable = checkFaultInjectionTooling
+
+// wrapper around exec.LookPath
+var lookPathFunc = exec.LookPath
+var osExecWrapper = execwrapper.NewExec()
+var networkConfigClient = netconfig.NewNetworkConfigClient()
+
+// checkFaultInjectionTooling checks for the required network packages like iptables, tc
+// to be available on the host before ecs.capability.fault-injection can be advertised
+func checkFaultInjectionTooling(cfg *config.Config) bool {
+	tools := []string{"iptables", "tc", "nsenter"}
+	if cfg.InstanceIPCompatibility.IsIPv6Only() {
+		// ip6tables is a required dependency on IPv6-only instances.
+		// TODO: Consider making ip6tables a required dependency for all instances (need to consider backwards compatibility)
+		tools = append(tools, "ip6tables")
+	}
+	for _, tool := range tools {
+		if _, err := lookPathFunc(tool); err != nil {
+			seelog.Warnf(
+				"Failed to find network tool %s that is needed for fault-injection feature: %v",
+				tool, err)
+			return false
+		}
+	}
+	return checkFaultInjectionModules() && checkTCShowTooling()
+}
+
+// checkFaultInjectionModules checks for the required kernel modules such as sch_netem to be installed
+// and avaialble on the host before ecs.capability.fault-injection can be advertised
+func checkFaultInjectionModules() bool {
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+	defer cancel()
+	_, err := osExecWrapper.CommandContext(ctxWithTimeout, modInfoCmd, faultInjectionKernelModules).CombinedOutput()
+	if err != nil {
+		seelog.Warnf("Failed to find kernel module %s that is needed for fault-injection feature: %v", faultInjectionKernelModules, err)
+		return false
+	}
+	return true
+}
+
+func checkTCShowTooling() bool {
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+	defer cancel()
+	hostDeviceName, netErr := netconfig.DefaultNetInterfaceName(networkConfigClient.NetlinkClient)
+	if netErr != nil {
+		seelog.Warnf("Failed to obtain the network interface device name on the host: %v", netErr)
+		return false
+	}
+	tcShowCmd := fmt.Sprintf(tcShowCmdString, hostDeviceName)
+	cmdList := strings.Split(tcShowCmd, " ")
+	_, err := osExecWrapper.CommandContext(ctxWithTimeout, cmdList[0], cmdList[1:]...).CombinedOutput()
+	if err != nil {
+		seelog.Warnf("Failed to call %s which is needed for fault-injection feature: %v", tcShowCmd, err)
+		return false
+	}
+	return true
+}
+
+// appendIPv6OnlyCapability appends ecs.capability.ipv6-only to passed capabilities and returns
+// the updated capabilities slice.
+func appendIPv6OnlyCapability(capabilities []types.Attribute) []types.Attribute {
+	return appendNameOnlyAttribute(capabilities, attributePrefix+capabilityIPv6Only)
 }

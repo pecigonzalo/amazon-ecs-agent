@@ -23,9 +23,9 @@ import (
 	"time"
 
 	asmfactory "github.com/aws/amazon-ecs-agent/agent/asm/factory"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/data"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
+	ebs "github.com/aws/amazon-ecs-agent/agent/ebs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
@@ -38,7 +38,9 @@ import (
 	ssmfactory "github.com/aws/amazon-ecs-agent/agent/ssm/factory"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows/svc"
@@ -97,6 +99,18 @@ func (agent *ecsAgent) initializeTaskENIDependencies(state dockerstate.TaskEngin
 func (agent *ecsAgent) startWindowsService() int {
 	svc.Run(EcsSvcName, newHandler(agent))
 	return 0
+}
+
+func (agent *ecsAgent) startEBSWatcher(
+	state dockerstate.TaskEngineState,
+	taskEngine engine.TaskEngine,
+	dockerClient dockerapi.DockerClient,
+) {
+	if agent.ebsWatcher == nil {
+		seelog.Debug("Creating new EBS watcher...")
+		agent.ebsWatcher = ebs.NewWatcher(agent.ctx, agent.cfg, state, taskEngine, dockerClient)
+		go agent.ebsWatcher.Start()
+	}
 }
 
 // handler implements https://godoc.org/golang.org/x/sys/windows/svc#Handler
@@ -307,12 +321,12 @@ func (agent *ecsAgent) initializeResourceFields(credentialsManager credentials.M
 			ASMClientCreator:   asmfactory.NewClientCreator(),
 			SSMClientCreator:   ssmfactory.NewSSMClientCreator(),
 			FSxClientCreator:   fsxfactory.NewFSxClientCreator(),
+			S3ClientCreator:    s3factory.NewS3ClientCreator(),
 			CredentialsManager: credentialsManager,
 		},
-		Ctx:             agent.ctx,
-		DockerClient:    agent.dockerClient,
-		S3ClientCreator: s3factory.NewS3ClientCreator(),
-		NetworkUtils:    networkutils.New(),
+		Ctx:          agent.ctx,
+		DockerClient: agent.dockerClient,
+		NetworkUtils: networkutils.New(),
 	}
 }
 
@@ -324,7 +338,7 @@ func (agent *ecsAgent) initializeGPUManager() error {
 	return nil
 }
 
-func (agent *ecsAgent) getPlatformDevices() []*ecs.PlatformDevice {
+func (agent *ecsAgent) getPlatformDevices() []types.PlatformDevice {
 	return nil
 }
 

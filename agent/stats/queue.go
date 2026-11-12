@@ -19,9 +19,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/tcs/model/ecstcs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	loggerfield "github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/stats"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tcs/model/ecstcs"
 	"github.com/cihub/seelog"
 	"github.com/docker/docker/api/types"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -36,7 +40,7 @@ type Queue struct {
 	buffer                []UsageStats
 	maxSize               int
 	lastStat              *types.StatsJSON
-	lastNetworkStatPerSec *NetworkStatsPerSec
+	lastNetworkStatPerSec *stats.NetworkStatsPerSec
 	lock                  sync.RWMutex
 }
 
@@ -59,12 +63,26 @@ func (queue *Queue) Reset() {
 	}
 }
 
-// Add adds a new set of container stats to the queue.
-func (queue *Queue) Add(dockerStat *types.StatsJSON) error {
+// AddContainerStat adds a new set of stats for a container to the queue. This method is only intended for use while
+// processing docker stats for a stats container.
+func (queue *Queue) AddContainerStat(dockerStat *types.StatsJSON, nonDockerStats NonDockerContainerStats,
+	lastStatBeforeLastRestart *types.StatsJSON, containerHasRestartedBefore bool) error {
+	if containerHasRestartedBefore {
+		dockerStat = getAggregatedDockerStatAcrossRestarts(dockerStat, lastStatBeforeLastRestart, queue.GetLastStat())
+	}
+
+	return queue.Add(dockerStat, nonDockerStats)
+}
+
+// Add adds a new set of stats to the queue.
+func (queue *Queue) Add(dockerStat *types.StatsJSON, nonDockerStats NonDockerContainerStats) error {
 	queue.setLastStat(dockerStat)
 	stat, err := dockerStatsToContainerStats(dockerStat)
 	if err != nil {
 		return err
+	}
+	if nonDockerStats.restartCount != nil {
+		stat.restartCount = nonDockerStats.restartCount
 	}
 	queue.add(stat)
 	return nil
@@ -84,6 +102,7 @@ func (queue *Queue) add(rawStat *ContainerStats) {
 	queueLength := len(queue.buffer)
 	stat := UsageStats{
 		CPUUsagePerc:      float32(nan32()),
+		RestartCount:      rawStat.restartCount,
 		MemoryUsageInMegs: uint32(rawStat.memoryUsage / BytesInMiB),
 		StorageReadBytes:  rawStat.storageReadBytes,
 		StorageWriteBytes: rawStat.storageWriteBytes,
@@ -105,8 +124,14 @@ func (queue *Queue) add(rawStat *ContainerStats) {
 				stat.NetworkStats.TxBytesPerSecond = lastStat.NetworkStats.TxBytesPerSecond
 			}
 		} else {
-			cpuUsageSinceLastStat := float32(rawStat.cpuUsage - lastStat.cpuUsage)
-			stat.CPUUsagePerc = 100 * cpuUsageSinceLastStat / timeSinceLastStat
+			if cpuUsageSinceLastStat, ok := counterDelta(rawStat.cpuUsage, lastStat.cpuUsage); ok {
+				stat.CPUUsagePerc = 100 * cpuUsageSinceLastStat / timeSinceLastStat
+			} else {
+				// The CPU usage counter is cumulative and only decreases when it is reset, for
+				// example during container teardown.
+				seelog.Debugf("CPU usage counter decreased, skipping CPU usage percent for this stat. lastStatCPUTime=%d thisStatCPUTime=%d",
+					lastStat.cpuUsage, rawStat.cpuUsage)
+			}
 
 			//calculate per second Network metrics
 			if stat.NetworkStats != nil && lastStat.NetworkStats != nil {
@@ -129,15 +154,24 @@ func (queue *Queue) add(rawStat *ContainerStats) {
 		}
 
 		if stat.NetworkStats != nil {
-			networkStatPerSec := &NetworkStatsPerSec{
-				RxBytesPerSecond: stat.NetworkStats.RxBytesPerSecond,
-				TxBytesPerSecond: stat.NetworkStats.TxBytesPerSecond,
+			networkStatPerSec := &stats.NetworkStatsPerSec{
+				RxBytesPerSecond: float64(stat.NetworkStats.RxBytesPerSecond),
+				TxBytesPerSecond: float64(stat.NetworkStats.TxBytesPerSecond),
 			}
 			queue.lastNetworkStatPerSec = networkStatPerSec
 		}
 	}
 
 	queue.buffer = append(queue.buffer, stat)
+}
+
+// counterDelta returns the increase of a cumulative counter between two samples.
+// It returns false if the counter decreased, for example because it was reset.
+func counterDelta(current, previous uint64) (float32, bool) {
+	if current < previous {
+		return 0, false
+	}
+	return float32(current - previous), true
 }
 
 // GetLastStat returns the last recorded raw statistics object from docker
@@ -148,7 +182,7 @@ func (queue *Queue) GetLastStat() *types.StatsJSON {
 	return queue.lastStat
 }
 
-func (queue *Queue) GetLastNetworkStatPerSec() *NetworkStatsPerSec {
+func (queue *Queue) GetLastNetworkStatPerSec() *stats.NetworkStatsPerSec {
 	queue.lock.RLock()
 	defer queue.lock.RUnlock()
 
@@ -169,62 +203,139 @@ func (queue *Queue) GetMemoryStatsSet() (*ecstcs.CWStatsSet, error) {
 func (queue *Queue) GetStorageStatsSet() (*ecstcs.StorageStatsSet, error) {
 	storageStatsSet := &ecstcs.StorageStatsSet{}
 	var err error
+	var errStr string
 	storageStatsSet.ReadSizeBytes, err = queue.getULongStatsSet(getStorageReadBytes)
 	if err != nil {
-		seelog.Warnf("Error getting storage read size bytes: %v", err)
+		errStr += fmt.Sprintf("error getting storage read size bytes: %v - ", err)
 	}
 	storageStatsSet.WriteSizeBytes, err = queue.getULongStatsSet(getStorageWriteBytes)
 	if err != nil {
-		seelog.Warnf("Error getting storage write size bytes: %v", err)
+		errStr += fmt.Sprintf("error getting storage write size bytes: %v - ", err)
 	}
-	return storageStatsSet, err
+	var errOut error
+	if len(errStr) > 0 {
+		errOut = errors.New(errStr)
+	}
+	return storageStatsSet, errOut
+}
+
+// GetRestartStatsSet gets the stats set for container restarts
+func (queue *Queue) GetRestartStatsSet() (*ecstcs.RestartStatsSet, error) {
+	return queue.getRestartStatsSet(getRestartCount)
+}
+
+func (queue *Queue) getRestartStatsSet(getInt getIntPointerFunc) (*ecstcs.RestartStatsSet, error) {
+	queue.lock.Lock()
+	defer queue.lock.Unlock()
+
+	var firstStat, lastStat int64
+	firstStat = -1
+
+	queueLength := len(queue.buffer)
+	if queueLength < 2 {
+		// Need at least 2 data points to calculate this.
+		return nil, fmt.Errorf("need at least 2 data points in queue to calculate restart stats set")
+	}
+
+	for i, stat := range queue.buffer {
+		if stat.sent {
+			// don't send stats to TACS if already sent
+			continue
+		}
+		thisStat := getInt(&stat)
+		if thisStat == nil {
+			continue
+		}
+		if i == queueLength-1 {
+			// get final unsent stat in the queue
+			lastStat = *thisStat
+		}
+
+		if firstStat == -1 {
+			// firstStat is unset so set it here
+			if i > 0 {
+				// some stats in queue were sent already, so use the stat previous to the
+				// first to diff with the last stat.
+				thisStat = getInt(&queue.buffer[i-1])
+				if thisStat == nil {
+					continue
+				}
+			}
+			firstStat = *thisStat
+		}
+	}
+
+	if firstStat == -1 {
+		// no non-nil stats found, most likely this means that the container
+		// does not have a restart policy set.
+		return nil, fmt.Errorf("No non-nil restart count stats found, not sending RestartStatsSet." +
+			" Most likely the container does not have a restart policy configured")
+	}
+
+	// get the diff in restart count between the first stat and the last stat in the
+	// queue. Examples:
+	//    [ 0 1 3 3 4 5 ] = 5 - 0 = 5 restarts
+	//    [ 0(sent) 1(sent) 3(sent) 4(unsent) 5(unsent) 7(unsent) ] = 7 - 3 = 4 restarts
+	result := lastStat - firstStat
+	if result < 0 {
+		return nil, fmt.Errorf("Negative restart count calculated, firstStat=%d lastStat=%d result=%d", firstStat, lastStat, result)
+	}
+
+	return &ecstcs.RestartStatsSet{
+		RestartCount: &result,
+	}, nil
 }
 
 // GetNetworkStatsSet gets the stats set for network metrics.
 func (queue *Queue) GetNetworkStatsSet() (*ecstcs.NetworkStatsSet, error) {
 	networkStatsSet := &ecstcs.NetworkStatsSet{}
 	var err error
+	var errStr string
 	networkStatsSet.RxBytes, err = queue.getULongStatsSet(getNetworkRxBytes)
 	if err != nil {
-		seelog.Warnf("Error getting network rx bytes: %v", err)
+		errStr += fmt.Sprintf("error getting network rx bytes: %v - ", err)
 	}
 	networkStatsSet.RxDropped, err = queue.getULongStatsSet(getNetworkRxDropped)
 	if err != nil {
-		seelog.Warnf("Error getting network rx dropped: %v", err)
+		errStr += fmt.Sprintf("error getting network rx dropped: %v - ", err)
 	}
 	networkStatsSet.RxErrors, err = queue.getULongStatsSet(getNetworkRxErrors)
 	if err != nil {
-		seelog.Warnf("Error getting network rx errors: %v", err)
+		errStr += fmt.Sprintf("error getting network rx errors: %v - ", err)
 	}
 	networkStatsSet.RxPackets, err = queue.getULongStatsSet(getNetworkRxPackets)
 	if err != nil {
-		seelog.Warnf("Error getting network rx packets: %v", err)
+		errStr += fmt.Sprintf("error getting network rx packets: %v - ", err)
 	}
 	networkStatsSet.TxBytes, err = queue.getULongStatsSet(getNetworkTxBytes)
 	if err != nil {
-		seelog.Warnf("Error getting network tx bytes: %v", err)
+		errStr += fmt.Sprintf("error getting network tx bytes: %v - ", err)
 	}
 	networkStatsSet.TxDropped, err = queue.getULongStatsSet(getNetworkTxDropped)
 	if err != nil {
-		seelog.Warnf("Error getting network tx dropped: %v", err)
+		errStr += fmt.Sprintf("error getting network tx dropped: %v - ", err)
 	}
 	networkStatsSet.TxErrors, err = queue.getULongStatsSet(getNetworkTxErrors)
 	if err != nil {
-		seelog.Warnf("Error getting network tx errors: %v", err)
+		errStr += fmt.Sprintf("error getting network tx errors: %v - ", err)
 	}
 	networkStatsSet.TxPackets, err = queue.getULongStatsSet(getNetworkTxPackets)
 	if err != nil {
-		seelog.Warnf("Error getting network tx packets: %v", err)
+		errStr += fmt.Sprintf("error getting network tx packets: %v - ", err)
 	}
 	networkStatsSet.RxBytesPerSecond, err = queue.getUDoubleCWStatsSet(getNetworkRxPacketsPerSecond)
 	if err != nil {
-		seelog.Warnf("Error getting network rx bytes per second: %v", err)
+		errStr += fmt.Sprintf("error getting network rx bytes per second: %v - ", err)
 	}
 	networkStatsSet.TxBytesPerSecond, err = queue.getUDoubleCWStatsSet(getNetworkTxPacketsPerSecond)
 	if err != nil {
-		seelog.Warnf("Error getting network tx bytes per second: %v", err)
+		errStr += fmt.Sprintf("error getting network tx bytes per second: %v - ", err)
 	}
-	return networkStatsSet, err
+	var errOut error
+	if len(errStr) > 0 {
+		errOut = errors.New(errStr)
+	}
+	return networkStatsSet, errOut
 }
 
 func getNetworkRxBytes(s *UsageStats) uint64 {
@@ -313,6 +424,10 @@ func getStorageWriteBytes(s *UsageStats) uint64 {
 	return s.StorageWriteBytes
 }
 
+func getRestartCount(s *UsageStats) *int64 {
+	return s.RestartCount
+}
+
 // getInt64WithOverflow truncates a uint64 to fit an int64
 // it returns overflow as a second int64
 func getInt64WithOverflow(uintStat uint64) (int64, int64) {
@@ -325,6 +440,7 @@ func getInt64WithOverflow(uintStat uint64) (int64, int64) {
 
 type getUsageFloatFunc func(*UsageStats) float64
 type getUsageIntFunc func(*UsageStats) uint64
+type getIntPointerFunc func(*UsageStats) *int64
 
 // getCWStatsSet gets the stats set for either CPU or Memory based on the
 // function pointer.
@@ -476,4 +592,51 @@ func (queue *Queue) getUDoubleCWStatsSet(getUsageFloat getUsageFloatFunc) (*ecst
 		SampleCount: &sampleCount,
 		Sum:         &sum,
 	}, nil
+}
+
+// getAggregatedDockerStatAcrossRestarts gets the aggregated docker stat for a container across container restarts.
+func getAggregatedDockerStatAcrossRestarts(dockerStat, lastStatBeforeLastRestart,
+	lastStatInStatsQueue *types.StatsJSON) *types.StatsJSON {
+	dockerStat = aggregateOSIndependentStats(dockerStat, lastStatBeforeLastRestart)
+	dockerStat = aggregateOSDependentStats(dockerStat, lastStatBeforeLastRestart)
+
+	// Stats relevant to PreCPU.
+	preCPUStats := types.CPUStats{}
+	preRead := time.Time{}
+	if lastStatInStatsQueue != nil {
+		preCPUStats = lastStatInStatsQueue.CPUStats
+		preRead = lastStatInStatsQueue.Read
+	}
+	dockerStat.PreCPUStats = preCPUStats
+	dockerStat.PreRead = preRead
+
+	logger.Debug("Aggregated Docker stat across restart(s)", logger.Fields{
+		loggerfield.DockerId: dockerStat.ID,
+	})
+
+	return dockerStat
+}
+
+// aggregateOSIndependentStats aggregates stats that are measured cumulatively against container start time and
+// populated regardless of what OS is being used.
+func aggregateOSIndependentStats(dockerStat, lastStatBeforeLastRestart *types.StatsJSON) *types.StatsJSON {
+	// CPU stats.
+	dockerStat.CPUStats.CPUUsage.TotalUsage += lastStatBeforeLastRestart.CPUStats.CPUUsage.TotalUsage
+	dockerStat.CPUStats.CPUUsage.UsageInKernelmode += lastStatBeforeLastRestart.CPUStats.CPUUsage.UsageInKernelmode
+	dockerStat.CPUStats.CPUUsage.UsageInUsermode += lastStatBeforeLastRestart.CPUStats.CPUUsage.UsageInUsermode
+
+	// Network stats.
+	for key, dockerStatNetwork := range dockerStat.Networks {
+		lastStatBeforeLastRestartNetwork, ok := lastStatBeforeLastRestart.Networks[key]
+		if ok {
+			dockerStatNetwork.RxBytes += lastStatBeforeLastRestartNetwork.RxBytes
+			dockerStatNetwork.RxPackets += lastStatBeforeLastRestartNetwork.RxPackets
+			dockerStatNetwork.RxDropped += lastStatBeforeLastRestartNetwork.RxDropped
+			dockerStatNetwork.TxBytes += lastStatBeforeLastRestartNetwork.TxBytes
+			dockerStatNetwork.TxPackets += lastStatBeforeLastRestartNetwork.TxPackets
+			dockerStatNetwork.TxDropped += lastStatBeforeLastRestartNetwork.TxDropped
+		}
+		dockerStat.Networks[key] = dockerStatNetwork
+	}
+	return dockerStat
 }

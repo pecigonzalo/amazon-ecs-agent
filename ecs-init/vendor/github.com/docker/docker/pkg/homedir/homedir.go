@@ -2,28 +2,34 @@ package homedir
 
 import (
 	"os"
+	"os/user"
 	"runtime"
-
-	"github.com/opencontainers/runc/libcontainer/user"
 )
 
 // Key returns the env var name for the user's home dir based on
-// the platform being run on
+// the platform being run on.
+//
+// Deprecated: this function is no longer used, and will be removed in the next release.
 func Key() string {
-	if runtime.GOOS == "windows" {
-		return "USERPROFILE"
-	}
-	return "HOME"
+	return envKeyName
 }
 
 // Get returns the home directory of the current user with the help of
 // environment variables depending on the target operating system.
 // Returned path should be used with "path/filepath" to form new paths.
+//
+// On non-Windows platforms, it falls back to nss lookups, if the home
+// directory cannot be obtained from environment-variables.
+//
+// If linking statically with cgo enabled against glibc, ensure the
+// osusergo build tag is used.
+//
+// If needing to do nss lookups, do not disable cgo or set osusergo.
 func Get() string {
-	home := os.Getenv(Key())
+	home, _ := os.UserHomeDir()
 	if home == "" && runtime.GOOS != "windows" {
-		if u, err := user.CurrentUser(); err == nil {
-			return u.Home
+		if u, err := user.Current(); err == nil {
+			return u.HomeDir
 		}
 	}
 	return home
@@ -31,9 +37,8 @@ func Get() string {
 
 // GetShortcutString returns the string that is shortcut to user's home directory
 // in the native shell of the platform running on.
+//
+// Deprecated: this function is no longer used, and will be removed in the next release.
 func GetShortcutString() string {
-	if runtime.GOOS == "windows" {
-		return "%USERPROFILE%" // be careful while using in format functions
-	}
-	return "~"
+	return homeShortCut
 }

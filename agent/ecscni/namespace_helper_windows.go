@@ -22,17 +22,17 @@ import (
 	"net"
 	"strings"
 
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
-	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/cihub/seelog"
-	"github.com/containernetworking/cni/pkg/types/current"
+	cniTypesCurrent "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/docker/docker/api/types"
 	"github.com/pkg/errors"
+
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 )
 
 const (
-	// containerAdminUser is the admin username for any container on Windows.
-	containerAdminUser = "ContainerAdministrator"
 	// windowsDefaultRoute is the default route of any endpoint.
 	windowsDefaultRoute = "0.0.0.0/0"
 	// credentialsEndpointRoute is the route of credentials endpoint for accessing task iam roles/task metadata.
@@ -57,7 +57,7 @@ const (
 // netsh interface ipv4 add route prefix=169.254.169.254/32 interface="vEthernet (task-br-<mac>-ep-<container_id>)
 // netsh interface ipv4 add route prefix=169.254.169.254/32 interface="Loopback"
 // netsh interface ipv4 add route prefix=<local-route> interface="vEthernet (nat-ep-<container_id>)
-func (nsHelper *helper) ConfigureTaskNamespaceRouting(ctx context.Context, taskENI *apieni.ENI, config *Config, result *current.Result) error {
+func (nsHelper *helper) ConfigureTaskNamespaceRouting(ctx context.Context, taskENI *ni.NetworkInterface, config *Config, result *cniTypesCurrent.Result) error {
 	// Obtain the ecs-bridge endpoint's subnet IP address from the CNI plugin execution result.
 	ecsBridgeSubnetIPAddress := &net.IPNet{
 		IP:   result.IPs[0].Address.IP.Mask(result.IPs[0].Address.Mask),
@@ -118,7 +118,7 @@ func (nsHelper *helper) invokeCommandsInsideContainer(ctx context.Context, conta
 	execCfg := types.ExecConfig{
 		Detach: false,
 		Cmd:    cfgCommand,
-		User:   containerAdminUser,
+		User:   config.ContainerAdminUser,
 	}
 
 	execRes, err := nsHelper.dockerClient.CreateContainerExec(ctx, containerID, execCfg, dockerclient.ContainerExecCreateTimeout)

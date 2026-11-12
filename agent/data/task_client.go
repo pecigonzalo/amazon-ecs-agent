@@ -18,6 +18,8 @@ import (
 
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/amazon-ecs-agent/agent/version"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
 
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
@@ -29,15 +31,15 @@ func (c *client) SaveTask(task *apitask.Task) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to generate database id")
 	}
-	return c.db.Batch(func(tx *bolt.Tx) error {
+	return c.DB.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(tasksBucketName))
-		return putObject(b, id, task)
+		return c.Accessor.PutObject(b, id, task)
 	})
 }
 
 // DeleteTask deletes a task from the task bucket.
 func (c *client) DeleteTask(id string) error {
-	return c.db.Batch(func(tx *bolt.Tx) error {
+	return c.DB.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(tasksBucketName))
 		return b.Delete([]byte(id))
 	})
@@ -46,11 +48,23 @@ func (c *client) DeleteTask(id string) error {
 // GetTasks returns all the tasks in the task bucket.
 func (c *client) GetTasks() ([]*apitask.Task, error) {
 	var tasks []*apitask.Task
-	err := c.db.View(func(tx *bolt.Tx) error {
+	err := c.DB.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(tasksBucketName))
-		return walk(bucket, func(id string, data []byte) error {
+		return c.Accessor.Walk(bucket, func(id string, data []byte) error {
 			task := apitask.Task{}
-			if err := json.Unmarshal(data, &task); err != nil {
+			// transform the model before loading it to agent state. this is a noop for now.
+			agentVersionInDB, err := c.GetMetadata(AgentVersionKey)
+			if err != nil {
+				logger.Info(emptyAgentVersionMsg)
+			} else {
+				if c.Transformer.IsUpgrade(version.Version, agentVersionInDB) {
+					data, err = c.Transformer.TransformTask(agentVersionInDB, data)
+					if err != nil {
+						return err
+					}
+				}
+			}
+			if err = json.Unmarshal(data, &task); err != nil {
 				return err
 			}
 			tasks = append(tasks, &task)
@@ -58,4 +72,19 @@ func (c *client) GetTasks() ([]*apitask.Task, error) {
 		})
 	})
 	return tasks, err
+}
+
+// HasNonTerminalTasks returns true if there are any pending or running tasks in the database.
+func (c *client) HasNonTerminalTasks() bool {
+	tasks, err := c.GetTasks()
+	if err != nil {
+		logger.Warn("Failed to get tasks from DB for running tasks check", logger.Fields{"error": err})
+		return false
+	}
+	for _, task := range tasks {
+		if !task.GetKnownStatus().Terminal() {
+			return true
+		}
+	}
+	return false
 }

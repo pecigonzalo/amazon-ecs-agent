@@ -15,12 +15,12 @@ package engine
 
 import (
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
 
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
@@ -40,6 +40,10 @@ func (engine *DockerTaskEngine) LoadState() error {
 		return err
 	}
 
+	if err := engine.loadResourceAttachments(); err != nil {
+		return err
+	}
+
 	return engine.loadENIAttachments()
 }
 
@@ -51,6 +55,24 @@ func (engine *DockerTaskEngine) loadTasks() error {
 
 	for _, task := range tasks {
 		engine.state.AddTask(task)
+
+		// Register the task role's ID in credentials manager as soon as possible.
+		// This ensures TMDS can distinguish between invalid credentials requests (400) and
+		// known credentials that aren't available yet (503) after agent restart.
+		if credentialsID := task.GetCredentialsID(); credentialsID != "" {
+			engine.credentialsManager.AddKnownCredentialsID(credentialsID)
+		}
+
+		// Also register execution role credentials ID for the same reason as above
+		if executionCredentialsID := task.GetExecutionCredentialsID(); executionCredentialsID != "" {
+			engine.credentialsManager.AddKnownCredentialsID(executionCredentialsID)
+		}
+
+		// TODO: Will need to clean up all of the STOPPED managed daemon tasks
+		md, ok := task.IsManagedDaemonTask()
+		if ok {
+			engine.SetDaemonTask(md, task)
+		}
 
 		// Populate ip <-> task mapping if task has a local ip. This mapping is needed for serving v2 task metadata.
 		if ip := task.GetLocalIPAddress(); ip != "" {
@@ -115,6 +137,17 @@ func (engine *DockerTaskEngine) loadImageStates() error {
 
 	for _, image := range images {
 		engine.state.AddImageState(image)
+	}
+	return nil
+}
+
+func (engine *DockerTaskEngine) loadResourceAttachments() error {
+	resAttachments, err := engine.dataClient.GetResourceAttachments()
+	if err != nil {
+		return err
+	}
+	for _, resAttachment := range resAttachments {
+		engine.state.AddEBSAttachment(resAttachment)
 	}
 	return nil
 }
@@ -207,16 +240,6 @@ func (engine *DockerTaskEngine) saveDockerContainerData(container *apicontainer.
 }
 
 func (engine *DockerTaskEngine) removeTaskData(task *apitask.Task) {
-	id, err := utils.GetTaskID(task.Arn)
-	if err != nil {
-		seelog.Errorf("Failed to get task id from task ARN %s: %v", task.Arn, err)
-		return
-	}
-	err = engine.dataClient.DeleteTask(id)
-	if err != nil {
-		seelog.Errorf("Failed to remove data for task %s: %v", task.Arn, err)
-	}
-
 	for _, c := range task.Containers {
 		id, err := data.GetContainerID(c)
 		if err != nil {
@@ -228,6 +251,16 @@ func (engine *DockerTaskEngine) removeTaskData(task *apitask.Task) {
 			seelog.Errorf("Failed to remove data for container %s: %v", c.Name, err)
 		}
 	}
+
+	id, err := utils.GetTaskID(task.Arn)
+	if err != nil {
+		seelog.Errorf("Failed to get task id from task ARN %s: %v", task.Arn, err)
+		return
+	}
+	err = engine.dataClient.DeleteTask(id)
+	if err != nil {
+		seelog.Errorf("Failed to remove data for task %s: %v", task.Arn, err)
+	}
 }
 
 func (engine *DockerTaskEngine) removeENIAttachmentData(mac string) {
@@ -236,7 +269,7 @@ func (engine *DockerTaskEngine) removeENIAttachmentData(mac string) {
 		seelog.Warnf("Unable to retrieve ENI Attachment for mac address %s: ", mac)
 		return
 	}
-	attachmentId, err := utils.GetENIAttachmentId(attachmentToRemove.AttachmentARN)
+	attachmentId, err := utils.GetAttachmentId(attachmentToRemove.AttachmentARN)
 	if err != nil {
 		seelog.Errorf("Failed to get attachment id for %s: %v", attachmentToRemove.AttachmentARN, err)
 	} else {

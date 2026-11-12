@@ -18,10 +18,11 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	"github.com/aws/amazon-ecs-agent/agent/handlers/utils"
 	v2 "github.com/aws/amazon-ecs-agent/agent/handlers/v2"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/utils"
+	tmdsv2 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v2"
 	"github.com/cihub/seelog"
 )
 
@@ -36,7 +37,7 @@ var TaskMetadataPath = "/v3/" + utils.ConstructMuxVar(V3EndpointIDMuxName, utils
 var TaskWithTagsMetadataPath = "/v3/" + utils.ConstructMuxVar(V3EndpointIDMuxName, utils.AnythingButSlashRegEx) + "/taskWithTags"
 
 // TaskMetadataHandler returns the handler method for handling task metadata requests.
-func TaskMetadataHandler(state dockerstate.TaskEngineState, ecsClient api.ECSClient, cluster, az, containerInstanceArn string, propagateTags bool) func(http.ResponseWriter, *http.Request) {
+func TaskMetadataHandler(state dockerstate.TaskEngineState, ecsClient ecs.ECSClient, cluster, az, containerInstanceArn string, propagateTags bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		taskARN, err := GetTaskARNByRequest(r, state)
 		if err != nil {
@@ -51,7 +52,7 @@ func TaskMetadataHandler(state dockerstate.TaskEngineState, ecsClient api.ECSCli
 
 		seelog.Infof("V3 task metadata handler: writing response for task '%s'", taskARN)
 
-		taskResponse, err := v2.NewTaskResponse(taskARN, state, ecsClient, cluster, az, containerInstanceArn, propagateTags, false)
+		taskResponse, err := v2.NewTaskResponse("", taskARN, state, ecsClient, cluster, az, containerInstanceArn, propagateTags, false)
 		if err != nil {
 			errResponseJSON, err := json.Marshal("Unable to generate metadata for task: '" + taskARN + "'")
 			if e := utils.WriteResponseIfMarshalError(w, err); e != nil {
@@ -64,7 +65,7 @@ func TaskMetadataHandler(state dockerstate.TaskEngineState, ecsClient api.ECSCli
 		task, _ := state.TaskByArn(taskARN)
 		if !task.IsNetworkModeAWSVPC() {
 			// fill in non-awsvpc network details for container responses here
-			responses := make([]v2.ContainerResponse, 0)
+			responses := make([]tmdsv2.ContainerResponse, 0)
 			for _, containerResponse := range taskResponse.Containers {
 				networks, err := GetContainerNetworkMetadata(containerResponse.ID, state)
 				if err != nil {

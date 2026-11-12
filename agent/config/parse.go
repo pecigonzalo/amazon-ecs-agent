@@ -23,8 +23,32 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	"github.com/aws/amazon-ecs-agent/agent/utils"
+
 	"github.com/cihub/seelog"
-	cnitypes "github.com/containernetworking/cni/pkg/types"
+	cniTypes "github.com/containernetworking/cni/pkg/types"
+	"github.com/docker/go-connections/nat"
+)
+
+const (
+	// envSkipDomainJoinCheck is an environment setting that can be used to skip
+	// domain join check validation. This is useful for integration and
+	// functional-tests but should not be set for any non-test use-case.
+	envSkipDomainJoinCheck = "ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION"
+	// envSkipDomainLessCheck is an environment setting that can be used to skip
+	// domain less gMSA support check validation. This is useful for integration and
+	// functional-tests but should not be set for any non-test use-case.
+	envSkipDomainLessCheck = "ZZZ_SKIP_DOMAIN_LESS_CHECK_NOT_SUPPORTED_IN_PRODUCTION"
+	// envGmsaEcsSupport is an environment setting that can be used to enable gMSA support on ECS
+	envGmsaEcsSupport = "ECS_GMSA_SUPPORTED"
+	// envCredentialsFetcherHostDir is an environment setting that is set in ecs-init identifying
+	// location of the credentials-fetcher location on the machine
+	envCredentialsFetcherHostDir = "CREDENTIALS_FETCHER_HOST_DIR"
+	// envInstanceIPCompatibility is an environment setting to override IP compatibility detection
+	envInstanceIPCompatibility = "ECS_INSTANCE_IP_COMPATIBILITY"
+	// envPropagateTaskMemoryLimitCgroupV2 is an environment setting to enable task memory
+	// limit propagation to containers on cgroupv2 if containers do not already have limit set
+	envPropagateTaskMemoryLimitCgroupV2 = "ECS_PROPAGATE_TASK_MEMORY_LIMIT_CGROUPV2"
 )
 
 func parseCheckpoint(dataDir string) BooleanDefaultFalse {
@@ -73,6 +97,19 @@ func parseDockerStopTimeout() time.Duration {
 		seelog.Warnf("Discarded invalid value for docker stop timeout, parsed as: %v", parsedStopTimeout)
 	}
 	return dockerStopTimeout
+}
+
+func parseManifestPullTimeout() time.Duration {
+	var timeout time.Duration
+	parsedTimeout := parseEnvVariableDuration("ECS_MANIFEST_PULL_TIMEOUT")
+	if parsedTimeout >= minimumManifestPullTimeout {
+		timeout = parsedTimeout
+	} else if parsedTimeout != 0 {
+		// Parsed timeout too low
+		timeout = minimumManifestPullTimeout
+		seelog.Warnf("Discarded invalid value for manifest pull timeout, parsed as: %v", parsedTimeout)
+	}
+	return timeout
 }
 
 func parseContainerStartTimeout() time.Duration {
@@ -197,8 +234,8 @@ func parseInstanceAttributes(errs []error) (map[string]string, []error) {
 	return instanceAttributes, errs
 }
 
-func parseAdditionalLocalRoutes(errs []error) ([]cnitypes.IPNet, []error) {
-	var additionalLocalRoutes []cnitypes.IPNet
+func parseAdditionalLocalRoutes(errs []error) ([]cniTypes.IPNet, []error) {
+	var additionalLocalRoutes []cniTypes.IPNet
 	additionalLocalRoutesEnv := os.Getenv("ECS_AWSVPC_ADDITIONAL_LOCAL_ROUTES")
 	if additionalLocalRoutesEnv != "" {
 		err := json.Unmarshal([]byte(additionalLocalRoutesEnv), &additionalLocalRoutes)
@@ -212,45 +249,45 @@ func parseAdditionalLocalRoutes(errs []error) ([]cnitypes.IPNet, []error) {
 }
 
 func parseBooleanDefaultFalseConfig(envVarName string) BooleanDefaultFalse {
-	boolDefaultFalseCofig := BooleanDefaultFalse{Value: NotSet}
+	boolDefaultFalseConfig := BooleanDefaultFalse{Value: NotSet}
 	configString := strings.TrimSpace(os.Getenv(envVarName))
 	if configString == "" {
 		// if intentionally not set, do not add warning log
-		return boolDefaultFalseCofig
+		return boolDefaultFalseConfig
 	}
 
 	res, err := strconv.ParseBool(configString)
 	if err == nil {
 		if res {
-			boolDefaultFalseCofig.Value = ExplicitlyEnabled
+			boolDefaultFalseConfig.Value = ExplicitlyEnabled
 		} else {
-			boolDefaultFalseCofig.Value = ExplicitlyDisabled
+			boolDefaultFalseConfig.Value = ExplicitlyDisabled
 		}
 	} else {
 		seelog.Warnf("Invalid format for \"%s\", expected a boolean. err %v", envVarName, err)
 	}
-	return boolDefaultFalseCofig
+	return boolDefaultFalseConfig
 }
 
 func parseBooleanDefaultTrueConfig(envVarName string) BooleanDefaultTrue {
-	boolDefaultTrueCofig := BooleanDefaultTrue{Value: NotSet}
+	boolDefaultTrueConfig := BooleanDefaultTrue{Value: NotSet}
 	configString := strings.TrimSpace(os.Getenv(envVarName))
 	if configString == "" {
 		// if intentionally not set, do not add warning log
-		return boolDefaultTrueCofig
+		return boolDefaultTrueConfig
 	}
 
 	res, err := strconv.ParseBool(configString)
 	if err == nil {
 		if res {
-			boolDefaultTrueCofig.Value = ExplicitlyEnabled
+			boolDefaultTrueConfig.Value = ExplicitlyEnabled
 		} else {
-			boolDefaultTrueCofig.Value = ExplicitlyDisabled
+			boolDefaultTrueConfig.Value = ExplicitlyDisabled
 		}
 	} else {
 		seelog.Warnf("Invalid format for \"%s\", expected a boolean. err %v", envVarName, err)
 	}
-	return boolDefaultTrueCofig
+	return boolDefaultTrueConfig
 }
 
 func parseTaskMetadataThrottles() (int, int) {
@@ -364,4 +401,30 @@ func parseCgroupCPUPeriod() time.Duration {
 	}
 
 	return defaultCgroupCPUPeriod
+}
+
+var getDynamicHostPortRange = utils.GetDynamicHostPortRange
+
+func parseDynamicHostPortRange(dynamicHostPortRangeEnv string) string {
+	dynamicHostPortRange := os.Getenv(dynamicHostPortRangeEnv)
+	if dynamicHostPortRange != "" {
+		_, _, err := nat.ParsePortRangeToInt(dynamicHostPortRange)
+		if err != nil {
+			seelog.Warnf("Invalid dynamicHostPortRange value from config: %s, err: %v", dynamicHostPortRange, err)
+			return getDefaultDynamicHostPortRange()
+		}
+	} else {
+		return getDefaultDynamicHostPortRange()
+	}
+	return dynamicHostPortRange
+}
+
+func getDefaultDynamicHostPortRange() string {
+	startHostPortRange, endHostPortRange, err := getDynamicHostPortRange()
+	if err != nil {
+		seelog.Warnf("Unable to read the ephemeral host port range, "+
+			"falling back to the default range: %v-%v", utils.DefaultPortRangeStart, utils.DefaultPortRangeEnd)
+		return fmt.Sprintf("%d-%d", utils.DefaultPortRangeStart, utils.DefaultPortRangeEnd)
+	}
+	return fmt.Sprintf("%d-%d", startHostPortRange, endHostPortRange)
 }

@@ -14,7 +14,12 @@
 package docker
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/aws/amazon-ecs-agent/ecs-init/config"
+	"github.com/cihub/seelog"
+	ctrdapparmor "github.com/containerd/containerd/pkg/apparmor"
 	godocker "github.com/fsouza/go-dockerclient"
 )
 
@@ -40,7 +45,11 @@ func createHostConfig(binds []string) *godocker.HostConfig {
 		iptablesExecutableHostDir+":"+iptablesExecutableContainerDir+readOnly,
 		iptablesAltDir+":"+iptablesAltDir+readOnly,
 		iptablesLegacyDir+":"+iptablesLegacyDir+readOnly,
+		lsblkDir+":"+lsblkDir,
 	)
+	binds = append(binds, getNsenterBinds(config.OsStat)...)
+	binds = append(binds, getModInfoBinds(config.OsStat)...)
+	binds = append(binds, getCloudInitResultBinds(config.OsStat)...)
 
 	logConfig := config.AgentDockerLogDriverConfiguration()
 
@@ -58,12 +67,80 @@ func createHostConfig(binds []string) *godocker.HostConfig {
 		NetworkMode: networkMode,
 		UsernsMode:  usernsMode,
 		CapAdd:      caps,
-		Init:        true,
+	}
+
+	// Task ENI feature requires agent to be "init" process, so set it if docker API
+	// version is new enough for this feature.
+	if dockerVersionCompare(dockerAPIVersion, enableTaskENIDockerClientAPIVersion) >= 0 {
+		hostConfig.Init = true
+	}
+
+	if ctrdapparmor.HostSupports() {
+		hostConfig.SecurityOpt = []string{fmt.Sprintf("apparmor:%s", config.ECSAgentAppArmorProfileName())}
 	}
 
 	if config.RunPrivileged() {
 		hostConfig.Privileged = true
 	}
 
+	// Set the PID mode to host if ECS_AGENT_PID_NAMESPACE_HOST env variable is set to true
+	if config.IsECSAgentPIDNamespaceHostEnabled() {
+		hostConfig.PidMode = "host"
+	}
+
 	return hostConfig
+}
+
+// Returns nsenter bind as a slice if nsenter is available on the host.
+// Returns an empty slice otherwise.
+func getNsenterBinds(statFn func(string) (os.FileInfo, error)) []string {
+	binds := []string{}
+	if _, err := statFn(nsEnterDir); err == nil {
+		binds = append(binds, nsEnterDir+":"+nsEnterDir)
+	} else {
+		seelog.Warnf("nsenter not found at %s, skip binding it to Agent container: %v",
+			nsEnterDir, err)
+	}
+	return binds
+}
+
+// Returns modinfo bind as a slice if modinfo is available on the host.
+// Otherwise, it will return an empty slice.
+func getModInfoBinds(statFn func(string) (os.FileInfo, error)) []string {
+	binds := []string{}
+	modInfoPathLocations := []string{
+		modInfoSbinDir,
+		modInfoUsrSbinDir,
+	}
+	for _, path := range modInfoPathLocations {
+		if _, err := statFn(path); err == nil {
+			seelog.Debugf("modinfo found at %s", path)
+			binds = append(binds, path+":"+path)
+			break
+		} else {
+			seelog.Infof("modinfo not found at %s, skip binding it to Agent container: %v",
+				path, err)
+		}
+	}
+	return binds
+}
+
+// cloudInitResultFile is the path to cloud-init's result.json file which records
+// the datasource used during instance boot.
+const cloudInitResultFile = "/var/lib/cloud/data/result.json"
+
+// getCloudInitResultBinds returns a read-only bind mount for cloud-init's result.json
+// if the file exists on the host. Returns an empty slice if the file is missing or
+// if running in external (non-EC2) mode where cloud-init is not applicable.
+func getCloudInitResultBinds(statFn func(string) (os.FileInfo, error)) []string {
+	if config.RunningInExternal() {
+		return []string{}
+	}
+	if _, err := statFn(cloudInitResultFile); err == nil {
+		return []string{cloudInitResultFile + ":" + cloudInitResultFile + readOnly}
+	} else {
+		seelog.Infof("cloud-init result file not found at %s, skip binding it to Agent container: %v",
+			cloudInitResultFile, err)
+	}
+	return []string{}
 }

@@ -16,23 +16,29 @@ package ecscni
 import (
 	"encoding/json"
 
-	"github.com/cihub/seelog"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+
 	"github.com/containernetworking/cni/libcni"
-	cnitypes "github.com/containernetworking/cni/pkg/types"
+	cniTypes "github.com/containernetworking/cni/pkg/types"
 )
 
 // newNetworkConfig converts a network config to libcni's NetworkConfig.
 func newNetworkConfig(netcfg interface{}, plugin string, cniVersion string) (*libcni.NetworkConfig, error) {
 	configBytes, err := json.Marshal(netcfg)
 	if err != nil {
-		seelog.Errorf("[ECSCNI] Marshal configuration for plugin %s failed, error: %v", plugin, err)
+		logger.Error("[ECSCNI] Marshal configuration failed", logger.Fields{
+			"netcfg":     netcfg,
+			"plugin":     plugin,
+			"cniVersion": cniVersion,
+		})
 		return nil, err
 	}
 
 	netConfig := &libcni.NetworkConfig{
-		Network: &cnitypes.NetConf{
+		Network: &cniTypes.NetConf{
 			Type:       plugin,
 			CNIVersion: cniVersion,
+			Name:       defaultNetworkName,
 		},
 		Bytes: configBytes,
 	}

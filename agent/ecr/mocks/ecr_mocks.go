@@ -19,76 +19,83 @@
 package mock_ecr
 
 import (
+	context "context"
 	reflect "reflect"
 
 	container "github.com/aws/amazon-ecs-agent/agent/api/container"
 	ecr "github.com/aws/amazon-ecs-agent/agent/ecr"
-	ecr0 "github.com/aws/amazon-ecs-agent/agent/ecr/model/ecr"
+	ecr0 "github.com/aws/aws-sdk-go-v2/service/ecr"
+	types "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockECRSDK is a mock of ECRSDK interface
+// MockECRSDK is a mock of ECRSDK interface.
 type MockECRSDK struct {
 	ctrl     *gomock.Controller
 	recorder *MockECRSDKMockRecorder
 }
 
-// MockECRSDKMockRecorder is the mock recorder for MockECRSDK
+// MockECRSDKMockRecorder is the mock recorder for MockECRSDK.
 type MockECRSDKMockRecorder struct {
 	mock *MockECRSDK
 }
 
-// NewMockECRSDK creates a new mock instance
+// NewMockECRSDK creates a new mock instance.
 func NewMockECRSDK(ctrl *gomock.Controller) *MockECRSDK {
 	mock := &MockECRSDK{ctrl: ctrl}
 	mock.recorder = &MockECRSDKMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockECRSDK) EXPECT() *MockECRSDKMockRecorder {
 	return m.recorder
 }
 
-// GetAuthorizationToken mocks base method
-func (m *MockECRSDK) GetAuthorizationToken(arg0 *ecr0.GetAuthorizationTokenInput) (*ecr0.GetAuthorizationTokenOutput, error) {
+// GetAuthorizationToken mocks base method.
+func (m *MockECRSDK) GetAuthorizationToken(arg0 context.Context, arg1 *ecr0.GetAuthorizationTokenInput, arg2 ...func(*ecr0.Options)) (*ecr0.GetAuthorizationTokenOutput, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetAuthorizationToken", arg0)
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetAuthorizationToken", varargs...)
 	ret0, _ := ret[0].(*ecr0.GetAuthorizationTokenOutput)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// GetAuthorizationToken indicates an expected call of GetAuthorizationToken
-func (mr *MockECRSDKMockRecorder) GetAuthorizationToken(arg0 interface{}) *gomock.Call {
+// GetAuthorizationToken indicates an expected call of GetAuthorizationToken.
+func (mr *MockECRSDKMockRecorder) GetAuthorizationToken(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAuthorizationToken", reflect.TypeOf((*MockECRSDK)(nil).GetAuthorizationToken), arg0)
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAuthorizationToken", reflect.TypeOf((*MockECRSDK)(nil).GetAuthorizationToken), varargs...)
 }
 
-// MockECRFactory is a mock of ECRFactory interface
+// MockECRFactory is a mock of ECRFactory interface.
 type MockECRFactory struct {
 	ctrl     *gomock.Controller
 	recorder *MockECRFactoryMockRecorder
 }
 
-// MockECRFactoryMockRecorder is the mock recorder for MockECRFactory
+// MockECRFactoryMockRecorder is the mock recorder for MockECRFactory.
 type MockECRFactoryMockRecorder struct {
 	mock *MockECRFactory
 }
 
-// NewMockECRFactory creates a new mock instance
+// NewMockECRFactory creates a new mock instance.
 func NewMockECRFactory(ctrl *gomock.Controller) *MockECRFactory {
 	mock := &MockECRFactory{ctrl: ctrl}
 	mock.recorder = &MockECRFactoryMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockECRFactory) EXPECT() *MockECRFactoryMockRecorder {
 	return m.recorder
 }
 
-// GetClient mocks base method
+// GetClient mocks base method.
 func (m *MockECRFactory) GetClient(arg0 *container.ECRAuthData) (ecr.ECRClient, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetClient", arg0)
@@ -97,45 +104,45 @@ func (m *MockECRFactory) GetClient(arg0 *container.ECRAuthData) (ecr.ECRClient, 
 	return ret0, ret1
 }
 
-// GetClient indicates an expected call of GetClient
+// GetClient indicates an expected call of GetClient.
 func (mr *MockECRFactoryMockRecorder) GetClient(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetClient", reflect.TypeOf((*MockECRFactory)(nil).GetClient), arg0)
 }
 
-// MockECRClient is a mock of ECRClient interface
+// MockECRClient is a mock of ECRClient interface.
 type MockECRClient struct {
 	ctrl     *gomock.Controller
 	recorder *MockECRClientMockRecorder
 }
 
-// MockECRClientMockRecorder is the mock recorder for MockECRClient
+// MockECRClientMockRecorder is the mock recorder for MockECRClient.
 type MockECRClientMockRecorder struct {
 	mock *MockECRClient
 }
 
-// NewMockECRClient creates a new mock instance
+// NewMockECRClient creates a new mock instance.
 func NewMockECRClient(ctrl *gomock.Controller) *MockECRClient {
 	mock := &MockECRClient{ctrl: ctrl}
 	mock.recorder = &MockECRClientMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockECRClient) EXPECT() *MockECRClientMockRecorder {
 	return m.recorder
 }
 
-// GetAuthorizationToken mocks base method
-func (m *MockECRClient) GetAuthorizationToken(arg0 string) (*ecr0.AuthorizationData, error) {
+// GetAuthorizationToken mocks base method.
+func (m *MockECRClient) GetAuthorizationToken(arg0 string) (*types.AuthorizationData, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetAuthorizationToken", arg0)
-	ret0, _ := ret[0].(*ecr0.AuthorizationData)
+	ret0, _ := ret[0].(*types.AuthorizationData)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// GetAuthorizationToken indicates an expected call of GetAuthorizationToken
+// GetAuthorizationToken indicates an expected call of GetAuthorizationToken.
 func (mr *MockECRClientMockRecorder) GetAuthorizationToken(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAuthorizationToken", reflect.TypeOf((*MockECRClient)(nil).GetAuthorizationToken), arg0)

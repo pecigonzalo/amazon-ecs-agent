@@ -16,7 +16,6 @@
 package statemanager_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,7 +26,9 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	engine_testutils "github.com/aws/amazon-ecs-agent/agent/engine/testutils"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource/credentialspec"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource/firelens"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource/status"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
 	taskresourcevolume "github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
 	"github.com/stretchr/testify/assert"
@@ -35,9 +36,7 @@ import (
 )
 
 func TestStateManager(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("/tmp", "ecs_statemanager_test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 	cfg := &config.Config{DataDir: tmpDir}
 	manager, err := statemanager.NewStateManager(cfg)
 	assert.Nil(t, err, "Error loading manager")
@@ -47,8 +46,8 @@ func TestStateManager(t *testing.T) {
 
 	// Now let's make some state to save
 	containerInstanceArn := ""
-	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(),
-		nil, nil, nil)
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(),
+		nil, nil, nil, nil, nil)
 
 	manager, err = statemanager.NewStateManager(cfg, statemanager.AddSaveable("TaskEngine", taskEngine),
 		statemanager.AddSaveable("ContainerInstanceArn", &containerInstanceArn))
@@ -65,8 +64,8 @@ func TestStateManager(t *testing.T) {
 	assertFileMode(t, filepath.Join(tmpDir, "ecs_agent_data.json"))
 
 	// Now make sure we can load that state sanely
-	loadedTaskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(),
-		nil, nil, nil)
+	loadedTaskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(),
+		nil, nil, nil, nil, nil)
 	var loadedContainerInstanceArn string
 
 	manager, err = statemanager.NewStateManager(cfg, statemanager.AddSaveable("TaskEngine", &loadedTaskEngine),
@@ -111,7 +110,7 @@ func TestLoadsDataForAWSVPCTask(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v11", tc.dir)}
 
-			taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+			taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 			var containerInstanceArn, cluster, savedInstanceID string
 
 			stateManager, err := statemanager.NewStateManager(cfg,
@@ -150,7 +149,7 @@ func TestLoadsDataForAWSVPCTask(t *testing.T) {
 // verify that the state manager correctly loads gpu related fields in state file
 func TestLoadsDataForGPU(t *testing.T) {
 	cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v18", "gpu")}
-	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	var containerInstanceArn, cluster, savedInstanceID string
 	var sequenceNumber int64
 	stateManager, err := statemanager.NewStateManager(cfg,
@@ -195,7 +194,7 @@ func TestLoadsDataForGPU(t *testing.T) {
 
 func TestLoadsDataForFirelensTask(t *testing.T) {
 	cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v23", "firelens")}
-	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	var containerInstanceArn, cluster, savedInstanceID string
 	var sequenceNumber int64
 	stateManager, err := statemanager.NewStateManager(cfg,
@@ -243,7 +242,7 @@ func TestLoadsDataForFirelensTask(t *testing.T) {
 
 func TestLoadsDataForFirelensTaskWithExternalConfig(t *testing.T) {
 	cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v24", "firelens")}
-	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	var containerInstanceArn, cluster, savedInstanceID string
 	var sequenceNumber int64
 	stateManager, err := statemanager.NewStateManager(cfg,
@@ -297,7 +296,7 @@ func TestLoadsDataForFirelensTaskWithExternalConfig(t *testing.T) {
 
 func TestLoadsDataForEFSGATask(t *testing.T) {
 	cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v27", "efs")}
-	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil)
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, dockerstate.NewTaskEngineState(), nil, nil, nil, nil, nil)
 	var containerInstanceArn, cluster, savedInstanceID string
 	var sequenceNumber int64
 	stateManager, err := statemanager.NewStateManager(cfg,
@@ -329,4 +328,55 @@ func TestLoadsDataForEFSGATask(t *testing.T) {
 	assert.Equal(t, "fs-xxx:/", volumeResource.VolumeConfig.DriverOpts["device"])
 	assert.Equal(t, "tls,tlsport=20050,iam,awscredsuri=/v2/credentials/xxx,accesspoint=fsap-xxx,netns=/proc/123/ns/net", volumeResource.VolumeConfig.DriverOpts["o"])
 	assert.Equal(t, "efs", volumeResource.VolumeConfig.DriverOpts["type"])
+}
+
+func TestLoadsDataForGMSATask(t *testing.T) {
+	cfg := &config.Config{DataDir: filepath.Join(".", "testdata", "v31", "gmsalinux")}
+	taskEngineState := dockerstate.NewTaskEngineState()
+	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil, nil, nil, nil, taskEngineState, nil, nil, nil, nil, nil)
+	var containerInstanceArn, cluster, savedInstanceID string
+	var sequenceNumber int64
+
+	stateManager, err := statemanager.NewStateManager(cfg,
+		statemanager.AddSaveable("TaskEngine", taskEngine),
+		statemanager.AddSaveable("ContainerInstanceArn", &containerInstanceArn),
+		statemanager.AddSaveable("Cluster", &cluster),
+		statemanager.AddSaveable("EC2InstanceID", &savedInstanceID),
+		statemanager.AddSaveable("SeqNum", &sequenceNumber),
+	)
+
+	assert.NoError(t, err)
+	err = stateManager.Load()
+	assert.NoError(t, err)
+	assert.Equal(t, "gmsa-test", cluster)
+	assert.EqualValues(t, 0, sequenceNumber)
+	tasks, err := taskEngine.ListTasks()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(tasks))
+	task := tasks[0]
+
+	assert.Equal(t, "arn:aws:ecs:ap-northeast-1:1234567890:task/b8e2bd3c-c82a-4b43-9bde-199ae05b49a5", task.Arn)
+	assert.Equal(t, "gmsa-test", task.Family)
+	assert.Equal(t, 1, len(task.Containers))
+	container := task.Containers[0]
+	assert.Equal(t, "linux_sample_app", container.Name)
+
+	resource, ok := task.GetCredentialSpecResource()
+	assert.True(t, ok)
+	assert.NotEmpty(t, resource)
+
+	credSpecResource := resource[0].(*credentialspec.CredentialSpecResource)
+
+	assert.Equal(t, status.ResourceCreated, credSpecResource.GetDesiredStatus())
+	assert.Equal(t, status.ResourceCreated, credSpecResource.GetKnownStatus())
+
+	credSpecMap := credSpecResource.CredSpecMap
+	assert.NotEmpty(t, credSpecMap)
+
+	testCredSpec := "credentialspec:arn:aws:s3:::gmsacredspec/contoso_webapp01.json"
+	expectedKerberosTicketPath := "/var/credentials-fetcher/krbdir/123456/webapp01"
+
+	actualKerberosTicketPath, err := credSpecResource.GetTargetMapping(testCredSpec)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedKerberosTicketPath, actualKerberosTicketPath)
 }

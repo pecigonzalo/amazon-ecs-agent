@@ -14,9 +14,13 @@
 package dockerapi
 
 import (
+	"errors"
+	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
 )
 
 const (
@@ -149,6 +153,24 @@ func (err CannotPullContainerError) ErrorName() string {
 	return "CannotPullContainerError"
 }
 
+func (err CannotPullContainerError) WithAugmentedErrorMessage(msg string) apierrors.NamedError {
+	return CannotPullContainerError{errors.New(msg)}
+}
+
+// CannotPullImageManifestError indicates any error when trying to pull a container image manifest.
+type CannotPullImageManifestError struct {
+	FromError error
+}
+
+func (err CannotPullImageManifestError) Error() string {
+	return err.FromError.Error()
+}
+
+// ErrorName returns the name of CannotPullImageManifestError.
+func (err CannotPullImageManifestError) ErrorName() string {
+	return "CannotPullImageManifestError"
+}
+
 // CannotPullECRContainerError indicates any error when trying to pull
 // a container image from ECR
 type CannotPullECRContainerError struct {
@@ -167,6 +189,10 @@ func (err CannotPullECRContainerError) ErrorName() string {
 // Retry fulfills the utils.Retrier interface and allows retries to be skipped by utils.Retry* functions
 func (err CannotPullECRContainerError) Retry() bool {
 	return false
+}
+
+func (err CannotPullECRContainerError) WithAugmentedErrorMessage(msg string) apierrors.NamedError {
+	return CannotPullECRContainerError{errors.New(msg)}
 }
 
 // CannotPullContainerAuthError indicates any error when trying to pull
@@ -405,4 +431,18 @@ func (err CannotInspectContainerExecError) Error() string {
 // ErrorName returns name of the CannotCreateContainerExecError.
 func (err CannotInspectContainerExecError) ErrorName() string {
 	return "CannotInspectContainerExecError"
+}
+
+// Redact ECR bucket urls from error string
+// Return a new error with redacted string - replacing ECR bucket (*starport-layer-bucket*) urls with a string.
+// This is done because container runtime's request may sometimes contain security tokens when accessing ECR buckets for image layers.
+// When these requests error out, the URLs with secrets may get bubbled up to Agent logs.
+// So we redact the otherwise hidden URLs for security.
+func redactEcrUrls(overrideStr string, err error) error {
+	if err == nil {
+		return nil
+	}
+	urlRegex := regexp.MustCompile(`\"?https[^\s]+starport-layer-bucket[^\s]+`)
+	redactedStr := urlRegex.ReplaceAllString(err.Error(), fmt.Sprintf("REDACTED ECR URL related to %s", overrideStr))
+	return errors.New(redactedStr)
 }

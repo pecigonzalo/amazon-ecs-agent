@@ -14,14 +14,19 @@
 package data
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/aws/amazon-ecs-agent/agent/api/container"
-	"github.com/aws/amazon-ecs-agent/agent/api/eni"
 	"github.com/aws/amazon-ecs-agent/agent/api/task"
+	"github.com/aws/amazon-ecs-agent/agent/data/transformationfunctions"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
-
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment/resource"
+	generaldata "github.com/aws/amazon-ecs-agent/ecs-agent/data"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/modeltransformer"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -33,7 +38,10 @@ const (
 	tasksBucketName          = "tasks"
 	imagesBucketName         = "images"
 	eniAttachmentsBucketName = "eniattachments"
+	resAttachmentsBucketName = "resattachments"
 	metadataBucketName       = "metadata"
+	emptyAgentVersionMsg     = "No version info available in boltDB. Either this is a fresh instance, or we were using state file to persist data. Transformer not applicable."
+	notDirectoryErrorMsg     = "path %s is not a valid directory"
 )
 
 var (
@@ -45,8 +53,10 @@ var (
 		containersBucketName,
 		tasksBucketName,
 		eniAttachmentsBucketName,
+		resAttachmentsBucketName,
 		metadataBucketName,
 	}
+	dirExists = checkDirectoryExists
 )
 
 // Client specifies the data management interface to persist and manage various kinds of data in the agent.
@@ -78,16 +88,27 @@ type Client interface {
 	GetImageStates() ([]*image.ImageState, error)
 
 	// SaveENIAttachment saves the data of an ENI attachment.
-	SaveENIAttachment(*eni.ENIAttachment) error
+	SaveENIAttachment(*networkinterface.ENIAttachment) error
 	// DeleteENIAttachment deletes the data of an ENI atttachment.
 	DeleteENIAttachment(string) error
-	// GetENIAttachments gets the data of all the ENI attachment.
-	GetENIAttachments() ([]*eni.ENIAttachment, error)
+	// GetENIAttachments gets the data of all the ENI attachments.
+	GetENIAttachments() ([]*networkinterface.ENIAttachment, error)
+
+	// SaveResourceAttachment saves the data of a resource attachment.
+	// This includes the EBS Attachment type
+	SaveResourceAttachment(*resource.ResourceAttachment) error
+	// DeleteResourceAttachment deletes the data of a resource atttachment.
+	DeleteResourceAttachment(string) error
+	// GetResourceAttachments gets the data of all the resouce attachments.
+	GetResourceAttachments() ([]*resource.ResourceAttachment, error)
 
 	// SaveMetadata saves a key value pair of metadata.
 	SaveMetadata(string, string) error
 	// GetMetadata gets the value of a certain kind of metadata.
 	GetMetadata(string) (string, error)
+
+	// HasNonTerminalTasks returns true if there are any pending or running tasks in the database.
+	HasNonTerminalTasks() bool
 
 	// Close closes the connection to database.
 	Close() error
@@ -95,7 +116,7 @@ type Client interface {
 
 // client implements the Client interface using boltdb as the backing data store.
 type client struct {
-	db *bolt.DB
+	generaldata.Client
 }
 
 // New returns a data client that implements the Client interface with boltdb.
@@ -116,9 +137,18 @@ func NewWithSetup(dataDir string) (Client, error) {
 	return setup(dataDir)
 }
 
-// setup initiates the boltdb client and makes sure the buckets we use are created.
+// setup initiates the boltdb client and makes sure the buckets we use and transformer are created, and
+// registers transformation functions to transformer.
 func setup(dataDir string) (*client, error) {
+	// Check if the directory is valid
+	err := dirExists(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	db, err := bolt.Open(filepath.Join(dataDir, dbName), dbMode, nil)
+	if err != nil {
+		return nil, err
+	}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, b := range buckets {
 			_, err = tx.CreateBucketIfNotExists([]byte(b))
@@ -129,15 +159,38 @@ func setup(dataDir string) (*client, error) {
 
 		return nil
 	})
+
+	// create transformer
+	transformer := modeltransformer.NewTransformer()
+
+	// registering task transformation functions
+	transformationfunctions.RegisterTaskTransformationFunctions(transformer)
+
 	if err != nil {
 		return nil, err
 	}
 	return &client{
-		db: db,
+		generaldata.Client{
+			Accessor:    generaldata.DBAccessor{},
+			DB:          db,
+			Transformer: transformer,
+		},
 	}, nil
 }
 
 // Close closes the boltdb connection.
 func (c *client) Close() error {
-	return c.db.Close()
+	return c.DB.Close()
+}
+
+// Checks if the data directory exists within the agent container
+func checkDirectoryExists(path string) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !fileInfo.IsDir() {
+		return fmt.Errorf(notDirectoryErrorMsg, path)
+	}
+	return nil
 }

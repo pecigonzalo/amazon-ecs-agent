@@ -17,6 +17,7 @@
 package asmsecret
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,15 +25,18 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	mock_factory "github.com/aws/amazon-ecs-agent/agent/asm/factory/mocks"
 	mock_secretsmanageriface "github.com/aws/amazon-ecs-agent/agent/asm/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	mock_credentials "github.com/aws/amazon-ecs-agent/agent/credentials/mocks"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	mock_credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials/mocks"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,10 +87,14 @@ func TestCreateWithMultipleASMCall(t *testing.T) {
 	}
 
 	credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true)
-	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient)
-	asmClientCreator.EXPECT().NewASMClient(region2, iamRoleCreds).Return(mockASMClient)
-	mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-		assert.Equal(t, valueFrom1, aws.StringValue(in.SecretId))
+	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient, nil)
+	asmClientCreator.EXPECT().NewASMClient(region2, iamRoleCreds).Return(mockASMClient, nil)
+	mockASMClient.EXPECT().GetSecretValue(
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+	).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+		assert.Equal(t, valueFrom1, aws.ToString(in.SecretId))
 	}).Return(asmSecretValue, nil).Times(2)
 
 	asmRes := &ASMSecretResource{
@@ -128,10 +136,14 @@ func TestCreateReturnMultipleErrors(t *testing.T) {
 	asmSecretValue := &secretsmanager.GetSecretValueOutput{}
 
 	credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true)
-	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient)
-	asmClientCreator.EXPECT().NewASMClient(region2, iamRoleCreds).Return(mockASMClient)
-	mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-		assert.Equal(t, valueFrom1, aws.StringValue(in.SecretId))
+	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient, nil)
+	asmClientCreator.EXPECT().NewASMClient(region2, iamRoleCreds).Return(mockASMClient, nil)
+	mockASMClient.EXPECT().GetSecretValue(
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+	).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+		assert.Equal(t, valueFrom1, aws.ToString(in.SecretId))
 	}).Return(asmSecretValue, errors.New("error response")).Times(2)
 
 	asmRes := &ASMSecretResource{
@@ -142,10 +154,8 @@ func TestCreateReturnMultipleErrors(t *testing.T) {
 	}
 
 	assert.Error(t, asmRes.Create())
-	expectedError1 := fmt.Sprintf("fetching secret data from AWS Secrets Manager in region %s: secret %s: error response", region1, valueFrom1)
-	expectedError2 := fmt.Sprintf("fetching secret data from AWS Secrets Manager in region %s: secret %s: error response", region2, valueFrom1)
-	assert.Contains(t, asmRes.GetTerminalReason(), expectedError1)
-	assert.Contains(t, asmRes.GetTerminalReason(), expectedError2)
+	expectedError := "error response"
+	assert.Contains(t, asmRes.GetTerminalReason(), expectedError)
 }
 
 func TestCreateReturnError(t *testing.T) {
@@ -169,10 +179,14 @@ func TestCreateReturnError(t *testing.T) {
 
 	gomock.InOrder(
 		credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true),
-		asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient),
-		mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-			assert.Equal(t, valueFrom1, aws.StringValue(in.SecretId))
-		}).Return(asmSecretValue, errors.New("error response")),
+		asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient, nil),
+		mockASMClient.EXPECT().GetSecretValue(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+		).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+			assert.Equal(t, valueFrom1, aws.ToString(in.SecretId))
+		}).Return(asmSecretValue, &types.ResourceNotFoundException{Message: aws.String("Secrets Manager can't find the specified secret")}),
 	)
 	asmRes := &ASMSecretResource{
 		executionCredentialsID: executionCredentialsID,
@@ -182,8 +196,8 @@ func TestCreateReturnError(t *testing.T) {
 	}
 
 	assert.Error(t, asmRes.Create())
-	expectedError := fmt.Sprintf("fetching secret data from AWS Secrets Manager in region %s: secret %s: error response", region1, valueFrom1)
-	assert.Equal(t, expectedError, asmRes.GetTerminalReason())
+	expectedError := fmt.Sprintf("ResourceNotFoundException: The task can't retrieve the secret with ARN '%s' from AWS Secrets Manager. Check whether the secret exists in the specified Region", valueFrom1)
+	assert.Contains(t, asmRes.GetTerminalReason(), expectedError)
 }
 
 func TestMarshalUnmarshalJSON(t *testing.T) {
@@ -225,12 +239,14 @@ func TestInitialize(t *testing.T) {
 		knownStatusUnsafe:   resourcestatus.ResourceCreated,
 		desiredStatusUnsafe: resourcestatus.ResourceCreated,
 	}
-	asmRes.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			ASMClientCreator:   asmClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
+	asmRes.Initialize(
+		&config.Config{},
+		&taskresource.ResourceFields{
+			ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+				ASMClientCreator:   asmClientCreator,
+				CredentialsManager: credentialsManager,
+			},
+		}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
 	assert.Equal(t, resourcestatus.ResourceStatusNone, asmRes.GetKnownStatus())
 	assert.Equal(t, resourcestatus.ResourceCreated, asmRes.GetDesiredStatus())
 
@@ -267,7 +283,7 @@ func TestCreateWithASMParametersWrongFormat(t *testing.T) {
 	}
 
 	credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true)
-	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient)
+	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient, nil)
 
 	asmRes := &ASMSecretResource{
 		executionCredentialsID: executionCredentialsID,
@@ -304,9 +320,13 @@ func TestCreateWithASMParametersJSONKeySpecified(t *testing.T) {
 	}
 
 	credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true)
-	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient)
-	mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-		assert.Equal(t, valueFrom1, aws.StringValue(in.SecretId))
+	asmClientCreator.EXPECT().NewASMClient(region1, iamRoleCreds).Return(mockASMClient, nil)
+	mockASMClient.EXPECT().GetSecretValue(
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+	).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+		assert.Equal(t, valueFrom1, aws.ToString(in.SecretId))
 	}).Return(asmSecretValue, nil)
 
 	asmRes := &ASMSecretResource{

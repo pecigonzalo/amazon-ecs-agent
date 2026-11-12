@@ -16,6 +16,7 @@
 package execcmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -25,9 +26,14 @@ import (
 	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 )
 
 func TestInitializeContainer(t *testing.T) {
@@ -126,7 +132,7 @@ func TestInitializeContainer(t *testing.T) {
 
 			execCmdMgr := newTestManager()
 
-			GetExecAgentConfigFileName = func(s int) (string, error) {
+			GetExecAgentConfigFileName = func(s int, cfg *config.Config, task *apitask.Task) (string, error) {
 				return "amazon-ssm-agent.json", test.getExecAgentConfigFileNameError
 			}
 
@@ -166,7 +172,8 @@ func TestInitializeContainer(t *testing.T) {
 
 			for _, container := range containers {
 				hc := &dockercontainer.HostConfig{}
-				err := execCmdMgr.InitializeContainer("task-id", container, hc)
+				task := &apitask.Task{Arn: "arn:aws:ecs:us-west-2:abc:task/my-cluster/task-id"}
+				err := execCmdMgr.InitializeContainer(task, container, hc)
 
 				assert.Equal(t, test.expectedError, err)
 
@@ -221,15 +228,12 @@ func TestInitializeContainer(t *testing.T) {
 func TestGetExecAgentConfigFileName(t *testing.T) {
 	execAgentConfig := `{
 	"Mgs": {
-		"Region": "",
-		"Endpoint": "",
 		"StopTimeoutMillis": 20000,
 		"SessionWorkersLimit": 2
 	},
 	"Agent": {
-		"Region": "",
-		"OrchestrationRootDir": "",
-		"ContainerMode": true
+		"ContainerMode": true,
+		"UseDualStackEndpoint": false
 	}
 }`
 	sha := getExecAgentConfigHash(execAgentConfig)
@@ -303,7 +307,9 @@ func TestGetExecAgentConfigFileName(t *testing.T) {
 		createNewExecAgentConfigFile = func(c, f string) error {
 			return tc.createConfigFileErr
 		}
-		fileName, err := GetExecAgentConfigFileName(2)
+		agentCfg := &config.Config{}
+		task := &apitask.Task{}
+		fileName, err := GetExecAgentConfigFileName(2, agentCfg, task)
 		assert.Equal(t, tc.expectedConfigFileName, fileName, "incorrect config file name")
 		assert.Equal(t, tc.expectedError, err)
 	}
@@ -450,5 +456,126 @@ func TestGetValidConfigExists(t *testing.T) {
 			return []byte(tc.existingLogConfig), tc.existingLogConfigReadErr
 		}
 		assert.Equal(t, tc.isValid, validConfigExists("configpath", getExecAgentConfigHash(execAgentLogConfigTemplate)))
+	}
+}
+
+func TestFormatSSMAgentConfig(t *testing.T) {
+	// Define a struct that matches the SSM agent config structure
+	type SSMAgentConfig struct {
+		Mgs struct {
+			StopTimeoutMillis   int `json:"StopTimeoutMillis"`
+			SessionWorkersLimit int `json:"SessionWorkersLimit"`
+		} `json:"Mgs"`
+		Agent struct {
+			ContainerMode        bool `json:"ContainerMode"`
+			UseDualStackEndpoint bool `json:"UseDualStackEndpoint"`
+		} `json:"Agent"`
+	}
+
+	// Create mock ENIs for testing
+	ipv6OnlyENI := &ni.NetworkInterface{
+		IPV6Addresses: []*ni.IPV6Address{{Address: "2001:db8::1", Primary: true}},
+	}
+	dualStackENI := &ni.NetworkInterface{
+		IPV4Addresses: []*ni.IPV4Address{{Address: "192.168.1.1", Primary: true}},
+		IPV6Addresses: []*ni.IPV6Address{{Address: "2001:db8::1", Primary: true}},
+	}
+
+	// Create mock tasks for testing
+	ipv6OnlyTask := &apitask.Task{
+		NetworkMode: apitask.AWSVPCNetworkMode,
+		ENIs:        []*ni.NetworkInterface{ipv6OnlyENI},
+	}
+	dualStackTask := &apitask.Task{
+		NetworkMode: apitask.AWSVPCNetworkMode,
+		ENIs:        []*ni.NetworkInterface{dualStackENI},
+	}
+	bridgeTask := &apitask.Task{
+		NetworkMode: apitask.BridgeNetworkMode,
+	}
+	taskWithoutENI := &apitask.Task{
+		NetworkMode: apitask.AWSVPCNetworkMode,
+	}
+
+	testCases := []struct {
+		name                 string
+		sessionLimit         int
+		cfg                  *config.Config
+		task                 *apitask.Task
+		expectedUseDualStack bool
+		expectedError        string
+	}{
+		{
+			name:         "non-IPv6-only environment with bridge mode task",
+			sessionLimit: 5,
+			cfg: &config.Config{
+				InstanceIPCompatibility: ipcompatibility.NewIPv4OnlyCompatibility(),
+			},
+			task:                 bridgeTask,
+			expectedUseDualStack: false,
+		},
+		{
+			name:         "IPv6-only environment with bridge mode task",
+			sessionLimit: 8,
+			cfg: &config.Config{
+				InstanceIPCompatibility: ipcompatibility.NewIPv6OnlyCompatibility(),
+			},
+			task:                 bridgeTask,
+			expectedUseDualStack: true,
+		},
+		{
+			name:         "IPv6-only task ENI with AWSVPC mode",
+			sessionLimit: 15,
+			cfg: &config.Config{
+				InstanceIPCompatibility: ipcompatibility.NewIPv4OnlyCompatibility(),
+			},
+			task:                 ipv6OnlyTask,
+			expectedUseDualStack: true,
+		},
+		{
+			name:         "Dual-stack task ENI with AWSVPC mode",
+			sessionLimit: 15,
+			cfg: &config.Config{
+				InstanceIPCompatibility: ipcompatibility.NewIPv6OnlyCompatibility(),
+			},
+			task:                 dualStackTask,
+			expectedUseDualStack: false,
+		},
+		{
+			name:         "AWSVPC task without ENI",
+			sessionLimit: 5,
+			cfg: &config.Config{
+				InstanceIPCompatibility: ipcompatibility.NewIPv4OnlyCompatibility(),
+			},
+			task:          taskWithoutENI,
+			expectedError: "awsvpc mode task does not have a primary ENI",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := formatSSMAgentConfig(tc.sessionLimit, tc.cfg, tc.task)
+
+			if tc.expectedError != "" {
+				assert.EqualError(t, err, tc.expectedError)
+				return
+			}
+
+			assert.NoError(t, err)
+
+			// Parse the JSON result into our struct
+			var config SSMAgentConfig
+			err = json.Unmarshal([]byte(result), &config)
+			require.NoError(t, err, "Result should be valid JSON")
+
+			// Check session workers limit is set correctly
+			assert.Equal(t, tc.sessionLimit, config.Mgs.SessionWorkersLimit, "Session workers limit should match")
+
+			// Verify container mode is true
+			assert.True(t, config.Agent.ContainerMode, "Agent.ContainerMode should be true")
+
+			// Verify UseDualStackEndpoint is set based on the test case expectation
+			assert.Equal(t, tc.expectedUseDualStack, config.Agent.UseDualStackEndpoint)
+		})
 	}
 }

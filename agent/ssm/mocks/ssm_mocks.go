@@ -19,46 +19,52 @@
 package mock_ssm
 
 import (
+	context "context"
 	reflect "reflect"
 
-	ssm "github.com/aws/aws-sdk-go/service/ssm"
+	ssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockSSMClient is a mock of SSMClient interface
+// MockSSMClient is a mock of SSMClient interface.
 type MockSSMClient struct {
 	ctrl     *gomock.Controller
 	recorder *MockSSMClientMockRecorder
 }
 
-// MockSSMClientMockRecorder is the mock recorder for MockSSMClient
+// MockSSMClientMockRecorder is the mock recorder for MockSSMClient.
 type MockSSMClientMockRecorder struct {
 	mock *MockSSMClient
 }
 
-// NewMockSSMClient creates a new mock instance
+// NewMockSSMClient creates a new mock instance.
 func NewMockSSMClient(ctrl *gomock.Controller) *MockSSMClient {
 	mock := &MockSSMClient{ctrl: ctrl}
 	mock.recorder = &MockSSMClientMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockSSMClient) EXPECT() *MockSSMClientMockRecorder {
 	return m.recorder
 }
 
-// GetParameters mocks base method
-func (m *MockSSMClient) GetParameters(arg0 *ssm.GetParametersInput) (*ssm.GetParametersOutput, error) {
+// GetParameters mocks base method.
+func (m *MockSSMClient) GetParameters(arg0 context.Context, arg1 *ssm.GetParametersInput, arg2 ...func(*ssm.Options)) (*ssm.GetParametersOutput, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetParameters", arg0)
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetParameters", varargs...)
 	ret0, _ := ret[0].(*ssm.GetParametersOutput)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// GetParameters indicates an expected call of GetParameters
-func (mr *MockSSMClientMockRecorder) GetParameters(arg0 interface{}) *gomock.Call {
+// GetParameters indicates an expected call of GetParameters.
+func (mr *MockSSMClientMockRecorder) GetParameters(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetParameters", reflect.TypeOf((*MockSSMClient)(nil).GetParameters), arg0)
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetParameters", reflect.TypeOf((*MockSSMClient)(nil).GetParameters), varargs...)
 }

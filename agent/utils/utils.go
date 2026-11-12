@@ -18,23 +18,24 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"math"
 	"math/big"
-	"net/http"
-	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	commonutils "github.com/aws/amazon-ecs-agent/ecs-agent/utils"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/pkg/errors"
-	"golang.org/x/net/http/httpproxy"
 )
 
 func DefaultIfBlank(str string, default_value string) string {
@@ -42,28 +43,6 @@ func DefaultIfBlank(str string, default_value string) string {
 		return default_value
 	}
 	return str
-}
-
-func ZeroOrNil(obj interface{}) bool {
-	value := reflect.ValueOf(obj)
-	if !value.IsValid() {
-		return true
-	}
-	if obj == nil {
-		return true
-	}
-	switch value.Kind() {
-	case reflect.Slice, reflect.Array, reflect.Map:
-		return value.Len() == 0
-	}
-	zero := reflect.Zero(reflect.TypeOf(obj))
-	if !value.Type().Comparable() {
-		return false
-	}
-	if obj == zero.Interface() {
-		return true
-	}
-	return false
 }
 
 // SlicesDeepEqual checks if slice1 and slice2 are equal, disregarding order.
@@ -110,15 +89,16 @@ func Strptr(s string) *string {
 	return &s
 }
 
-// Uint16SliceToStringSlice converts a slice of type uint16 to a slice of type
-// *string. It uses strconv.Itoa on each element
-func Uint16SliceToStringSlice(slice []uint16) []*string {
-	stringSlice := make([]*string, len(slice))
-	for i, el := range slice {
-		str := strconv.Itoa(int(el))
-		stringSlice[i] = &str
-	}
-	return stringSlice
+func IntPtr(i int) *int {
+	return &i
+}
+
+func Int64Ptr(i int64) *int64 {
+	return &i
+}
+
+func BoolPtr(b bool) *bool {
+	return &b
 }
 
 func StrSliceEqual(s1, s2 []string) bool {
@@ -151,33 +131,48 @@ func ParseBool(str string, default_ bool) bool {
 	return res
 }
 
+// Removes element at a particular index in the slice
+func Remove(slice []string, s int) []string {
+	return append(slice[:s], slice[s+1:]...)
+}
+
 // IsAWSErrorCodeEqual returns true if the err implements Error
 // interface of awserr and it has the same error code as
 // the passed in error code.
 func IsAWSErrorCodeEqual(err error, code string) bool {
-	awsErr, ok := err.(awserr.Error)
-	return ok && awsErr.Code() == code
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == code
+	}
+
+	return false
 }
 
-// GetRequestFailureStatusCode returns the status code from a
-// RequestFailure error, or 0 if the error is not of that type
-func GetRequestFailureStatusCode(err error) int {
+// GetResponseErrorStatusCode returns the status code from a
+// ResponseError error of a server client error from AWS SDK Go V2,
+// or 0 if the error is not of that type
+// https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/handle-errors.html
+func GetResponseErrorStatusCode(err error) int {
 	var statusCode int
-	if reqErr, ok := err.(awserr.RequestFailure); ok {
-		statusCode = reqErr.StatusCode()
+	var oe *smithy.OperationError
+	if errors.As(err, &oe) {
+		var responseErr *smithyhttp.ResponseError
+		if errors.As(oe.Err, &responseErr) {
+			statusCode = responseErr.HTTPStatusCode()
+		}
 	}
 	return statusCode
 }
 
 // MapToTags converts a map to a slice of tags.
-func MapToTags(tagsMap map[string]string) []*ecs.Tag {
-	tags := make([]*ecs.Tag, 0)
+func MapToTags(tagsMap map[string]string) []types.Tag {
+	tags := make([]types.Tag, 0)
 	if tagsMap == nil {
 		return tags
 	}
 
 	for key, value := range tagsMap {
-		tags = append(tags, &ecs.Tag{
+		tags = append(tags, types.Tag{
 			Key:   aws.String(key),
 			Value: aws.String(value),
 		})
@@ -199,7 +194,7 @@ func SearchStrInDir(dir, filePrefix, content string) error {
 	for _, file := range logfiles {
 		if strings.HasPrefix(file.Name(), filePrefix) {
 			desiredFile = file.Name()
-			if ZeroOrNil(desiredFile) {
+			if commonutils.ZeroOrNil(desiredFile) {
 				return fmt.Errorf("File with prefix: %v does not exist", filePrefix)
 			}
 
@@ -235,20 +230,28 @@ func GetTaskID(taskARN string) (string, error) {
 	return fields[len(fields)-1], nil
 }
 
-// GetENIAttachmentId retrieves the attachment ID from eni attachment ARN.
-func GetENIAttachmentId(eniAttachmentArn string) (string, error) {
-	_, err := arn.Parse(eniAttachmentArn)
+// GetAttachmentId retrieves the ID from an attachment's ARN.
+// asssumes arn structure: arn:[partition]:ec2:[region]:[account-id]:[attachment-type]/[resource-id]
+func GetAttachmentId(attachmentArn string) (string, error) {
+	_, err := arn.Parse(attachmentArn)
 	if err != nil {
-		return "", errors.Errorf("failed to get eni attachment id: eni attachment arn format invalid: %s", eniAttachmentArn)
+		return "", errors.Errorf("failed to get resource attachment id: resource attachment arn format invalid: %s", attachmentArn)
 	}
-	fields := strings.Split(eniAttachmentArn, "/")
+	fields := strings.Split(attachmentArn, "/")
 	if len(fields) < 2 {
-		return "", errors.Errorf("failed to get eni attachment id: eni attachment arn invalid: %s", eniAttachmentArn)
+		return "", errors.Errorf("failed to get resource attachment id: resource attachment arn invalid: %s", attachmentArn)
 	}
 	return fields[len(fields)-1], nil
 }
 
-// Proxy is an uncached version of http.ProxyFromEnvironment.
-func Proxy(req *http.Request) (*url.URL, error) {
-	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+// Checks if a file exists on the provided file path.
+func FileExists(filePath string) (bool, error) {
+	_, err := os.Stat(filePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

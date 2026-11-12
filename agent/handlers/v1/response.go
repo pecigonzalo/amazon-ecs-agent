@@ -15,64 +15,16 @@ package v1
 
 import (
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
-	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	"github.com/aws/amazon-ecs-agent/agent/handlers/utils"
+	v1 "github.com/aws/amazon-ecs-agent/ecs-agent/introspection/v1"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	tmdsresponse "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/response"
+	tmdsutils "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/utils"
 )
 
-// MetadataResponse is the schema for the metadata response JSON object
-type MetadataResponse struct {
-	Cluster              string  `json:"Cluster"`
-	ContainerInstanceArn *string `json:"ContainerInstanceArn"`
-	Version              string  `json:"Version"`
-}
-
-// TaskResponse is the schema for the task response JSON object
-type TaskResponse struct {
-	Arn           string              `json:"Arn"`
-	DesiredStatus string              `json:"DesiredStatus,omitempty"`
-	KnownStatus   string              `json:"KnownStatus"`
-	Family        string              `json:"Family"`
-	Version       string              `json:"Version"`
-	Containers    []ContainerResponse `json:"Containers"`
-}
-
-// TasksResponse is the schema for the tasks response JSON object
-type TasksResponse struct {
-	Tasks []*TaskResponse `json:"Tasks"`
-}
-
-// ContainerResponse is the schema for the container response JSON object
-type ContainerResponse struct {
-	DockerID   string                      `json:"DockerId"`
-	DockerName string                      `json:"DockerName"`
-	Name       string                      `json:"Name"`
-	Ports      []PortResponse              `json:"Ports,omitempty"`
-	Networks   []containermetadata.Network `json:"Networks,omitempty"`
-	Volumes    []VolumeResponse            `json:"Volumes,omitempty"`
-}
-
-// VolumeResponse is the schema for the volume response JSON object
-type VolumeResponse struct {
-	DockerName  string `json:"DockerName,omitempty"`
-	Source      string `json:"Source,omitempty"`
-	Destination string `json:"Destination,omitempty"`
-}
-
-// PortResponse defines the schema for portmapping response JSON
-// object.
-type PortResponse struct {
-	ContainerPort uint16 `json:"ContainerPort,omitempty"`
-	Protocol      string `json:"Protocol,omitempty"`
-	HostPort      uint16 `json:"HostPort,omitempty"`
-	HostIp        string `json:"HostIp,omitempty"`
-}
-
-// NewTaskResponse creates a TaskResponse for a task.
-func NewTaskResponse(task *apitask.Task, containerMap map[string]*apicontainer.DockerContainer) *TaskResponse {
-	containers := []ContainerResponse{}
+// NewTaskResponse converts the given task to a v1 server TaskResponse.
+func NewTaskResponse(task *apitask.Task, containerMap map[string]*apicontainer.DockerContainer) *v1.TaskResponse {
+	containers := []v1.ContainerResponse{}
 	for _, container := range containerMap {
 		if container.Container.IsInternal() {
 			continue
@@ -90,7 +42,7 @@ func NewTaskResponse(task *apitask.Task, containerMap map[string]*apicontainer.D
 		desiredStatus = ""
 	}
 
-	return &TaskResponse{
+	return &v1.TaskResponse{
 		Arn:           task.Arn,
 		DesiredStatus: desiredStatus,
 		KnownStatus:   knownBackendStatus,
@@ -100,11 +52,13 @@ func NewTaskResponse(task *apitask.Task, containerMap map[string]*apicontainer.D
 	}
 }
 
-// NewContainerResponse creates ContainerResponse for a container.
-func NewContainerResponse(dockerContainer *apicontainer.DockerContainer, eni *apieni.ENI) ContainerResponse {
+// NewContainerResponse converts the given container to a v1 server ContainerResponse.
+func NewContainerResponse(dockerContainer *apicontainer.DockerContainer, eni *ni.NetworkInterface) v1.ContainerResponse {
 	container := dockerContainer.Container
-	resp := ContainerResponse{
+	resp := v1.ContainerResponse{
 		Name:       container.Name,
+		Image:      container.Image,
+		ImageID:    container.ImageID,
 		DockerID:   dockerContainer.DockerID,
 		DockerName: dockerContainer.DockerName,
 	}
@@ -113,21 +67,33 @@ func NewContainerResponse(dockerContainer *apicontainer.DockerContainer, eni *ap
 	resp.Volumes = NewVolumesResponse(dockerContainer)
 
 	if eni != nil {
-		resp.Networks = []containermetadata.Network{
+		resp.Networks = []tmdsresponse.Network{
 			{
-				NetworkMode:   utils.NetworkModeAWSVPC,
+				NetworkMode:   tmdsutils.NetworkModeAWSVPC,
 				IPv4Addresses: eni.GetIPV4Addresses(),
 				IPv6Addresses: eni.GetIPV6Addresses(),
 			},
 		}
 	}
+	if createdAt := container.GetCreatedAt(); !createdAt.IsZero() {
+		createdAt = createdAt.UTC()
+		resp.CreatedAt = &createdAt
+	}
+	if startedAt := container.GetStartedAt(); !startedAt.IsZero() {
+		startedAt = startedAt.UTC()
+		resp.StartedAt = &startedAt
+	}
+	if container.RestartPolicyEnabled() {
+		restartCount := container.RestartTracker.GetRestartCount()
+		resp.RestartCount = &restartCount
+	}
 	return resp
 }
 
-// NewPortBindingsResponse creates PortResponse for a container.
-func NewPortBindingsResponse(dockerContainer *apicontainer.DockerContainer, eni *apieni.ENI) []PortResponse {
+// NewPortBindingsResponse generates v1 server PortResponses for a container.
+func NewPortBindingsResponse(dockerContainer *apicontainer.DockerContainer, eni *ni.NetworkInterface) []tmdsresponse.PortResponse {
 	container := dockerContainer.Container
-	resp := []PortResponse{}
+	resp := []tmdsresponse.PortResponse{}
 
 	bindings := container.GetKnownPortBindings()
 
@@ -138,7 +104,7 @@ func NewPortBindingsResponse(dockerContainer *apicontainer.DockerContainer, eni 
 	}
 
 	for _, binding := range bindings {
-		port := PortResponse{
+		port := tmdsresponse.PortResponse{
 			ContainerPort: binding.ContainerPort,
 			Protocol:      binding.Protocol.String(),
 		}
@@ -154,15 +120,15 @@ func NewPortBindingsResponse(dockerContainer *apicontainer.DockerContainer, eni 
 	return resp
 }
 
-// NewVolumesResponse creates VolumeResponse for a container
-func NewVolumesResponse(dockerContainer *apicontainer.DockerContainer) []VolumeResponse {
+// NewVolumesResponse generates v1 server VolumeResponses for a container.
+func NewVolumesResponse(dockerContainer *apicontainer.DockerContainer) []tmdsresponse.VolumeResponse {
 	container := dockerContainer.Container
-	var resp []VolumeResponse
+	var resp []tmdsresponse.VolumeResponse
 
 	volumes := container.GetVolumes()
 
 	for _, volume := range volumes {
-		volResp := VolumeResponse{
+		volResp := tmdsresponse.VolumeResponse{
 			DockerName:  volume.Name,
 			Source:      volume.Source,
 			Destination: volume.Destination,
@@ -171,16 +137,4 @@ func NewVolumesResponse(dockerContainer *apicontainer.DockerContainer) []VolumeR
 		resp = append(resp, volResp)
 	}
 	return resp
-}
-
-// NewTasksResponse creates TasksResponse for all the tasks.
-func NewTasksResponse(state dockerstate.TaskEngineState) *TasksResponse {
-	allTasks := state.AllTasks()
-	taskResponses := make([]*TaskResponse, len(allTasks))
-	for ndx, task := range allTasks {
-		containerMap, _ := state.ContainerMapByArn(task.Arn)
-		taskResponses[ndx] = NewTaskResponse(task, containerMap)
-	}
-
-	return &TasksResponse{Tasks: taskResponses}
 }

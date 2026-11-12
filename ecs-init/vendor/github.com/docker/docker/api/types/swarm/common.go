@@ -1,10 +1,18 @@
-package swarm
+package swarm // import "github.com/docker/docker/api/types/swarm"
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 // Version represents the internal object version.
 type Version struct {
 	Index uint64 `json:",omitempty"`
+}
+
+// String implements fmt.Stringer interface.
+func (v Version) String() string {
+	return strconv.FormatUint(v.Index, 10)
 }
 
 // Meta is a base object inherited by most of the other once.
@@ -20,7 +28,7 @@ type Annotations struct {
 	Labels map[string]string `json:"Labels"`
 }
 
-// Driver represents a driver (network, logging).
+// Driver represents a driver (network, logging, secrets backend).
 type Driver struct {
 	Name    string            `json:",omitempty"`
 	Options map[string]string `json:",omitempty"`

@@ -18,6 +18,7 @@ package stats
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/cihub/seelog"
@@ -27,7 +28,7 @@ import (
 // dockerStatsToContainerStats returns a new object of the ContainerStats object from docker stats.
 func dockerStatsToContainerStats(dockerStats *types.StatsJSON) (*ContainerStats, error) {
 	cpuUsage := dockerStats.CPUStats.CPUUsage.TotalUsage / numCores
-	memoryUsage := dockerStats.MemoryStats.Usage - dockerStats.MemoryStats.Stats["cache"]
+	memoryUsage := getMemUsage(dockerStats.MemoryStats)
 	storageReadBytes, storageWriteBytes := getStorageStats(dockerStats)
 	networkStats := getNetworkStats(dockerStats)
 	return &ContainerStats{
@@ -40,7 +41,27 @@ func dockerStatsToContainerStats(dockerStats *types.StatsJSON) (*ContainerStats,
 	}, nil
 }
 
-func validateDockerStats(dockerStats *types.StatsJSON) error {
+func getMemUsage(mem types.MemoryStats) uint64 {
+	if config.CgroupV2 {
+		// for cgroupv2 systems, mem usage calculation uses the same method that the docker cli uses
+		// https://github.com/docker/cli/blob/e198123693b1aaa724041fff602c7d75c8fe4b57/cli/command/container/stats_helpers.go#L227-L249
+		// see https://github.com/aws/amazon-ecs-agent/issues/3323
+		if v, ok := mem.Stats["inactive_file"]; ok && v < mem.Usage {
+			return mem.Usage - v
+		}
+	}
+	if v, ok := mem.Stats["cache"]; ok && v < mem.Usage {
+		return mem.Usage - v
+	}
+	return mem.Usage
+}
+
+func validateDockerStats(dockerStats *types.StatsJSON, containerEnabledRestartPolicy bool) error {
+	if containerEnabledRestartPolicy && dockerStats.Read.IsZero() {
+		return fmt.Errorf("invalid container statistics reported for container with restart policy enabled, %s",
+			invalidStatZeroValueReadTimeMsg)
+	}
+
 	if config.CgroupV2 {
 		// PercpuUsage is not available in cgroupv2
 		if numCores == uint64(0) {
@@ -64,10 +85,10 @@ func getStorageStats(dockerStats *types.StatsJSON) (uint64, uint64) {
 	storageReadBytes := uint64(0)
 	storageWriteBytes := uint64(0)
 	for _, blockStat := range dockerStats.BlkioStats.IoServiceBytesRecursive {
-		switch op := blockStat.Op; op {
-		case "Read":
+		switch strings.ToLower(blockStat.Op) {
+		case "read":
 			storageReadBytes += blockStat.Value
-		case "Write":
+		case "write":
 			storageWriteBytes += blockStat.Value
 		default:
 			//ignoring "Async", "Total", "Sum", etc

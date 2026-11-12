@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/logger"
-	"github.com/aws/amazon-ecs-agent/agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 )
@@ -34,6 +34,33 @@ type Image struct {
 
 func (image *Image) String() string {
 	return fmt.Sprintf("ImageID: %s; Names: %s", image.ImageID, strings.Join(image.Names, ", "))
+}
+
+// managedEnvKeys is the set of image env var keys the agent tracks at the
+// image level. Presence of any of these keys in the image config suppresses
+// agent-side default injection at container create time.
+var managedEnvKeys = map[string]bool{
+	"AWS_REGION":         true,
+	"AWS_DEFAULT_REGION": true,
+}
+
+// ParseManagedEnvKeys returns the set of managed env var keys found in the
+// given image env list (formatted as "KEY=value" or "KEY").
+// A managed key with an empty value is still recorded; a warning is emitted.
+func ParseManagedEnvKeys(imageEnv []string) map[string]bool {
+	keys := make(map[string]bool)
+	for _, kv := range imageEnv {
+		key, value, found := strings.Cut(kv, "=")
+		if managedEnvKeys[key] {
+			if !found || value == "" {
+				logger.Warn("Image env var has empty value", logger.Fields{
+					"key": key,
+				})
+			}
+			keys[key] = true
+		}
+	}
+	return keys
 }
 
 // ImageState represents a docker image
@@ -50,7 +77,24 @@ type ImageState struct {
 	// PullSucceeded defines whether this image has been pulled successfully before,
 	// this should be set to true when one of the pull image call succeeds.
 	PullSucceeded bool
-	lock          sync.RWMutex
+	// ManagedEnvKeys is the subset of agent-managed env var keys present in the
+	// image config. Persisted so the agent does not need to re-inspect on restart.
+	ManagedEnvKeys map[string]bool
+	lock           sync.RWMutex
+}
+
+// SetManagedEnvKeys records which managed env var keys are present in the image config.
+func (imageState *ImageState) SetManagedEnvKeys(keys map[string]bool) {
+	imageState.lock.Lock()
+	defer imageState.lock.Unlock()
+	imageState.ManagedEnvKeys = keys
+}
+
+// GetManagedEnvKeys returns the set of managed env var keys present in the image config.
+func (imageState *ImageState) GetManagedEnvKeys() map[string]bool {
+	imageState.lock.RLock()
+	defer imageState.lock.RUnlock()
+	return imageState.ManagedEnvKeys
 }
 
 // UpdateContainerReference updates container reference in image state
@@ -170,15 +214,17 @@ func (imageState *ImageState) MarshalJSON() ([]byte, error) {
 	defer imageState.lock.Unlock()
 
 	return json.Marshal(&struct {
-		Image         *Image
-		PulledAt      time.Time
-		LastUsedAt    time.Time
-		PullSucceeded bool
+		Image          *Image
+		PulledAt       time.Time
+		LastUsedAt     time.Time
+		PullSucceeded  bool
+		ManagedEnvKeys map[string]bool
 	}{
-		Image:         imageState.Image,
-		PulledAt:      imageState.PulledAt,
-		LastUsedAt:    imageState.LastUsedAt,
-		PullSucceeded: imageState.PullSucceeded,
+		Image:          imageState.Image,
+		PulledAt:       imageState.PulledAt,
+		LastUsedAt:     imageState.LastUsedAt,
+		PullSucceeded:  imageState.PullSucceeded,
+		ManagedEnvKeys: imageState.ManagedEnvKeys,
 	})
 }
 
@@ -188,5 +234,27 @@ func (imageState *ImageState) String() string {
 		image = imageState.Image.String()
 	}
 	return fmt.Sprintf("Image: [%s] referenced by %d containers; PulledAt: %s; LastUsedAt: %s; PullSucceeded: %t",
-		image, len(imageState.Containers), imageState.PulledAt.String(), imageState.LastUsedAt.String(), imageState.PullSucceeded)
+		image, len(imageState.Containers), imageState.PulledAt.UTC().Format(time.RFC3339),
+		imageState.LastUsedAt.UTC().Format(time.RFC3339), imageState.PullSucceeded)
+}
+
+func (imageState *ImageState) Fields() logger.Fields {
+	imageID := ""
+	names := []string{}
+	size := int64(-1)
+	if imageState.Image != nil {
+		imageID = imageState.Image.ImageID
+		names = imageState.Image.Names
+		size = imageState.Image.Size
+	}
+
+	return logger.Fields{
+		field.ImageID:            imageID,
+		field.ImageNames:         names,
+		field.ImageSizeBytes:     size,
+		"referencedBy":           len(imageState.Containers),
+		field.ImagePulledAt:      imageState.PulledAt.UTC().Format(time.RFC3339),
+		field.ImageLastUsedAt:    imageState.LastUsedAt.UTC().Format(time.RFC3339),
+		field.ImagePullSucceeded: imageState.PullSucceeded,
+	}
 }

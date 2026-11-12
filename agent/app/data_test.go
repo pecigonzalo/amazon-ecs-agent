@@ -18,22 +18,20 @@ package app
 
 import (
 	"context"
-	"io/ioutil"
-	"os"
 	"strconv"
 	"testing"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	"github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/app/factory"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
-
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -77,20 +75,21 @@ var (
 		ImageID: testImageId,
 	}
 
-	testENIAttachment = &eni.ENIAttachment{
-		AttachmentARN:    testAttachmentArn,
-		AttachStatusSent: false,
-		MACAddress:       testMac,
+	testENIAttachment = &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			AttachmentARN:    testAttachmentArn,
+			AttachStatusSent: false,
+		},
+		MACAddress: testMac,
 	}
 )
 
 func TestLoadDataNoPreviousState(t *testing.T) {
 	ctrl, credentialsManager, _, imageManager, _,
-		_, stateManagerFactory, _, execCmdMgr := setup(t)
+		_, stateManagerFactory, _, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 
-	stateManager, dataClient, cleanup := newTestClient(t)
-	defer cleanup()
+	stateManager, dataClient := newTestClient(t)
 
 	cfg := getTestConfig()
 	cfg.Checkpoint = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
@@ -112,19 +111,22 @@ func TestLoadDataNoPreviousState(t *testing.T) {
 		stateManagerFactory:   stateManagerFactory,
 		saveableOptionFactory: factory.NewSaveableOption(),
 	}
+	state := dockerstate.NewTaskEngineState()
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
 
-	_, err := agent.loadData(eventstream.NewEventStream("events", ctx),
-		credentialsManager, dockerstate.NewTaskEngineState(), imageManager, execCmdMgr)
+	_, err := agent.loadData(eventstream.NewEventStream("events", ctx), credentialsManager,
+		state, imageManager, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 	assert.NoError(t, err)
 }
 
 func TestLoadDataLoadFromBoltDB(t *testing.T) {
 	ctrl, credentialsManager, _, imageManager, _,
-		_, stateManagerFactory, _, execCmdMgr := setup(t)
+		_, stateManagerFactory, _, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 
-	_, dataClient, cleanup := newTestClient(t)
-	defer cleanup()
+	_, dataClient := newTestClient(t)
+
 	// Populate boltdb with test data.
 	populateBoltDB(dataClient, t)
 
@@ -143,19 +145,21 @@ func TestLoadDataLoadFromBoltDB(t *testing.T) {
 	}
 
 	state := dockerstate.NewTaskEngineState()
-	s, err := agent.loadData(eventstream.NewEventStream("events", ctx),
-		credentialsManager, state, imageManager, execCmdMgr)
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
+	s, err := agent.loadData(eventstream.NewEventStream("events", ctx), credentialsManager,
+		state, imageManager, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 	assert.NoError(t, err)
 	checkLoadedData(state, s, t)
 }
 
 func TestLoadDataLoadFromStateFile(t *testing.T) {
 	ctrl, credentialsManager, _, imageManager, _,
-		_, stateManagerFactory, _, execCmdMgr := setup(t)
+		_, stateManagerFactory, _, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 
-	stateManager, dataClient, cleanup := newTestClient(t)
-	defer cleanup()
+	stateManager, dataClient := newTestClient(t)
+
 	// Generate a state file with test data.
 	generateStateFile(stateManager, t)
 
@@ -181,8 +185,10 @@ func TestLoadDataLoadFromStateFile(t *testing.T) {
 	}
 
 	state := dockerstate.NewTaskEngineState()
-	s, err := agent.loadData(eventstream.NewEventStream("events", ctx),
-		credentialsManager, state, imageManager, execCmdMgr)
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
+	s, err := agent.loadData(eventstream.NewEventStream("events", ctx), credentialsManager,
+		state, imageManager, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 	assert.NoError(t, err)
 	checkLoadedData(state, s, t)
 
@@ -215,20 +221,18 @@ func checkLoadedData(state dockerstate.TaskEngineState, s *savedData, t *testing
 	assert.Equal(t, testLatestSeqNumberTaskManifest, s.latestTaskManifestSeqNum)
 }
 
-func newTestClient(t *testing.T) (statemanager.StateManager, data.Client, func()) {
-	testDir, err := ioutil.TempDir("", "agent_app_unit_test")
-	require.NoError(t, err)
+func newTestClient(t *testing.T) (statemanager.StateManager, data.Client) {
+	testDir := t.TempDir()
 
 	stateManager, err := statemanager.NewStateManager(&config.Config{DataDir: testDir})
 	require.NoError(t, err)
 
 	dataClient, err := data.NewWithSetup(testDir)
 
-	cleanup := func() {
+	t.Cleanup(func() {
 		require.NoError(t, dataClient.Close())
-		require.NoError(t, os.RemoveAll(testDir))
-	}
-	return stateManager, dataClient, cleanup
+	})
+	return stateManager, dataClient
 }
 
 func generateStateFile(stateManager statemanager.StateManager, t *testing.T) {

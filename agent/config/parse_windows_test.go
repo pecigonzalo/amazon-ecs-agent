@@ -20,14 +20,17 @@ import (
 	"os"
 	"testing"
 
+	"github.com/aws/amazon-ecs-agent/agent/statemanager/dependencies"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sys/windows"
 )
 
 func TestParseGMSACapability(t *testing.T) {
 	os.Setenv("ECS_GMSA_SUPPORTED", "False")
 	defer os.Unsetenv("ECS_GMSA_SUPPORTED")
 
-	assert.False(t, parseGMSACapability())
+	assert.False(t, parseGMSACapability().Enabled())
 }
 
 func TestParseBooleanEnvVar(t *testing.T) {
@@ -49,5 +52,146 @@ func TestParseFSxWindowsFileServerCapability(t *testing.T) {
 	os.Setenv("ECS_FSX_WINDOWS_FILE_SERVER_SUPPORTED", "False")
 	defer os.Unsetenv("ECS_FSX_WINDOWS_FILE_SERVER_SUPPORTED")
 
-	assert.False(t, parseFSxWindowsFileServerCapability())
+	assert.False(t, parseFSxWindowsFileServerCapability().Enabled())
+}
+
+func TestParseFSxWindowsFileServerCapabilityDefault(t *testing.T) {
+	IsWindows2016 = func() (bool, error) {
+		return false, nil
+	}
+
+	assert.True(t, parseFSxWindowsFileServerCapability().Enabled())
+}
+
+func TestParseDomainlessgMSACapabilityFalseOnW2016(t *testing.T) {
+	IsWindows2016 = func() (bool, error) {
+		return true, nil
+	}
+
+	os.Setenv("ECS_GMSA_SUPPORTED", "True")
+	defer os.Unsetenv("ECS_GMSA_SUPPORTED")
+
+	fnQueryDomainlessGmsaPluginSubKeys = func() ([]string, error) {
+		return []string{}, nil
+	}
+
+	assert.False(t, parseGMSADomainlessCapability().Enabled())
+}
+
+func TestParseDomainlessgMSACapabilityFalsePluginNoEnv(t *testing.T) {
+	IsWindows2016 = func() (bool, error) {
+		return false, nil
+	}
+
+	os.Setenv("ECS_GMSA_SUPPORTED", "False")
+	defer os.Unsetenv("ECS_GMSA_SUPPORTED")
+
+	fnQueryDomainlessGmsaPluginSubKeys = func() ([]string, error) {
+		return []string{"{859E1386-BDB4-49E8-85C7-3070B13920E1}"}, nil
+	}
+
+	assert.False(t, parseGMSADomainlessCapability().Enabled())
+}
+
+func TestParseDomainlessgMSACapabilityFalseNoPlugin(t *testing.T) {
+	IsWindows2016 = func() (bool, error) {
+		return false, nil
+	}
+
+	os.Setenv("ECS_GMSA_SUPPORTED", "True")
+	defer os.Unsetenv("ECS_GMSA_SUPPORTED")
+
+	fnQueryDomainlessGmsaPluginSubKeys = func() ([]string, error) {
+		return []string{}, nil
+	}
+
+	assert.False(t, parseGMSADomainlessCapability().Enabled())
+}
+
+func TestParseDomainlessgMSACapabilityTrue(t *testing.T) {
+	IsWindows2016 = func() (bool, error) {
+		return false, nil
+	}
+
+	os.Setenv("ECS_GMSA_SUPPORTED", "True")
+	defer os.Unsetenv("ECS_GMSA_SUPPORTED")
+
+	fnQueryDomainlessGmsaPluginSubKeys = func() ([]string, error) {
+		return []string{"{859E1386-BDB4-49E8-85C7-3070B13920E1}"}, nil
+	}
+
+	assert.True(t, parseGMSADomainlessCapability().Enabled())
+}
+
+func TestParseTaskPidsLimit(t *testing.T) {
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "1")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "10")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "100")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "10000")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "0")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "-1")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "foobar")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+	t.Setenv("ECS_TASK_PIDS_LIMIT", "")
+	assert.Equal(t, 0, parseTaskPidsLimit())
+}
+
+func TestParseTaskPidsLimit_Unset(t *testing.T) {
+	assert.Equal(t, 0, parseTaskPidsLimit())
+}
+
+func TestParsePropagateTaskMemoryLimitCgroupV2(t *testing.T) {
+	testCases := []struct {
+		name     string
+		envValue string
+	}{
+		{"not set", ""},
+		{"set to true", "true"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envValue != "" {
+				t.Setenv(envPropagateTaskMemoryLimitCgroupV2, tc.envValue)
+			}
+			assert.False(t, parsePropagateTaskMemoryLimitCgroupV2().Enabled())
+		})
+	}
+}
+
+func TestGetDetailedOSFamilyWindows(t *testing.T) {
+	// GetDetailedOSFamily should return the same as GetOSFamily on Windows
+	defer func() {
+		winRegistry = dependencies.StdRegistry{}
+		windowsGetVersionFunc = windows.RtlGetVersion
+	}()
+
+	osFamily := GetOSFamily()
+	detailedOSFamily := GetDetailedOSFamily()
+	assert.Equal(t, osFamily, detailedOSFamily)
+}
+
+func TestParseInstanceIPCompatibility(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		envValue                string
+		expectedIPCompatibility ipcompatibility.IPCompatibility
+	}{
+		{"empty value", "", ipcompatibility.IPCompatibility{}},
+		{"ipv4 value", "ipv4", ipcompatibility.IPCompatibility{}},
+		{"ipv6 value", "ipv6", ipcompatibility.IPCompatibility{}},
+		{"invalid value", "invalid", ipcompatibility.IPCompatibility{}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envInstanceIPCompatibility, tc.envValue)
+			assert.Equal(t, tc.expectedIPCompatibility, parseInstanceIPCompatibility())
+		})
+	}
 }

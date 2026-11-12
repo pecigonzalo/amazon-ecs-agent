@@ -1,0 +1,798 @@
+package platform
+
+import (
+	"context"
+	goErr "errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+
+	"github.com/aws/amazon-ecs-agent/ecs-agent/acs/model/ecsacs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ec2"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	loggerfield "github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	netlibdata "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/data"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/appmesh"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/ecscni"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/serviceconnect"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/tasknetworkconfig"
+	utilsnet "github.com/aws/amazon-ecs-agent/ecs-agent/utils/net"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	cnins "github.com/containernetworking/plugins/pkg/ns"
+	"github.com/pkg/errors"
+)
+
+const (
+	MacResource                = "mac"
+	IPv4SubNetCidrBlock        = "network/interfaces/macs/%s/subnet-ipv4-cidr-block"
+	IPv6SubNetCidrBlock        = "network/interfaces/macs/%s/subnet-ipv6-cidr-blocks"
+	PrivateIPv4Address         = "local-ipv4"
+	PrivateIPv6Address         = "ipv6"
+	InstanceIDResource         = "instance-id"
+	DefaultArg                 = "default"
+	NetworkInterfaceDeviceName = "eth1" // device name of the primary network interface in the task network namespace.
+	DaemonInterfaceName        = "eth0" // daemon network interface name in the daemon network namespace.
+)
+
+type managedLinux struct {
+	common
+	client       ec2.EC2MetadataClient
+	nsSetupMutex sync.Mutex // nsSetupMutex serializes concurrent calls to configureDaemonNetNS and StopDaemonNetNS.
+}
+
+// BuildTaskNetworkConfiguration translates network data in task payload sent by ACS
+// into the task network configuration data structure internal to the agent.
+func (m *managedLinux) BuildTaskNetworkConfiguration(
+	taskID string,
+	taskPayload *ecsacs.Task,
+) (*tasknetworkconfig.TaskNetworkConfig, error) {
+	mode := types.NetworkMode(aws.ToString(taskPayload.NetworkMode))
+	var netNSs []*tasknetworkconfig.NetworkNamespace
+	var err error
+	switch mode {
+	case types.NetworkModeAwsvpc:
+		netNSs, err = m.common.buildAWSVPCNetworkNamespaces(taskID, taskPayload, false, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to translate network configuration")
+		}
+		assignTaskInterfaceDeviceNames(netNSs)
+	case types.NetworkModeHost:
+		netNSs, err = m.buildHostNetworkNamespaceConfig(taskID)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create network namespace with host eni")
+		}
+	case "daemon-bridge":
+		netNSs, err = m.buildHostDaemonNamespaceConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create daemon host namespace")
+		}
+	default:
+		return nil, errors.New("invalid network mode: " + string(mode))
+	}
+	return &tasknetworkconfig.TaskNetworkConfig{
+		NetworkNamespaces: netNSs,
+		NetworkMode:       mode,
+	}, nil
+}
+
+func (m *managedLinux) CreateDNSConfig(taskID string,
+	netNS *tasknetworkconfig.NetworkNamespace) error {
+	if netNS.ServiceConnectConfig != nil {
+		return m.createServiceConnectTasksDNSConfig(taskID, netNS)
+	}
+	return m.common.createDNSConfig(taskID, true, netNS)
+}
+
+func (m *managedLinux) createServiceConnectTasksDNSConfig(taskID string,
+	netNS *tasknetworkconfig.NetworkNamespace) error {
+	logger.Info("Creating DNS config for Service Connect tasks", map[string]interface{}{
+		"NetNSPath": netNS.Path,
+		"NetNSName": netNS.Name,
+		"TaskID":    taskID,
+	})
+
+	primaryIF := netNS.GetPrimaryInterface()
+	if primaryIF == nil {
+		return errors.New("unable to find primary interface")
+	}
+
+	// Create the dns configuration file directory.
+	netNSName := netNS.Name
+	netNSDir := filepath.Join(networkConfigFileDirectory, netNSName)
+	_, err := m.os.Stat(netNSDir)
+	if err != nil && m.os.IsNotExist(err) {
+		err = m.os.MkdirAll(
+			filepath.Join(networkConfigFileDirectory, netNSName),
+			networkConfigFileMode)
+	}
+	if err != nil {
+		return errors.Wrap(err, "unable to create the dns config directory")
+	}
+
+	// Create the hostname file.
+	err = m.createHostnameFileForNetNS(netNSName, primaryIF)
+	if err != nil {
+		return errors.Wrap(err, "unable to create hostname file for netns")
+	}
+	err = m.createHostnameFileForDefaultNetNS()
+	if err != nil {
+		return errors.Wrap(err, "unable to verify the existence of /etc/hostname on the host")
+	}
+
+	// Create the hosts file based on the primary interface information.
+	err = m.createHostsFile(netNSName, primaryIF)
+	if err != nil {
+		return errors.Wrap(err, "unable to create hosts file for netns")
+	}
+
+	// Create the resolv.conf file.
+	// For service connect tasks on ECS managed instances, we should use resolv.conf from the host
+	// and Control Plane won't send down the dns server information.
+	if err := m.createResolvConf(netNSDir, primaryIF); err != nil {
+		return err
+	}
+
+	// Copy these files into a task volume, which can be used by containers as well, to
+	// configure their network.
+	if err := m.copyNetworkConfigFilesToTask(taskID, netNSName); err != nil {
+		return err
+	}
+
+	return m.populateHostsFromFile(netNS)
+}
+
+// assignTaskInterfaceDeviceNames gives every interface in each awsvpc network
+// namespace a unique device name. The CNI plugins rename the interface inside
+// the netns to this name, so duplicate names in a shared netns fail the rename
+// with EEXIST. Names derive from the interface's 1-based position in the
+// index-sorted NetworkInterfaces slice rather than from the ACS index itself,
+// so the primary (lowest index) interface is always eth1 (the name relied on
+// by TMDS, task network stats, and fault injection) and secondaries observe
+// the same eth2, eth3, ... sequence as on Fargate regardless of gaps in ACS
+// index values.
+func assignTaskInterfaceDeviceNames(netNSs []*tasknetworkconfig.NetworkNamespace) {
+	for _, netNS := range netNSs {
+		for i, iface := range netNS.NetworkInterfaces {
+			iface.DeviceName = fmt.Sprintf("eth%d", i+1)
+		}
+	}
+}
+
+func (m *managedLinux) ConfigureInterface(
+	ctx context.Context,
+	netNSPath string,
+	iface *networkinterface.NetworkInterface,
+	netDAO netlibdata.NetworkDataClient,
+) error {
+	// The interface arrives with the device name assigned at model-build time
+	// and persisted in the state DB, which keeps setup and cleanup symmetric
+	// across agent restarts.
+	return m.configureInterface(ctx, netNSPath, iface, netDAO)
+}
+
+func (m *managedLinux) configureInterface(
+	ctx context.Context,
+	netNSPath string,
+	iface *networkinterface.NetworkInterface,
+	netDAO netlibdata.NetworkDataClient,
+) error {
+	var err error
+	switch iface.InterfaceAssociationProtocol {
+	case networkinterface.DefaultInterfaceAssociationProtocol:
+		err = m.configureRegularENI(ctx, netNSPath, iface)
+	case networkinterface.VLANInterfaceAssociationProtocol:
+		err = m.configureBranchENI(ctx, netNSPath, iface)
+	case networkinterface.V2NInterfaceAssociationProtocol:
+		err = m.common.configureGENEVEInterface(ctx, netNSPath, iface, netDAO)
+	case networkinterface.VETHInterfaceAssociationProtocol:
+		// Do nothing.
+		return nil
+	default:
+		err = errors.New("invalid interface association protocol " + iface.InterfaceAssociationProtocol)
+	}
+	return err
+}
+
+func (m *managedLinux) configureRegularENI(ctx context.Context, netNSPath string, eni *networkinterface.NetworkInterface) error {
+	logger.Info("Configuring regular ENI", map[string]interface{}{
+		"ENIName":   eni.Name,
+		"NetNSPath": netNSPath,
+	})
+
+	var cniNetConf []ecscni.PluginConfig
+	var add bool
+	var err error
+
+	m.common.os.Setenv(CNIPluginLogFileEnv, ecscni.PluginLogPath)
+	m.common.os.Setenv(IPAMDataPathEnv, filepath.Join(m.common.stateDBDir, IPAMDataFileName))
+
+	ipComp := ipcompatibility.NewIPCompatibility(len(eni.IPV4Addresses) > 0, len(eni.IPV6Addresses) > 0)
+
+	switch eni.DesiredStatus {
+	case status.NetworkReadyPull:
+		// The task metadata interface setup by bridge plugin is required only for the primary ENI.
+		if eni.IsPrimary() {
+			cniNetConf = append(cniNetConf, m.createBridgePluginConfig(netNSPath, ipComp))
+		}
+		cniNetConf = append(cniNetConf, m.regularENIConfig(netNSPath, eni))
+		add = true
+	case status.NetworkDeleted:
+		if eni.IsPrimary() {
+			cniNetConf = append(cniNetConf, m.createBridgePluginConfig(netNSPath, ipComp))
+		}
+		cniNetConf = append(cniNetConf, m.regularENIConfig(netNSPath, eni))
+		add = false
+	}
+
+	_, err = m.common.executeCNIPlugin(ctx, add, cniNetConf...)
+	if err != nil {
+		err = errors.Wrap(err, "failed to setup regular eni")
+	}
+
+	return err
+}
+
+// configureBranchENI configures a network interface for a branch ENI.
+func (m *managedLinux) configureBranchENI(ctx context.Context, netNSPath string, eni *networkinterface.NetworkInterface) error {
+	logger.Info("Configuring branch ENI", map[string]interface{}{
+		"ENIName":   eni.Name,
+		"NetNSPath": netNSPath,
+	})
+
+	// Set the path for the IPAM CNI local db to track assigned IPs.
+	// Default path is /data but in some linux distros (i.e.Amazon BottleRocket) the root volume is read-only.
+	m.common.os.Setenv(IPAMDataPathEnv, filepath.Join(m.common.stateDBDir, IPAMDataFileName))
+
+	var cniNetConf []ecscni.PluginConfig
+	var err error
+	add := true
+	ipComp := ipcompatibility.NewIPCompatibility(len(eni.IPV4Addresses) > 0, len(eni.IPV6Addresses) > 0)
+
+	// Generate CNI network configuration based on the ENI's desired state.
+	switch eni.DesiredStatus {
+	case status.NetworkReadyPull:
+		// Setup bridge to connect task network namespace to TMDS running in host's primary netns.
+		if eni.IsPrimary() {
+			cniNetConf = append(cniNetConf, m.createBridgePluginConfig(netNSPath, ipComp))
+		}
+		cniNetConf = append(cniNetConf, m.branchENIConfig(netNSPath, eni))
+	case status.NetworkDeleted:
+		if eni.IsPrimary() {
+			cniNetConf = append(cniNetConf, m.createBridgePluginConfig(netNSPath, ipComp))
+		}
+		cniNetConf = append(cniNetConf, m.branchENIConfig(netNSPath, eni))
+		add = false
+	}
+
+	_, err = m.common.executeCNIPlugin(ctx, add, cniNetConf...)
+	if err != nil {
+		err = errors.Wrap(err, "failed to setup branch eni")
+	}
+
+	return err
+}
+
+// regularENIConfig builds the ecs-eni plugin configuration for the ENI,
+// withholding the default gateway from non-primary interfaces.
+func (m *managedLinux) regularENIConfig(netNSPath string, eni *networkinterface.NetworkInterface) ecscni.PluginConfig {
+	eniConfig := createENIPluginConfigs(netNSPath, eni)
+	if !eni.IsPrimary() {
+		eniConfig.(*ecscni.ENIConfig).GatewayIPAddresses = []string{}
+	}
+	return eniConfig
+}
+
+// branchENIConfig builds the vpc-branch-eni plugin configuration for the ENI.
+// Non-primary interfaces get neither a default gateway nor an IMDS block.
+//
+// A default route may exist only for the primary interface of a netns:
+// installing one per interface in a shared netns fails with EEXIST and would
+// make routing for the primary's responsibilities (image pull, logs, TMDS)
+// ambiguous. Non-primary interfaces keep their IP addresses and are brought
+// up, so workloads can install their own routes.
+//
+// IMDS is blocked with blackhole routes for 169.254.169.254/32 and
+// fd00:ec2::254/128. Routes belong to the netns, not to an interface, so the
+// routes installed while configuring the primary interface already block IMDS
+// for every interface sharing that netns. Asking the plugin to block IMDS
+// again for a non-primary interface makes it add the same routes a second
+// time, which fails with EEXIST and aborts the task's network setup.
+func (m *managedLinux) branchENIConfig(netNSPath string, eni *networkinterface.NetworkInterface) ecscni.PluginConfig {
+	blockIMDS := blockInstanceMetadataDefault && eni.IsPrimary()
+	branchConfig := createBranchENIConfig(netNSPath, eni, VPCBranchENIInterfaceTypeVlan, blockIMDS)
+	if !eni.IsPrimary() {
+		branchConfig.(*ecscni.VPCBranchENIConfig).GatewayIPAddresses = []string{}
+	}
+	return branchConfig
+}
+
+func (m *managedLinux) ConfigureAppMesh(ctx context.Context,
+	netNSPath string,
+	cfg *appmesh.AppMesh) error {
+	return m.common.configureAppMesh(ctx, netNSPath, cfg)
+}
+
+func (m *managedLinux) ConfigureServiceConnect(
+	ctx context.Context,
+	netNSPath string,
+	primaryIf *networkinterface.NetworkInterface,
+	scConfig *serviceconnect.ServiceConnectConfig,
+) error {
+	return m.common.configureServiceConnect(ctx, netNSPath, primaryIf, scConfig)
+}
+
+// buildHostNetworkNamespaceConfig return default network namespace of host ENI for host mode.
+func (m *managedLinux) buildHostNetworkNamespaceConfig(taskID string) ([]*tasknetworkconfig.NetworkNamespace, error) {
+	macAddress, err1 := m.client.GetMetadata(MacResource)
+	ec2ID, err2 := m.client.GetMetadata(InstanceIDResource)
+	macToNames, err3 := m.common.interfacesMACToName()
+	if err := goErr.Join(err1, err2, err3); err != nil {
+		logger.Error("Error fetching fields for default ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	hostENI := &ecsacs.ElasticNetworkInterface{
+		AttachmentArn:                aws.String("arn"),
+		Ec2Id:                        aws.String(ec2ID),
+		MacAddress:                   aws.String(macAddress),
+		DomainNameServers:            []*string{},
+		DomainName:                   []*string{},
+		PrivateDnsName:               aws.String(DefaultArg),
+		InterfaceAssociationProtocol: aws.String(DefaultArg),
+		Index:                        aws.Int64(64),
+	}
+
+	ipComp, err := utilsnet.DetermineIPCompatibility(m.netlink, macAddress)
+	if err != nil {
+		logger.Error("Failed to determine IP compatibility of host ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	if !ipComp.IsIPv4Compatible() && !ipComp.IsIPv6Compatible() {
+		return nil, errors.New("Failed to build the default network namespace because the host ENI is neither " +
+			"IPv4 enabled nor IPv6 enabled")
+	}
+
+	if ipComp.IsIPv6Compatible() {
+		privateIpv6, err1 := m.client.GetMetadata(PrivateIPv6Address)
+		ipv6SubNet, err2 := m.client.GetMetadata(fmt.Sprintf(IPv6SubNetCidrBlock, macAddress))
+		if err := goErr.Join(err1, err2); err != nil {
+			logger.Error("Error fetching IPv6 fields for default ENI", logger.Fields{
+				loggerfield.Error: err,
+			})
+			return nil, err
+		}
+
+		hostENI.Ipv6Addresses = []*ecsacs.IPv6AddressAssignment{
+			{
+				Primary: aws.Bool(true),
+				Address: aws.String(privateIpv6),
+			},
+		}
+		hostENI.SubnetGatewayIpv6Address = aws.String(ipv6SubNet)
+	}
+
+	if ipComp.IsIPv4Compatible() {
+		privateIpv4, err1 := m.client.GetMetadata(PrivateIPv4Address)
+		ipv4SubNet, err2 := m.client.GetMetadata(fmt.Sprintf(IPv4SubNetCidrBlock, macAddress))
+		if err := goErr.Join(err1, err2); err != nil {
+			logger.Error("Error fetching IPv4 fields for default ENI", logger.Fields{
+				loggerfield.Error: err,
+			})
+			return nil, err
+		}
+
+		hostENI.Ipv4Addresses = []*ecsacs.IPv4AddressAssignment{
+			{
+				Primary:        aws.Bool(true),
+				PrivateAddress: aws.String(privateIpv4),
+			},
+		}
+		hostENI.SubnetGatewayIpv4Address = aws.String(ipv4SubNet)
+	}
+
+	netNSName := networkinterface.NetNSName(taskID, DefaultArg)
+	netInt, err := networkinterface.New(hostENI, DefaultArg, nil, macToNames)
+	if err != nil {
+		logger.Error("Failed to create the network interface", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	netInt.Default = true
+	netInt.DesiredStatus = status.NetworkReady
+	netInt.KnownStatus = status.NetworkReady
+	defaultNameSpace, err := tasknetworkconfig.NewNetworkNamespace(netNSName, "", 0, nil, netInt)
+	if err != nil {
+		logger.Error("Error building default network namespace for host mode", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+	defaultNameSpace = defaultNameSpace.WithNetworkMode(types.NetworkModeHost)
+	defaultNameSpace.KnownState = status.NetworkReady
+	defaultNameSpace.DesiredState = status.NetworkReady
+	return []*tasknetworkconfig.NetworkNamespace{defaultNameSpace}, nil
+}
+
+// HandleHostMode is a no op because Host Mode does not require network interface configuration. No need to invoke CNI plugins.
+func (m *managedLinux) HandleHostMode() error {
+	return nil
+}
+
+func (m *managedLinux) buildHostDaemonNamespaceConfig() ([]*tasknetworkconfig.NetworkNamespace, error) {
+	macAddress, err1 := m.client.GetMetadata(MacResource)
+	ec2ID, err2 := m.client.GetMetadata(InstanceIDResource)
+	macToNames, err3 := m.common.interfacesMACToName()
+	if err := goErr.Join(err1, err2, err3); err != nil {
+		logger.Error("Error fetching fields for default ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	hostENI := &ecsacs.ElasticNetworkInterface{
+		AttachmentArn:                aws.String("arn"),
+		Ec2Id:                        aws.String(ec2ID),
+		MacAddress:                   aws.String(macAddress),
+		DomainNameServers:            []*string{},
+		DomainName:                   []*string{},
+		PrivateDnsName:               aws.String(DefaultArg),
+		InterfaceAssociationProtocol: aws.String(DefaultArg),
+		Index:                        aws.Int64(64),
+	}
+
+	ipComp, err := utilsnet.DetermineIPCompatibility(m.netlink, macAddress)
+	if err != nil {
+		logger.Error("Failed to determine IP compatibility of host ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	if !ipComp.IsIPv4Compatible() && !ipComp.IsIPv6Compatible() {
+		return nil, errors.New("Failed to build the default network namespace because the host ENI is neither IPv4 enabled nor IPv6 enabled")
+	}
+
+	if err := m.configureIPv4ForHostENI(hostENI, macAddress, ipComp); err != nil {
+		return nil, err
+	}
+
+	if err := m.configureIPv6ForHostENI(hostENI, macAddress, ipComp); err != nil {
+		return nil, err
+	}
+
+	return m.createDaemonNetworkNamespace(hostENI, macToNames)
+}
+
+// configureIPv4ForHostENI configures IPv4 settings for the host ENI
+func (m *managedLinux) configureIPv4ForHostENI(hostENI *ecsacs.ElasticNetworkInterface, macAddress string, ipComp ipcompatibility.IPCompatibility) error {
+	if !ipComp.IsIPv4Compatible() {
+		return nil
+	}
+
+	privateIpv4, err1 := m.client.GetMetadata(PrivateIPv4Address)
+	ipv4SubNet, err2 := m.client.GetMetadata(fmt.Sprintf(IPv4SubNetCidrBlock, macAddress))
+	if err := goErr.Join(err1, err2); err != nil {
+		logger.Error("Error fetching IPv4 fields for default ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return err
+	}
+
+	hostENI.Ipv4Addresses = []*ecsacs.IPv4AddressAssignment{
+		{
+			Primary:        aws.Bool(true),
+			PrivateAddress: aws.String(privateIpv4),
+		},
+	}
+	hostENI.SubnetGatewayIpv4Address = aws.String(ipv4SubNet)
+	return nil
+}
+
+// configureIPv6ForHostENI configures IPv6 settings for the host ENI
+func (m *managedLinux) configureIPv6ForHostENI(hostENI *ecsacs.ElasticNetworkInterface, macAddress string, ipComp ipcompatibility.IPCompatibility) error {
+	if !ipComp.IsIPv6Compatible() {
+		return nil
+	}
+
+	privateIpv6, err1 := m.client.GetMetadata(PrivateIPv6Address)
+	ipv6SubNet, err2 := m.client.GetMetadata(fmt.Sprintf(IPv6SubNetCidrBlock, macAddress))
+	if err := goErr.Join(err1, err2); err != nil {
+		logger.Error("Error fetching IPv6 fields for default ENI", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return err
+	}
+
+	hostENI.Ipv6Addresses = []*ecsacs.IPv6AddressAssignment{
+		{
+			Primary: aws.Bool(true),
+			Address: aws.String(privateIpv6),
+		},
+	}
+	hostENI.SubnetGatewayIpv6Address = aws.String(ipv6SubNet)
+	return nil
+}
+
+// createDaemonNetworkNamespace creates the final network namespace
+func (m *managedLinux) createDaemonNetworkNamespace(hostENI *ecsacs.ElasticNetworkInterface, macToNames map[string]string) ([]*tasknetworkconfig.NetworkNamespace, error) {
+	netNSName := "host-daemon"
+	netNSPath := m.common.GetNetNSPath(netNSName)
+	netInt, err := networkinterface.New(hostENI, DefaultArg, nil, macToNames)
+	if err != nil {
+		logger.Error("Failed to create the network interface", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	netInt.Default = true
+	netInt.DesiredStatus = status.NetworkReadyPull
+	netInt.KnownStatus = status.NetworkNone
+
+	daemonNamespace, err := tasknetworkconfig.NewNetworkNamespace(netNSName, netNSPath, 0, nil, netInt)
+	if err != nil {
+		logger.Error("Error building default network namespace for daemon-bridge mode", logger.Fields{
+			loggerfield.Error: err,
+		})
+		return nil, err
+	}
+
+	daemonNamespace = daemonNamespace.WithNetworkMode("daemon-bridge")
+	daemonNamespace.KnownState = status.NetworkNone
+	daemonNamespace.DesiredState = status.NetworkReadyPull
+
+	return []*tasknetworkconfig.NetworkNamespace{daemonNamespace}, nil
+}
+
+func (m *managedLinux) configureDaemonNetNS(ctx context.Context, taskID string, netNS *tasknetworkconfig.NetworkNamespace) error {
+	var err error
+	if netNS.DesiredState == status.NetworkDeleted {
+		return errors.New("invalid transition state encountered: " + netNS.DesiredState.String())
+	}
+	if netNS.KnownState == status.NetworkNone &&
+		netNS.DesiredState == status.NetworkReadyPull {
+
+		logger.Debug("Creating daemon netns: " + netNS.Path)
+
+		// Serialize the entire namespace setup to prevent concurrent goroutines from
+		// racing on CreateNetNS, isDaemonNamespaceConfigured, and CNI plugin execution.
+		m.nsSetupMutex.Lock()
+		defer m.nsSetupMutex.Unlock()
+
+		// Create network namespace on the host.
+		err = m.CreateNetNS(netNS.Path)
+		if err != nil {
+			return err
+		}
+
+		logger.Debug("Creating DNS config files for daemon NS")
+
+		// Create necessary DNS config files for the netns.
+		err = m.CreateDNSConfig(taskID, netNS)
+		if err != nil {
+			return err
+		}
+
+		// Create MI-Bridge for daemon-bridge mode only if not already configured.
+		if !m.isDaemonNamespaceConfigured(netNS.Path) {
+			// Determine IP compatibility from the primary network interface
+			ipComp := m.getIPCompatibilityFromNetNS(netNS)
+
+			// Set environment variables for CNI plugins
+			m.common.os.Setenv(CNIPluginLogFileEnv, ecscni.PluginLogPath)
+			m.common.os.Setenv(IPAMDataPathEnv, filepath.Join(m.common.stateDBDir, IPAMDataFileName))
+
+			// Create daemon bridge config with IP compatibility
+			bridgeConfig, err := createDaemonBridgePluginConfig(netNS.Path, ipComp)
+			if err != nil {
+				return errors.Wrap(err, "failed to create daemon bridge plugin config")
+			}
+
+			var cniNetConf []ecscni.PluginConfig
+			cniNetConf = append(cniNetConf, bridgeConfig)
+
+			_, err = m.common.executeCNIPlugin(ctx, true, cniNetConf...)
+			if err != nil {
+				return errors.Wrap(err, "failed to setup daemon network namespace bridge")
+			}
+
+			// Add NAT masquerade rule for external connectivity
+			err = m.addDaemonBridgeNATRule(ipComp)
+			if err != nil {
+				logger.Warn("Failed to add NAT rule for daemon-bridge", logger.Fields{
+					loggerfield.Error: err,
+				})
+			}
+		} else {
+			logger.Info("Daemon namespace already configured, skipping CNI plugin setup")
+		}
+	}
+	return nil
+}
+
+// ConfigureDaemonNetNS will create a network namespace using the host ENI and host dns configuration.
+// It will contain a loopback interface and a bridge to the internal ECS subnet.
+func (m *managedLinux) ConfigureDaemonNetNS(netNS *tasknetworkconfig.NetworkNamespace) error {
+	return m.configureDaemonNetNS(context.Background(), netNS.Path, netNS)
+}
+
+// addDaemonBridgeNATRule adds iptables/ip6tables MASQUERADE rules for daemon-bridge external connectivity
+func (m *managedLinux) addDaemonBridgeNATRule(ipComp ipcompatibility.IPCompatibility) error {
+	if err := enableSystemSettings(ipComp); err != nil {
+		return err
+	}
+
+	// Setup IPv4 NAT rule if IPv4 compatible
+	if ipComp.IsIPv4Compatible() {
+		// Check if IPv4 rule already exists
+		getIPv4Args := func() []string { return getDaemonNATArgs(DaemonBridgeIP, ECSSubNet) }
+		err := modifyNetfilterEntry(iptablesTableNat, iptablesCheck, getIPv4Args, false)
+		if err != nil {
+			// Rule doesn't exist, add it
+			if err := modifyNetfilterEntry(iptablesTableNat, iptablesAppend, getIPv4Args, false); err != nil {
+				return fmt.Errorf("failed to add IPv4 NAT rule: %w", err)
+			}
+			logger.Info("IPv4 NAT rule added for daemon-bridge")
+		} else {
+			logger.Info("IPv4 NAT rule already exists for daemon-bridge")
+		}
+	}
+
+	// Setup IPv6 NAT rule if IPv6 compatible
+	if ipComp.IsIPv6Compatible() {
+		// Check if IPv6 rule already exists
+		getIPv6Args := func() []string { return getDaemonNATArgs(DaemonBridgeIPv6, ECSSubNetIPv6) }
+		err := modifyNetfilterEntry(iptablesTableNat, iptablesCheck, getIPv6Args, true)
+		if err != nil {
+			// Rule doesn't exist, add it
+			if err := modifyNetfilterEntry(iptablesTableNat, iptablesAppend, getIPv6Args, true); err != nil {
+				return fmt.Errorf("failed to add IPv6 NAT rule: %w", err)
+			}
+			logger.Info("IPv6 NAT rule added for daemon-bridge")
+		} else {
+			logger.Info("IPv6 NAT rule already exists for daemon-bridge")
+		}
+	}
+
+	// Grant the daemon namespace access to the introspection server. The baseline
+	// DROP is installed at agent startup (SetupIntrospectionFirewall); the ACCEPT
+	// is added here, only now that a daemon bridge exists and the daemon owns
+	// DaemonBridgeIP, so an awsvpc task can never satisfy it.
+	if err := allowDaemonIntrospection(ipComp.IsIPv6Compatible()); err != nil {
+		return fmt.Errorf("failed to allow daemon introspection access: %w", err)
+	}
+
+	return nil
+}
+
+// getIPCompatibilityFromNetNS determines IP compatibility from the network namespace's primary interface.
+// It checks if the primary interface has IPv4 and/or IPv6 addresses configured.
+func (m *managedLinux) getIPCompatibilityFromNetNS(netNS *tasknetworkconfig.NetworkNamespace) ipcompatibility.IPCompatibility {
+	primaryIface := netNS.GetPrimaryInterface()
+	if primaryIface == nil {
+		// Default to IPv4 only if no primary interface found
+		return ipcompatibility.NewIPv4OnlyCompatibility()
+	}
+
+	hasIPv4 := len(primaryIface.IPV4Addresses) > 0
+	hasIPv6 := len(primaryIface.IPV6Addresses) > 0
+
+	return ipcompatibility.NewIPCompatibility(hasIPv4, hasIPv6)
+}
+
+// StopDaemonNetNS stops and cleans up a daemon network namespace.
+func (m *managedLinux) StopDaemonNetNS(ctx context.Context, netNS *tasknetworkconfig.NetworkNamespace) error {
+	logger.Info("Starting StopDaemonNetNS", logger.Fields{
+		"netNSPath":  netNS.Path,
+		"knownState": netNS.KnownState,
+	})
+
+	// Serialize with configureDaemonNetNS to prevent teardown from racing with setup.
+	m.nsSetupMutex.Lock()
+	defer m.nsSetupMutex.Unlock()
+
+	// Cleanup bridge config (veth pair).
+	// Use the actual IP compatibility from the network namespace so that the CNI DEL
+	// config includes both IPv4 and IPv6 IPAM entries. Using IPv4-only here would leave
+	// stale IPv6 IPAM allocations in the database on dual-stack hosts.
+	ipComp := m.getIPCompatibilityFromNetNS(netNS)
+	bridgeConfig, err := createDaemonBridgePluginConfig(netNS.Path, ipComp)
+	if err != nil {
+		err = errors.Wrap(err, "failed to create daemon bridge plugin config to stop daemon netns")
+		logger.Error("StopDaemonNetNS failed", logger.Fields{
+			"netNSPath":       netNS.Path,
+			loggerfield.Error: err,
+		})
+		return err
+	}
+
+	// Remove the daemon-namespace introspection ACCEPT rule added in
+	// addDaemonBridgeNATRule, once per family that was set up. Each family is
+	// attempted independently so a failure on one still cleans up the other.
+	// Best-effort: a removal failure only leaves a stale allow rule (which matches
+	// nothing once the daemon's fixed address is gone), so log and continue rather
+	// than failing teardown.
+	//
+	// This runs BEFORE the CNI DEL below: the DEL releases the daemon's fixed
+	// addresses (DaemonBridgeIP / DaemonBridgeIPv6) back to the shared bridge
+	// IPAM, where a subsequent awsvpc task could be assigned one. Removing the
+	// ACCEPT rules first ensures those addresses are never simultaneously
+	// reallocatable and still allowed.
+	removeIntrospectionAllow := func(useIPv6 bool) {
+		if err := disallowDaemonIntrospection(useIPv6); err != nil {
+			logger.Warn("Failed to remove daemon introspection access rule", logger.Fields{
+				"ipv6":            useIPv6,
+				loggerfield.Error: err,
+			})
+		}
+	}
+	removeIntrospectionAllow(false)
+	if ipComp.IsIPv6Compatible() {
+		removeIntrospectionAllow(true)
+	}
+
+	var cniNetConf []ecscni.PluginConfig
+	cniNetConf = append(cniNetConf, bridgeConfig)
+	add := false
+
+	_, err = m.common.executeCNIPlugin(ctx, add, cniNetConf...)
+	if err != nil {
+		err = errors.Wrap(err, "failed to stop daemon network namespace bridge")
+		logger.Error("StopDaemonNetNS failed", logger.Fields{
+			"netNSPath":       netNS.Path,
+			loggerfield.Error: err,
+		})
+	} else {
+		logger.Info("StopDaemonNetNS completed successfully", logger.Fields{
+			"netNSPath": netNS.Path,
+		})
+	}
+
+	// NOTE: The daemon network namespace is intentionally not deleted here.
+	// Daemons are considered infrastructure on managed instances, which follow the
+	// "immutable infrastructure" pattern. The namespace persists for the instance
+	// lifetime and is cleaned up on instance termination.
+
+	return err
+}
+
+// isDaemonNamespaceConfigured checks if the daemon namespace is already properly configured
+// by verifying that the veth interface exists in the daemon network namespace.
+func (m *managedLinux) isDaemonNamespaceConfigured(netNSPath string) bool {
+	var configured bool
+
+	// Execute within the network namespace to check interfaces
+	err := m.nsUtil.ExecInNSPath(netNSPath, func(_ cnins.NetNS) error {
+		// Check if eth0 veth interface exists in daemon namespace
+		link, err := m.netlink.LinkByName(DaemonInterfaceName)
+		if err != nil {
+			return errors.New("eth0 interface not found in daemon namespace")
+		}
+
+		// Verify it's a veth interface
+		if link.Type() != VethInterfaceType {
+			return errors.New("eth0 is not a veth interface")
+		}
+
+		configured = true
+		return nil
+	})
+
+	if err != nil || !configured {
+		return false
+	}
+
+	return true
+}

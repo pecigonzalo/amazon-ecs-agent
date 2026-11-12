@@ -15,20 +15,23 @@ package stats
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/stats/resolver"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	loggerfield "github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
 	"github.com/cihub/seelog"
+	"github.com/pkg/errors"
 )
 
-func newStatsContainer(dockerID string, client dockerapi.DockerClient, resolver resolver.ContainerMetadataResolver,
-	cfg *config.Config) (*StatsContainer, error) {
+func newStatsContainer(dockerID string, client dockerapi.DockerClient, resolver resolver.ContainerMetadataResolver, cfg *config.Config, dataClient data.Client) (*StatsContainer, error) {
 	dockerContainer, err := resolver.ResolveContainer(dockerID)
 	if err != nil {
 		return nil, err
@@ -39,12 +42,15 @@ func newStatsContainer(dockerID string, client dockerapi.DockerClient, resolver 
 			DockerID:    dockerID,
 			Name:        dockerContainer.Container.Name,
 			NetworkMode: dockerContainer.Container.GetNetworkMode(),
+			StartedAt:   dockerContainer.Container.GetStartedAt(),
 		},
-		ctx:      ctx,
-		cancel:   cancel,
-		client:   client,
-		resolver: resolver,
-		config:   cfg,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		client:                 client,
+		resolver:               resolver,
+		config:                 cfg,
+		restartAggregationData: dockerContainer.Container.GetRestartAggregationDataForStats(),
+		dataClient:             dataClient,
 	}, nil
 }
 
@@ -71,14 +77,19 @@ func (container *StatsContainer) collect() {
 	backoff := retry.NewExponentialBackoff(time.Second*1, time.Second*10, 0.5, 2)
 	for {
 		err := container.processStatsStream()
+
 		select {
 		case <-container.ctx.Done():
-			seelog.Infof("Container [%s]: Stopping stats collection", dockerID)
+			logger.Info("Stopping container stats collection", logger.Fields{"runtimeID": dockerID})
 			return
 		default:
 			if err != nil {
 				d := backoff.Duration()
-				seelog.Debugf("Container [%s]: Error processing stats stream of container, backing off %s before reopening", dockerID, d)
+				logger.Debug(fmt.Sprintf(
+					"Error processing stats stream of container, backing off %s before reopening", d), logger.Fields{
+					loggerfield.DockerId: dockerID,
+					loggerfield.Error:    err,
+				})
 				time.Sleep(d)
 			}
 			// We were disconnected from the stats stream.
@@ -96,12 +107,35 @@ func (container *StatsContainer) collect() {
 				container.StopStatsCollection()
 				return
 			} else if terminal {
-				seelog.Infof("Container [%s]: container is terminal, stopping stats collection", dockerID)
+				logger.Info("Container is terminal, stopping stats collection", logger.Fields{"runtimeID": dockerID})
 				container.StopStatsCollection()
 				return
 			}
 		}
 	}
+}
+
+func (container *StatsContainer) getApiContainer(dockerID string) (*apicontainer.Container, error) {
+	if container.resolver == nil {
+		return nil, fmt.Errorf("Container ID=%s has no stats metadata resolver", dockerID)
+	}
+	dockerContainer, err := container.resolver.ResolveContainer(dockerID)
+	if err != nil {
+		return nil, err
+	}
+	return dockerContainer.Container, nil
+}
+
+func getNonDockerContainerStats(apiContainer *apicontainer.Container) NonDockerContainerStats {
+	nonDockerStats := NonDockerContainerStats{}
+	if apiContainer == nil {
+		return nonDockerStats
+	}
+	if apiContainer.RestartPolicyEnabled() {
+		restartCount := int64(apiContainer.RestartTracker.GetRestartCount())
+		nonDockerStats.restartCount = &restartCount
+	}
+	return nonDockerStats
 }
 
 func (container *StatsContainer) processStatsStream() error {
@@ -111,6 +145,15 @@ func (container *StatsContainer) processStatsStream() error {
 		return errors.New("container processStatsStream: Client is not set.")
 	}
 	dockerStats, errC := container.client.Stats(container.ctx, dockerID, dockerclient.StatsInactivityTimeout)
+
+	apiContainer, err := container.getApiContainer(dockerID)
+	if apiContainer == nil && err != nil {
+		logger.Error("apiContainer is nil - will not be able to get restart stats set or determine "+
+			"if container has restart policy enabled", logger.Fields{
+			loggerfield.DockerId: dockerID,
+			loggerfield.Error:    err,
+		})
+	}
 
 	returnError := false
 	for {
@@ -132,13 +175,32 @@ func (container *StatsContainer) processStatsStream() error {
 				}
 				return nil
 			}
-			err := validateDockerStats(rawStat)
+			containerEnabledRestartPolicy := false // default to false if apiContainer is nil
+			if apiContainer != nil {
+				containerEnabledRestartPolicy = apiContainer.RestartPolicyEnabled()
+			}
+			err := validateDockerStats(rawStat, containerEnabledRestartPolicy)
 			if err != nil {
 				return err
 			}
 
-			if err := container.statsQueue.Add(rawStat); err != nil {
+			isFirstStatAfterContainerRestart := apiContainer != nil && apiContainer.RestartPolicyEnabled() &&
+				container.syncContainerRestartAggregationData()
+			err = container.statsQueue.AddContainerStat(rawStat, getNonDockerContainerStats(apiContainer),
+				&container.restartAggregationData.LastStatBeforeLastRestart, container.hasRestartedBefore())
+			if err != nil {
 				seelog.Warnf("Container [%s]: error converting stats for container: %v", dockerID, err)
+				continue
+			}
+			if isFirstStatAfterContainerRestart {
+				err = container.saveRestartAggregationData(apiContainer)
+				if err != nil {
+					logger.Error("Failed to update container's stats restart aggregation data in database",
+						logger.Fields{
+							loggerfield.DockerId: dockerID,
+							loggerfield.Error:    err,
+						})
+				}
 			}
 		}
 	}
@@ -150,4 +212,45 @@ func (container *StatsContainer) terminal() (bool, error) {
 		return false, err
 	}
 	return dockerContainer.Container.KnownTerminal(), nil
+}
+
+// syncContainerRestartAggregationData updates a container's restart aggregation data if a container restart has been
+// detected. This method returns true if a restart was detected and returns false otherwise.
+func (container *StatsContainer) syncContainerRestartAggregationData() bool {
+	_, dockerContainerData := container.client.DescribeContainer(container.ctx, container.containerMetadata.DockerID)
+	restartDetected := dockerContainerData.StartedAt.Sub(container.containerMetadata.StartedAt) > 0
+	if container.hasRestartedBefore() {
+		restartDetected = dockerContainerData.StartedAt.Sub(container.restartAggregationData.LastRestartDetectedAt) > 0
+	}
+
+	if restartDetected {
+		container.restartAggregationData.LastRestartDetectedAt = time.Now()
+
+		logger.Debug("Received first stat for container after a container restart", logger.Fields{
+			loggerfield.DockerId: container.containerMetadata.DockerID,
+		})
+
+		lastStat := container.statsQueue.GetLastStat()
+		if lastStat != nil {
+			container.restartAggregationData.LastStatBeforeLastRestart = *lastStat
+		}
+	}
+
+	return restartDetected
+}
+
+// saveRestartAggregationData is used to save a container's restart aggregation data in Agent's local state database.
+func (container *StatsContainer) saveRestartAggregationData(apiContainer *apicontainer.Container) error {
+	apiContainer.SetRestartAggregationDataForStats(container.restartAggregationData)
+	err := container.dataClient.SaveContainer(apiContainer)
+	if err != nil {
+		return errors.Wrap(err, "failed to save data for container")
+	}
+
+	return nil
+}
+
+// hasRestartedBefore determines if a container has ever restarted before.
+func (container *StatsContainer) hasRestartedBefore() bool {
+	return !container.restartAggregationData.LastRestartDetectedAt.IsZero()
 }

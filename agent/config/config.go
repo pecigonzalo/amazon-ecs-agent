@@ -23,10 +23,12 @@ import (
 	"strings"
 	"time"
 
-	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
-	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ec2"
+	commonutils "github.com/aws/amazon-ecs-agent/ecs-agent/utils"
+
 	"github.com/cihub/seelog"
 )
 
@@ -43,9 +45,6 @@ const (
 
 	// AgentIntrospectionPort is used to serve the metadata about the agent and to query the tasks being managed by the agent.
 	AgentIntrospectionPort = 51678
-
-	// AgentCredentialsPort is used to serve the credentials for tasks.
-	AgentCredentialsPort = 51679
 
 	// AgentPrometheusExpositionPort is used to expose Prometheus metrics that can be scraped by a Prometheus server
 	AgentPrometheusExpositionPort = 51680
@@ -190,6 +189,9 @@ var (
 
 	// CgroupV2 Specifies whether or not to run in Cgroups V2 mode.
 	CgroupV2 = false
+
+	// isFIPSEnabled indicates whether FIPS mode is enabled on the host
+	isFIPSEnabled = false
 )
 
 // Merge merges two config files, preferring the ones on the left. Any nil or
@@ -207,7 +209,7 @@ func (cfg *Config) Merge(rhs Config) *Config {
 				leftField.Set(reflect.ValueOf(right.Field(i).Interface()))
 			}
 		default:
-			if utils.ZeroOrNil(leftField.Interface()) {
+			if commonutils.ZeroOrNil(leftField.Interface()) {
 				leftField.Set(reflect.ValueOf(right.Field(i).Interface()))
 			}
 		}
@@ -228,6 +230,7 @@ func NewConfig(ec2client ec2.EC2MetadataClient) (*Config, error) {
 		errs = append(errs, err)
 	}
 	config := &envConfig
+	isFIPSEnabled = utils.DetectFIPSMode(utils.FIPSModeFilePath)
 
 	if config.External.Enabled() {
 		if config.AWSRegion == "" {
@@ -269,7 +272,7 @@ func NewConfig(ec2client ec2.EC2MetadataClient) (*Config, error) {
 
 func (config *Config) mergeDefaultConfig(errs []error) error {
 	config.trimWhitespace()
-	config.Merge(DefaultConfig())
+	config.Merge(DefaultConfig(config.InstanceIPCompatibility))
 	err := config.validateAndOverrideBounds()
 	if err != nil {
 		errs = append(errs, err)
@@ -398,7 +401,7 @@ func (cfg *Config) checkMissingAndDepreciated() error {
 	fatalFields := []string{}
 	for i := 0; i < cfgElem.NumField(); i++ {
 		cfgField := cfgElem.Field(i)
-		if utils.ZeroOrNil(cfgField.Interface()) {
+		if commonutils.ZeroOrNil(cfgField.Interface()) {
 			missingTag := cfgStructField.Field(i).Tag.Get("missing")
 			if len(missingTag) == 0 {
 				continue
@@ -432,7 +435,7 @@ func (cfg *Config) complete() bool {
 	cfgElem := reflect.ValueOf(cfg).Elem()
 
 	for i := 0; i < cfgElem.NumField(); i++ {
-		if utils.ZeroOrNil(cfgElem.Field(i).Interface()) {
+		if commonutils.ZeroOrNil(cfgElem.Field(i).Interface()) {
 			return false
 		}
 	}
@@ -467,7 +470,7 @@ func fileConfig() (Config, error) {
 	}
 
 	// Handle any deprecated keys correctly here
-	if utils.ZeroOrNil(cfg.Cluster) && !utils.ZeroOrNil(cfg.ClusterArn) {
+	if commonutils.ZeroOrNil(cfg.Cluster) && !commonutils.ZeroOrNil(cfg.ClusterArn) {
 		cfg.Cluster = cfg.ClusterArn
 	}
 	return cfg, nil
@@ -551,6 +554,7 @@ func environmentConfig() (Config, error) {
 		DeleteNonECSImagesEnabled:           parseBooleanDefaultFalseConfig("ECS_ENABLE_UNTRACKED_IMAGE_CLEANUP"),
 		TaskCPUMemLimit:                     parseBooleanDefaultTrueConfig("ECS_ENABLE_TASK_CPU_MEM_LIMIT"),
 		DockerStopTimeout:                   parseDockerStopTimeout(),
+		ManifestPullTimeout:                 parseManifestPullTimeout(),
 		ContainerStartTimeout:               parseContainerStartTimeout(),
 		ContainerCreateTimeout:              parseContainerCreateTimeout(),
 		DependentContainersPullUpfront:      parseBooleanDefaultFalseConfig("ECS_PULL_DEPENDENT_CONTAINERS_UPFRONT"),
@@ -584,18 +588,25 @@ func environmentConfig() (Config, error) {
 		PollingMetricsWaitDuration:          parseEnvVariableDuration("ECS_POLLING_METRICS_WAIT_DURATION"),
 		DisableDockerHealthCheck:            parseBooleanDefaultFalseConfig("ECS_DISABLE_DOCKER_HEALTH_CHECK"),
 		GPUSupportEnabled:                   utils.ParseBool(os.Getenv("ECS_ENABLE_GPU_SUPPORT"), false),
+		EBSTASupportEnabled:                 utils.ParseBool(os.Getenv("ECS_EBSTA_SUPPORTED"), true),
 		InferentiaSupportEnabled:            utils.ParseBool(os.Getenv("ECS_ENABLE_INF_SUPPORT"), false),
 		NvidiaRuntime:                       os.Getenv("ECS_NVIDIA_RUNTIME"),
 		TaskMetadataAZDisabled:              utils.ParseBool(os.Getenv("ECS_DISABLE_TASK_METADATA_AZ"), false),
 		CgroupCPUPeriod:                     parseCgroupCPUPeriod(),
 		SpotInstanceDrainingEnabled:         parseBooleanDefaultFalseConfig("ECS_ENABLE_SPOT_INSTANCE_DRAINING"),
 		GMSACapable:                         parseGMSACapability(),
+		GMSADomainlessCapable:               parseGMSADomainlessCapability(),
 		VolumePluginCapabilities:            parseVolumePluginCapabilities(),
 		FSxWindowsFileServerCapable:         parseFSxWindowsFileServerCapability(),
 		External:                            parseBooleanDefaultFalseConfig("ECS_EXTERNAL"),
 		EnableRuntimeStats:                  parseBooleanDefaultFalseConfig("ECS_ENABLE_RUNTIME_STATS"),
 		ShouldExcludeIPv6PortBinding:        parseBooleanDefaultTrueConfig("ECS_EXCLUDE_IPV6_PORTBINDING"),
 		WarmPoolsSupport:                    parseBooleanDefaultFalseConfig("ECS_WARM_POOLS_CHECK"),
+		DynamicHostPortRange:                parseDynamicHostPortRange("ECS_DYNAMIC_HOST_PORT_RANGE"),
+		TaskPidsLimit:                       parseTaskPidsLimit(),
+		FirelensAsyncEnabled:                parseBooleanDefaultTrueConfig("ECS_ENABLE_FIRELENS_ASYNC"),
+		InstanceIPCompatibility:             parseInstanceIPCompatibility(),
+		PropagateTaskMemoryLimitCgroupV2:    parsePropagateTaskMemoryLimitCgroupV2(),
 	}, err
 }
 
@@ -623,12 +634,14 @@ func (cfg *Config) String() string {
 			"PollingMetricsWaitDuration: %v, "+
 			"ReservedMem: %v, "+
 			"TaskCleanupWaitDuration: %v, "+
+			"ManifestPullTimeout: %v, "+
 			"DockerStopTimeout: %v, "+
 			"ContainerStartTimeout: %v, "+
 			"ContainerCreateTimeout: %v, "+
 			"DependentContainersPullUpfront: %v, "+
 			"TaskCPUMemLimit: %v, "+
 			"ShouldExcludeIPv6PortBinding: %v, "+
+			"DynamicHostPortRange: %v"+
 			"%s",
 		cfg.Cluster,
 		cfg.AWSRegion,
@@ -641,12 +654,45 @@ func (cfg *Config) String() string {
 		cfg.PollingMetricsWaitDuration,
 		cfg.ReservedMemory,
 		cfg.TaskCleanupWaitDuration,
+		cfg.ManifestPullTimeout,
 		cfg.DockerStopTimeout,
 		cfg.ContainerStartTimeout,
 		cfg.ContainerCreateTimeout,
 		cfg.DependentContainersPullUpfront,
 		cfg.TaskCPUMemLimit,
 		cfg.ShouldExcludeIPv6PortBinding,
+		cfg.DynamicHostPortRange,
 		cfg.platformString(),
 	)
+}
+
+func IsFIPSEnabled() bool {
+	return isFIPSEnabled
+}
+
+// SetFIPSEnabled sets the isFIPSEnabled variable for testing purposes
+// that is used in s3/factory/factory_test.go
+func SetFIPSEnabled(enabled bool) {
+	isFIPSEnabled = enabled
+}
+
+// DetermineIMDSIAMRolesConfig determines whether the agent should use IMDS for task credential retrieval.
+func (cfg *Config) DetermineIMDSIAMRolesConfig(imdsAvailable, previouslyEnabled, hasNonTerminalTasks bool) {
+	defer func() {
+		seelog.Debugf("IMDS IAM roles config resolved: enabled=%t", cfg.IMDSIAMRolesEnabled)
+	}()
+
+	// 1. Do not enable the config option if IMDS is not available on the instance.
+	if !imdsAvailable {
+		return
+	}
+
+	// 2. Do not enable the config option if this agent has been upgraded in-place
+	// with running tasks on the instance, to avoid disruption.
+	if hasNonTerminalTasks && !previouslyEnabled {
+		return
+	}
+
+	// Enable the config option
+	cfg.IMDSIAMRolesEnabled = true
 }

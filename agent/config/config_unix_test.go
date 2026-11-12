@@ -17,24 +17,33 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
-	"github.com/aws/amazon-ecs-agent/agent/ec2"
-	cnitypes "github.com/containernetworking/cni/pkg/types"
+	mock_ec2 "github.com/aws/amazon-ecs-agent/ecs-agent/ec2/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper"
+	mock_netlinkwrapper "github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper/mocks"
+	cniTypes "github.com/containernetworking/cni/pkg/types"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
+
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	ec2testutil "github.com/aws/amazon-ecs-agent/agent/utils/test/ec2util"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 )
 
 func TestConfigDefault(t *testing.T) {
 	defer setTestRegion()()
 	os.Unsetenv("ECS_HOST_DATA_DIR")
 
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	require.NoError(t, err)
 
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.DockerEndpoint, "Default docker endpoint set incorrectly")
@@ -45,6 +54,7 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, 30*time.Second, cfg.DockerStopTimeout, "Default docker stop container timeout set incorrectly")
 	assert.Equal(t, 3*time.Minute, cfg.ContainerStartTimeout, "Default docker start container timeout set incorrectly")
 	assert.Equal(t, 4*time.Minute, cfg.ContainerCreateTimeout, "Default docker create container timeout set incorrectly")
+	assert.Equal(t, 1*time.Minute, cfg.ManifestPullTimeout, "Default manifest pull timeout set incorrectly")
 	assert.False(t, cfg.PrivilegedDisabled.Enabled(), "Default PrivilegedDisabled set incorrectly")
 	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
 		cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
@@ -74,6 +84,10 @@ func TestConfigDefault(t *testing.T) {
 	assert.False(t, cfg.PollMetrics.Enabled(), "ECS_POLL_METRICS default should be false")
 	assert.False(t, cfg.EnableRuntimeStats.Enabled(), "Default EnableRuntimeStats set incorrectly")
 	assert.True(t, cfg.ShouldExcludeIPv6PortBinding.Enabled(), "Default ShouldExcludeIPv6PortBinding set incorrectly")
+	assert.False(t, cfg.FSxWindowsFileServerCapable.Enabled(), "Default FSxWindowsFileServerCapable set incorrectly")
+	assert.Equal(t, "/var/run/ecs/ebs-csi-driver/csi-driver.sock", cfg.CSIDriverSocketPath, "Default CSIDriverSocketPath set incorrectly")
+	assert.Equal(t, 2*time.Second, cfg.NodeStageTimeout, "Default NodeStage timeout set incorrectly")
+	assert.Equal(t, 30*time.Second, cfg.NodeUnstageTimeout, "Default NodeUntage timeout set incorrectly")
 }
 
 // TestConfigFromFile tests the configuration can be read from file
@@ -124,7 +138,7 @@ func TestConfigFromFile(t *testing.T) {
 	assert.Equal(t, testPauseImageName, cfg.PauseContainerImageName, "should read PauseContainerImageName")
 	assert.Equal(t, testPauseTag, cfg.PauseContainerTag, "should read PauseContainerTag")
 	assert.Equal(t, 1, len(cfg.AWSVPCAdditionalLocalRoutes), "should have one additional local route")
-	expectedLocalRoute, err := cnitypes.ParseCIDR("169.254.172.1/32")
+	expectedLocalRoute, err := cniTypes.ParseCIDR("169.254.172.1/32")
 	assert.NoError(t, err)
 	assert.Equal(t, expectedLocalRoute.IP, cfg.AWSVPCAdditionalLocalRoutes[0].IP, "should match expected route IP")
 	assert.Equal(t, expectedLocalRoute.Mask, cfg.AWSVPCAdditionalLocalRoutes[0].Mask, "should match expected route Mask")
@@ -163,7 +177,7 @@ func TestDockerAuthMergeFromFile(t *testing.T) {
 	defer setTestEnv("ECS_AGENT_CONFIG_FILE_PATH", filePath)()
 	defer setTestEnv("AWS_DEFAULT_REGION", "us-west-2")()
 
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	assert.NoError(t, err, "create configuration failed")
 
 	assert.Equal(t, cluster, cfg.Cluster, "cluster name not as expected from environment variable")
@@ -185,13 +199,13 @@ func TestBadFileContent(t *testing.T) {
 	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", filePath)
 	defer os.Unsetenv("ECS_AGENT_CONFIG_FILE_PATH")
 
-	_, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	_, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	assert.Error(t, err, "create configuration should fail")
 }
 
 func TestPrometheusMetricsPlatformOverrides(t *testing.T) {
 	defer setTestRegion()()
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	require.NoError(t, err)
 
 	defer setTestEnv("ECS_ENABLE_PROMETHEUS_METRICS", "true")()
@@ -204,7 +218,7 @@ func TestPrometheusMetricsPlatformOverrides(t *testing.T) {
 func TestENITrunkingEnabled(t *testing.T) {
 	defer setTestRegion()()
 	defer setTestEnv("ECS_ENABLE_TASK_ENI", "true")()
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	require.NoError(t, err)
 
 	cfg.platformOverrides()
@@ -215,7 +229,7 @@ func TestENITrunkingEnabled(t *testing.T) {
 func TestENITrunkingDisabled(t *testing.T) {
 	defer setTestRegion()()
 	defer setTestEnv("ECS_ENABLE_TASK_ENI", "true")()
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	require.NoError(t, err)
 
 	defer setTestEnv("ECS_ENABLE_HIGH_DENSITY_ENI", "false")()
@@ -237,7 +251,7 @@ func setupFileConfiguration(t *testing.T, configContent string) string {
 func TestEmptyNvidiaRuntime(t *testing.T) {
 	defer setTestRegion()()
 	defer setTestEnv("ECS_NVIDIA_RUNTIME", "")()
-	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 	assert.NoError(t, err)
 	assert.Equal(t, DefaultNvidiaRuntime, cfg.NvidiaRuntime, "Wrong value for NvidiaRuntime")
 }
@@ -276,10 +290,217 @@ func TestCPUPeriodSettings(t *testing.T) {
 			defer os.Setenv("ECS_CGROUP_CPU_PERIOD", "100ms")
 
 			os.Setenv("ECS_CGROUP_CPU_PERIOD", c.Env)
-			conf, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+			conf, err := NewConfig(ec2testutil.FakeEC2MetadataClient{})
 
 			assert.NoError(t, err)
 			assert.Equal(t, c.Response, conf.CgroupCPUPeriod, "Wrong value for CgroupCPUPeriod")
+		})
+	}
+}
+
+func TestDetermineIPCompatibility(t *testing.T) {
+	ipv6Gw := net.ParseIP("1:2:3:4::")
+	require.NotNil(t, ipv6Gw)
+	ipv6DefaultRoute := netlink.Route{Gw: ipv6Gw, Dst: nil}
+
+	testCases := []struct {
+		name            string
+		setExpectations func(*mock_ec2.MockEC2MetadataClient, *mock_netlinkwrapper.MockNetLink)
+		expected        ipcompatibility.IPCompatibility
+	}{
+		{
+			name: "IP compatibility determined successfully",
+			setExpectations: func(ec2c *mock_ec2.MockEC2MetadataClient, nl *mock_netlinkwrapper.MockNetLink) {
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return([]netlink.Route{}, nil)
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V6).Return([]netlink.Route{ipv6DefaultRoute}, nil)
+			},
+			expected: ipcompatibility.NewIPCompatibility(false, true),
+		},
+		{
+			name: "IP compatibility could not be determined",
+			setExpectations: func(ec2c *mock_ec2.MockEC2MetadataClient, nl *mock_netlinkwrapper.MockNetLink) {
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return(nil, errors.New("some error"))
+			},
+			expected: ipcompatibility.NewIPv4OnlyCompatibility(),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Init mock
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			imdsClient := mock_ec2.NewMockEC2MetadataClient(ctrl)
+			mockNLWrapper := mock_netlinkwrapper.NewMockNetLink(ctrl)
+
+			// Set up mock netlink wrapper
+			ogNLWrapper := nlWrapper
+			defer func() {
+				nlWrapper = ogNLWrapper
+			}()
+			nlWrapper = mockNLWrapper
+
+			// Set up mock expectations
+			tc.setExpectations(imdsClient, mockNLWrapper)
+
+			// Run the test
+			cfg := Config{}
+			cfg.determineIPCompatibility()
+			assert.Equal(t, tc.expected, cfg.InstanceIPCompatibility)
+		})
+	}
+}
+
+// Tests that IPCompatibility defaults to IPv4-only when determining IP compatibility of
+// the container instance fails due to some error.
+func TestIPCompatibilityFallback(t *testing.T) {
+	defer setTestRegion()()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockEc2Metadata := mock_ec2.NewMockEC2MetadataClient(ctrl)
+	mockNLWrapper := mock_netlinkwrapper.NewMockNetLink(ctrl)
+	defer setMockNLWrapper(mockNLWrapper)()
+
+	mockNLWrapper.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return(nil, assert.AnError)
+	mockEc2Metadata.EXPECT().GetUserData()
+
+	config, err := NewConfig(mockEc2Metadata)
+	assert.NoError(t, err)
+	assert.Equal(t, config.InstanceIPCompatibility.IsIPv4Compatible(), true)
+	assert.Equal(t, config.InstanceIPCompatibility.IsIPv6Compatible(), false)
+}
+
+// setMockNLWrapper is a helper function to set nlWrapper to a mock value.
+// Returns a function that resets nlWrapper to its original value.
+//
+// Usage: defer setMockNLWrapper(mock)()
+func setMockNLWrapper(mock netlinkwrapper.NetLink) func() {
+	original := nlWrapper
+	nlWrapper = mock
+	return func() { nlWrapper = original }
+}
+
+func TestShouldExcludeIPv6PortBindingDefault(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		instanceIPCompatibility ipcompatibility.IPCompatibility
+		expectedExcludeIPv6     BooleanDefaultTrue
+	}{
+		{
+			name:                    "ipv6-only instance",
+			instanceIPCompatibility: ipcompatibility.NewIPv6OnlyCompatibility(),
+			expectedExcludeIPv6:     BooleanDefaultTrue{Value: ExplicitlyDisabled},
+		},
+		{
+			name:                    "dual-stack instance",
+			instanceIPCompatibility: ipcompatibility.NewDualStackCompatibility(),
+			expectedExcludeIPv6:     BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+		{
+			name:                    "ipv4-only instance",
+			instanceIPCompatibility: ipcompatibility.NewIPv4OnlyCompatibility(),
+			expectedExcludeIPv6:     BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+		{
+			name:                    "no ip compatibility",
+			instanceIPCompatibility: ipcompatibility.NewIPCompatibility(false, false),
+			expectedExcludeIPv6:     BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.setIPv6PortBindingDefault(tc.instanceIPCompatibility)
+			assert.Equal(t, tc.expectedExcludeIPv6, cfg.ShouldExcludeIPv6PortBinding)
+		})
+	}
+}
+
+func TestDefaultConfigIPCompatibilityAndExcludeIPv6PortBinding(t *testing.T) {
+	ipv4Gw := net.ParseIP("10.0.0.1")
+	ipv6Gw := net.ParseIP("1:2:3:4::")
+	require.NotNil(t, ipv4Gw)
+	require.NotNil(t, ipv6Gw)
+	ipv4Route := netlink.Route{Gw: ipv4Gw, Dst: nil}
+	ipv6Route := netlink.Route{Gw: ipv6Gw, Dst: nil}
+
+	testCases := []struct {
+		name                     string
+		ipCompatOverride         ipcompatibility.IPCompatibility
+		setNetlinkExpectations   func(*mock_netlinkwrapper.MockNetLink)
+		expectedInstanceIPCompat ipcompatibility.IPCompatibility
+		expectedExcludeIPv6      BooleanDefaultTrue
+	}{
+		{
+			name:                     "Override with IPv4-only",
+			ipCompatOverride:         ipcompatibility.NewIPv4OnlyCompatibility(),
+			expectedInstanceIPCompat: ipcompatibility.NewIPv4OnlyCompatibility(),
+			expectedExcludeIPv6:      BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+		{
+			name:                     "Override with IPv6-only",
+			ipCompatOverride:         ipcompatibility.NewIPv6OnlyCompatibility(),
+			expectedInstanceIPCompat: ipcompatibility.NewIPv6OnlyCompatibility(),
+			expectedExcludeIPv6:      BooleanDefaultTrue{Value: ExplicitlyDisabled},
+		},
+		{
+			name:                     "Override with dual-stack",
+			ipCompatOverride:         ipcompatibility.NewDualStackCompatibility(),
+			expectedInstanceIPCompat: ipcompatibility.NewDualStackCompatibility(),
+			expectedExcludeIPv6:      BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+
+		{
+			name:             "No override - auto-detect IPv4-only",
+			ipCompatOverride: ipcompatibility.IPCompatibility{}, // Zero value triggers auto-detection
+			setNetlinkExpectations: func(nl *mock_netlinkwrapper.MockNetLink) {
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return([]netlink.Route{ipv4Route}, nil)
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V6).Return([]netlink.Route{}, nil)
+			},
+			expectedInstanceIPCompat: ipcompatibility.NewIPv4OnlyCompatibility(),
+			expectedExcludeIPv6:      BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+		{
+			name:             "No override - auto-detect IPv6-only",
+			ipCompatOverride: ipcompatibility.IPCompatibility{}, // Zero value triggers auto-detection
+			setNetlinkExpectations: func(nl *mock_netlinkwrapper.MockNetLink) {
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return([]netlink.Route{}, nil)
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V6).Return([]netlink.Route{ipv6Route}, nil)
+			},
+			expectedInstanceIPCompat: ipcompatibility.NewIPv6OnlyCompatibility(),
+			// IPv6 port bindings included for IPv6-only
+			expectedExcludeIPv6: BooleanDefaultTrue{Value: ExplicitlyDisabled},
+		},
+		{
+			name:             "No override - auto-detect dual-stack",
+			ipCompatOverride: ipcompatibility.IPCompatibility{}, // Zero value triggers auto-detection
+			setNetlinkExpectations: func(nl *mock_netlinkwrapper.MockNetLink) {
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V4).Return([]netlink.Route{ipv4Route}, nil)
+				nl.EXPECT().RouteList(nil, netlink.FAMILY_V6).Return([]netlink.Route{ipv6Route}, nil)
+			},
+			expectedInstanceIPCompat: ipcompatibility.NewDualStackCompatibility(),
+			expectedExcludeIPv6:      BooleanDefaultTrue{Value: ExplicitlyEnabled},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockNLWrapper := mock_netlinkwrapper.NewMockNetLink(ctrl)
+			defer setMockNLWrapper(mockNLWrapper)()
+
+			if tc.setNetlinkExpectations != nil {
+				tc.setNetlinkExpectations(mockNLWrapper)
+			}
+
+			cfg := DefaultConfig(tc.ipCompatOverride)
+			assert.Equal(t, tc.expectedInstanceIPCompat, cfg.InstanceIPCompatibility)
+			assert.Equal(t, tc.expectedExcludeIPv6, cfg.ShouldExcludeIPv6PortBinding)
 		})
 	}
 }

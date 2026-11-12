@@ -26,21 +26,23 @@ import (
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
-	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
-	mock_api "github.com/aws/amazon-ecs-agent/agent/api/mocks"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/data"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	mock_dockerstate "github.com/aws/amazon-ecs-agent/agent/engine/dockerstate/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
-	mock_retry "github.com/aws/amazon-ecs-agent/agent/utils/retry/mock"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	mock_ecs "github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs/mocks"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	mock_retry "github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry/mock"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go"
 	"github.com/golang/mock/gomock"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -51,7 +53,7 @@ const taskARN = "taskarn"
 func TestSendsEventsOneContainer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -65,10 +67,9 @@ func TestSendsEventsOneContainer(t *testing.T) {
 	contEvent2 := containerEvent(taskARN)
 	taskEvent2 := taskEvent(taskARN)
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, 2, len(change.Containers))
-		assert.Equal(t, taskARN, change.Containers[0].TaskArn)
-		assert.Equal(t, taskARN, change.Containers[1].TaskArn)
+		assert.Equal(t, taskARN, change.TaskARN)
 		wg.Done()
 	})
 
@@ -82,7 +83,7 @@ func TestSendsEventsOneContainer(t *testing.T) {
 func TestSendsEventsOneEventRetries(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -107,7 +108,7 @@ func TestSendsEventsOneEventRetries(t *testing.T) {
 func TestSendsEventsInvalidParametersEventsRemoved(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -121,7 +122,10 @@ func TestSendsEventsInvalidParametersEventsRemoved(t *testing.T) {
 	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(interface{}) {
 		assert.Equal(t, 1, handler.tasksToEvents[taskARN].events.Len())
 		wg.Done()
-	}).Return(awserr.New(ecs.ErrCodeInvalidParameterException, "", nil))
+	}).Return(&smithy.GenericAPIError{
+		Code:    apierrors.ErrCodeInvalidParameterException,
+		Message: "",
+	})
 
 	handler.AddStateChangeEvent(taskEvent, client)
 
@@ -135,7 +139,7 @@ func TestSendsEventsInvalidParametersEventsRemoved(t *testing.T) {
 func TestSendsEventsConcurrentLimit(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -173,7 +177,7 @@ func TestSendsEventsConcurrentLimit(t *testing.T) {
 func TestSendsEventsContainerDifferences(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -187,12 +191,10 @@ func TestSendsEventsContainerDifferences(t *testing.T) {
 	contEvent2 := containerEventStopped(taskARN)
 	taskEvent := taskEvent(taskARN)
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
-		assert.Equal(t, 2, len(change.Containers))
-		assert.Equal(t, taskARN, change.Containers[0].TaskArn)
-		assert.Equal(t, apicontainerstatus.ContainerRunning, change.Containers[0].Status)
-		assert.Equal(t, taskARN, change.Containers[1].TaskArn)
-		assert.Equal(t, apicontainerstatus.ContainerStopped, change.Containers[1].Status)
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
+		assert.Equal(t, taskARN, change.TaskARN)
+		assert.Equal(t, apicontainerstatus.ContainerRunning.String(), aws.ToString(change.Containers[0].Status))
+		assert.Equal(t, apicontainerstatus.ContainerStopped.String(), aws.ToString(change.Containers[1].Status))
 		wg.Done()
 	})
 
@@ -206,7 +208,7 @@ func TestSendsEventsContainerDifferences(t *testing.T) {
 func TestSendsEventsTaskDifferences(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 	dataClient := data.NewNoopClient()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -230,13 +232,13 @@ func TestSendsEventsTaskDifferences(t *testing.T) {
 	contEventB2 := containerEventStopped(taskARNB)
 	taskEventB := taskEventStopped(taskARNB)
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, taskARNA, change.TaskARN)
 		wgAddEvent.Done()
 		wg.Done()
 	})
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, taskARNB, change.TaskARN)
 		wg.Done()
 	})
@@ -256,7 +258,7 @@ func TestSendsEventsTaskDifferences(t *testing.T) {
 func TestSendsEventsDedupe(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -283,9 +285,8 @@ func TestSendsEventsDedupe(t *testing.T) {
 	cont2.(api.ContainerStateChange).Container.SetSentStatus(apicontainerstatus.ContainerRunning)
 
 	// Expect to send a task status but not a container status
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, 1, len(change.Containers))
-		assert.Equal(t, taskARNB, change.Containers[0].TaskArn)
 		assert.Equal(t, taskARNB, change.TaskARN)
 		wg.Done()
 	})
@@ -302,7 +303,7 @@ func TestCleanupTaskEventAfterSubmit(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -318,7 +319,7 @@ func TestCleanupTaskEventAfterSubmit(t *testing.T) {
 	taskEvent3 := taskEvent(taskARN2)
 
 	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(
-		func(change api.TaskStateChange) {
+		func(change ecs.TaskStateChange) {
 			wg.Done()
 		}).Times(3)
 
@@ -369,16 +370,18 @@ func taskEventStopped(arn string) statechange.Event {
 func TestENISentStatusChange(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	task := &apitask.Task{
 		Arn: taskARN,
 	}
 
-	eniAttachment := &apieni.ENIAttachment{
-		TaskARN:          taskARN,
-		AttachStatusSent: false,
-		ExpiresAt:        time.Now().Add(time.Second),
+	eniAttachment := &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          taskARN,
+			AttachStatusSent: false,
+			ExpiresAt:        time.Now().Add(time.Second),
+		},
 	}
 	timeoutFunc := func() {
 		eniAttachment.AttachStatusSent = true
@@ -452,7 +455,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskRunningAfterStopped(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	handler := &TaskHandler{
 		state:                  state,
@@ -490,7 +493,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskRunningAfterStopped(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	gomock.InOrder(
-		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 			assert.Equal(t, apitaskstatus.TaskStopped, change.Status)
 		}),
 		backoff.EXPECT().Reset().Do(func() {
@@ -516,7 +519,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskStoppedAfterRunning(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	handler := &TaskHandler{
 		state:                  state,
@@ -554,7 +557,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskStoppedAfterRunning(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	gomock.InOrder(
-		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 			assert.Equal(t, apitaskstatus.TaskRunning, change.Status)
 		}),
 		backoff.EXPECT().Reset().Do(func() {
@@ -570,7 +573,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskStoppedAfterRunning(t *testing.T) {
 
 	wg.Add(1)
 	gomock.InOrder(
-		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+		client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 			assert.Equal(t, apitaskstatus.TaskStopped, change.Status)
 		}),
 		backoff.EXPECT().Reset().Do(func() {
@@ -588,7 +591,7 @@ func TestSubmitTaskEventsWhenSubmittingTaskStoppedAfterRunning(t *testing.T) {
 func TestSendContainerAndManagedAgentEvents(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := NewTaskHandler(ctx, data.NewNoopClient(), dockerstate.NewTaskEngineState(), client)
@@ -601,11 +604,10 @@ func TestSendContainerAndManagedAgentEvents(t *testing.T) {
 	cEevent1 := containerEvent(taskARN)
 	taskEvent1 := taskEvent(taskARN)
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, 1, len(change.ManagedAgents))
 		assert.Equal(t, 1, len(change.Containers))
-		assert.Equal(t, taskARN, change.ManagedAgents[0].TaskArn)
-		assert.Equal(t, taskARN, change.Containers[0].TaskArn)
+		assert.Equal(t, taskARN, change.TaskARN)
 		wg.Done()
 	})
 
@@ -621,7 +623,7 @@ func TestSendContainerAndManagedAgentEvents(t *testing.T) {
 func TestSendManagedAgentEventsTaskDifferences(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_api.NewMockECSClient(ctrl)
+	client := mock_ecs.NewMockECSClient(ctrl)
 	dataClient := data.NewNoopClient()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -644,13 +646,13 @@ func TestSendManagedAgentEventsTaskDifferences(t *testing.T) {
 	maEventB1 := managedAgentEvent(taskARNB)
 	taskEventB := taskEventStopped(taskARNB)
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, taskARNA, change.TaskARN)
 		wgAddEvent.Done()
 		wg.Done()
 	})
 
-	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change ecs.TaskStateChange) {
 		assert.Equal(t, taskARNB, change.TaskARN)
 		wg.Done()
 	})

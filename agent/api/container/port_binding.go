@@ -16,7 +16,8 @@ package container
 import (
 	"strconv"
 
-	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
+
 	"github.com/docker/go-connections/nat"
 )
 
@@ -31,6 +32,8 @@ const (
 type PortBinding struct {
 	// ContainerPort is the port inside the container
 	ContainerPort uint16
+	// ContainerPortRange is a range of ports exposed inside the container
+	ContainerPortRange string
 	// HostPort is the port exposed on the host
 	HostPort uint16
 	// BindIP is the IP address to which the port is bound

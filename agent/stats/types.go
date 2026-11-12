@@ -14,11 +14,12 @@
 package stats
 
 import (
+	"context"
 	"time"
 
-	"context"
-
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/stats/resolver"
 )
@@ -29,8 +30,16 @@ type ContainerStats struct {
 	memoryUsage       uint64
 	storageReadBytes  uint64
 	storageWriteBytes uint64
+	restartCount      *int64
 	networkStats      *NetworkStats
 	timestamp         time.Time
+}
+
+// NonDockerContainerStats contains stats for a container that are not gotten from docker.
+// These are amended to the docker stats and added to the stats queue if they are
+// available.
+type NonDockerContainerStats struct {
+	restartCount *int64
 }
 
 // NetworkStats contains the network stats information for a container
@@ -54,6 +63,7 @@ type UsageStats struct {
 	StorageReadBytes  uint64        `json:"storageReadBytes"`
 	StorageWriteBytes uint64        `json:"storageWriteBytes"`
 	NetworkStats      *NetworkStats `json:"networkStats"`
+	RestartCount      *int64        `json:"restartCount"`
 	Timestamp         time.Time     `json:"timestamp"`
 	cpuUsage          uint64
 	// sent indicates if the stat has been sent to TACS already.
@@ -62,9 +72,10 @@ type UsageStats struct {
 
 // ContainerMetadata contains meta-data information for a container.
 type ContainerMetadata struct {
-	DockerID    string `json:"-"`
-	Name        string `json:"-"`
-	NetworkMode string `json:"-"`
+	DockerID    string    `json:"-"`
+	Name        string    `json:"-"`
+	NetworkMode string    `json:"-"`
+	StartedAt   time.Time `json:"-"`
 }
 
 // TaskMetadata contains meta-data information for a task.
@@ -79,22 +90,19 @@ type TaskMetadata struct {
 
 // StatsContainer abstracts methods to gather and aggregate utilization data for a container.
 type StatsContainer struct {
-	containerMetadata *ContainerMetadata
-	ctx               context.Context
-	cancel            context.CancelFunc
-	client            dockerapi.DockerClient
-	statsQueue        *Queue
-	resolver          resolver.ContainerMetadataResolver
-	config            *config.Config
+	containerMetadata      *ContainerMetadata
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	client                 dockerapi.DockerClient
+	statsQueue             *Queue
+	resolver               resolver.ContainerMetadataResolver
+	config                 *config.Config
+	restartAggregationData apicontainer.ContainerRestartAggregationDataForStats
+	dataClient             data.Client
 }
 
 // taskDefinition encapsulates family and version strings for a task definition
 type taskDefinition struct {
 	family  string
 	version string
-}
-
-type NetworkStatsPerSec struct {
-	RxBytesPerSecond float32 `json:"rx_bytes_per_sec"`
-	TxBytesPerSecond float32 `json:"tx_bytes_per_sec"`
 }

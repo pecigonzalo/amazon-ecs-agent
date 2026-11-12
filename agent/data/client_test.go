@@ -17,20 +17,27 @@
 package data
 
 import (
-	"io/ioutil"
-	"os"
+	"fmt"
 	"path/filepath"
 	"testing"
 
+	generaldata "github.com/aws/amazon-ecs-agent/ecs-agent/data"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/modeltransformer"
+
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 )
 
-func newTestClient(t *testing.T) (Client, func()) {
-	testDir, err := ioutil.TempDir("", "agent_data_unit_test")
-	require.NoError(t, err)
+const (
+	statPathNotFoundErr = "stat %s: no such file or directory"
+)
+
+func newTestClient(t *testing.T) Client {
+	testDir := t.TempDir()
 
 	testDB, err := bolt.Open(filepath.Join(testDir, dbName), dbMode, nil)
+	transformer := modeltransformer.NewTransformer()
 	require.NoError(t, err)
 	require.NoError(t, testDB.Update(func(tx *bolt.Tx) error {
 		for _, b := range buckets {
@@ -43,12 +50,55 @@ func newTestClient(t *testing.T) (Client, func()) {
 		return nil
 	}))
 	testClient := &client{
-		db: testDB,
+		generaldata.Client{
+			Accessor:    generaldata.DBAccessor{},
+			DB:          testDB,
+			Transformer: transformer,
+		},
 	}
 
-	cleanup := func() {
+	t.Cleanup(func() {
 		require.NoError(t, testClient.Close())
-		require.NoError(t, os.RemoveAll(testDir))
+	})
+	return testClient
+}
+
+func TestSetupInvalidDirectoryErrors(t *testing.T) {
+	originalDirExists := dirExists
+	defer func() {
+		dirExists = originalDirExists
+	}()
+	tcs := []struct {
+		name          string
+		dirPath       string
+		mockDirExists func(string) error
+		expectedError error
+	}{
+		{
+			name:    "path not found",
+			dirPath: "/path/",
+			mockDirExists: func(path string) error {
+				return fmt.Errorf(statPathNotFoundErr, path)
+			},
+			expectedError: fmt.Errorf(statPathNotFoundErr, "/path/"),
+		},
+		{
+			name:    "path is not a directory",
+			dirPath: "/data/blah.txt",
+			mockDirExists: func(path string) error {
+				return fmt.Errorf(notDirectoryErrorMsg, path)
+			},
+			expectedError: fmt.Errorf(notDirectoryErrorMsg, "/data/blah.txt"),
+		},
 	}
-	return testClient, cleanup
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			dirExists = tc.mockDirExists
+
+			_, err := setup(tc.dirPath)
+
+			assert.Equal(t, tc.expectedError, err)
+		})
+	}
 }

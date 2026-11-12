@@ -1,72 +1,128 @@
 module github.com/aws/amazon-ecs-agent/agent
 
-go 1.12
+go 1.26.0
 
 require (
-	github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78 // indirect
-	github.com/aws/aws-sdk-go v1.36.0
-	github.com/awslabs/go-config-generator-for-fluentd-and-fluentbit v0.0.0-20190829210224-55d4fd2e6f35
+	github.com/aws/amazon-ecs-agent/ecs-agent v0.0.0
+	github.com/aws/amazon-ecs-agent/ecs-agent/daemonimages/csidriver v0.0.0-20250814231752-7d5ec06fbcec
+	github.com/aws/aws-sdk-go v1.55.7
+	github.com/aws/aws-sdk-go-v2 v1.47.2
+	github.com/aws/aws-sdk-go-v2/config v1.33.8
+	github.com/aws/aws-sdk-go-v2/credentials v1.20.8
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.2
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.72
+	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.65.0
+	github.com/aws/aws-sdk-go-v2/service/ecr v1.45.1
+	github.com/aws/aws-sdk-go-v2/service/ecs v1.47.3
+	github.com/aws/aws-sdk-go-v2/service/fsx v1.65.10
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.7
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.60.0
+	github.com/aws/smithy-go v1.28.4
+	github.com/awslabs/go-config-generator-for-fluentd-and-fluentbit v0.0.0-20210308162251-8959c62cb8f9
 	github.com/cihub/seelog v0.0.0-20170130134532-f561c5e57575
-	github.com/containerd/cgroups v1.0.4-0.20220221221032-e710ed6ebb1a
-	github.com/containerd/containerd v1.4.12 // indirect
-	github.com/containerd/continuity v0.0.0-20181023183536-c220ac4f01b8 // indirect
-	github.com/containernetworking/cni v0.7.1
-	github.com/containernetworking/plugins v0.8.6
-	github.com/deniswernert/udev v0.0.0-20140626150257-82fe5be8ca5f
-	github.com/didip/tollbooth v3.0.2+incompatible
-	github.com/docker/distribution v0.0.0-20181002220433-1cb4180b1a5b // indirect
-	github.com/docker/docker v0.0.0-20200531234253-77e06fda0c94
-	github.com/docker/go-connections v0.4.0
-	github.com/docker/go-units v0.4.0
-	github.com/golang/mock v1.1.1
-	github.com/google/go-cmp v0.5.6 // indirect
-	github.com/gorilla/mux v1.8.0
-	github.com/gorilla/websocket v1.4.2
-	github.com/hectane/go-acl v0.0.0-20190604041725-da78bae5fc95
-	github.com/konsorten/go-windows-terminal-sequences v1.0.1 // indirect
-	github.com/morikuni/aec v1.0.0 // indirect
-	github.com/opencontainers/go-digest v1.0.0-rc1 // indirect
-	github.com/opencontainers/image-spec v1.0.2 // indirect
-	github.com/opencontainers/runtime-spec v1.0.2
-	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
-	github.com/pborman/uuid v0.0.0-20150603214016-ca53cad383ca
+	github.com/container-storage-interface/spec v1.12.0
+	github.com/containerd/cgroups/v3 v3.1.3
+	github.com/containernetworking/cni v1.3.0
+	github.com/containernetworking/plugins v1.4.1
+	github.com/deniswernert/udev v0.0.0-20170418162847-a12666f7b5a1
+	github.com/didip/tollbooth v4.0.2+incompatible
+	github.com/distribution/reference v0.6.0
+	github.com/docker/docker v25.0.6+incompatible
+	github.com/docker/go-connections v0.6.0
+	github.com/docker/go-units v0.5.0
+	github.com/fsnotify/fsnotify v1.6.0
+	github.com/golang/mock v1.6.0
+	github.com/gorilla/mux v1.8.1
+	github.com/hectane/go-acl v1.0.0
+	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/image-spec v1.1.1
+	github.com/opencontainers/runtime-spec v1.3.0
+	github.com/pborman/uuid v1.2.1
 	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v0.9.4
-	github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4
-	github.com/stretchr/testify v1.7.0
-	github.com/vishvananda/netlink v0.0.0-20181108222139-023a6dafdcdf
-	go.etcd.io/bbolt v1.3.6
-	golang.org/x/net v0.0.0-20210525063256-abc453219eb5
-	golang.org/x/sys v0.0.0-20210510120138-977fb7262007
-	golang.org/x/text v0.3.6 // indirect
-	golang.org/x/time v0.0.0-20170927054726-6dc17368e09b // indirect
-	golang.org/x/tools v0.1.5
-	google.golang.org/grpc v1.38.0 // indirect
-	gotest.tools v2.2.0+incompatible // indirect
+	github.com/prometheus/client_model v0.6.3
+	github.com/stretchr/testify v1.12.1
+	github.com/vishvananda/netlink v1.3.1
+	go.etcd.io/bbolt v1.4.3
+	golang.org/x/sys v0.49.0
+	golang.org/x/tools v0.51.0
+	k8s.io/api v0.37.0
+)
+
+require (
+	github.com/Microsoft/go-winio v0.6.2 // indirect
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.5 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.5 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.5 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.334.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.20 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.13 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.5 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.21 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.10.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.38.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.51.3 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cilium/ebpf v0.22.0 // indirect
+	github.com/containerd/containerd v1.7.36 // indirect
+	github.com/containerd/log v0.1.0 // indirect
+	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
+	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/moby/sys/userns v0.1.0 // indirect
+	github.com/moby/term v0.0.0-20221205130635-1aeaba878587 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
+	github.com/morikuni/aec v1.0.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pandatix/go-abnf v0.5.3 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
+	github.com/prometheus/common v0.73.1 // indirect
+	github.com/sirupsen/logrus v1.9.4 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
+	go.opentelemetry.io/otel v1.45.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0 // indirect
+	go.opentelemetry.io/otel/metric v1.45.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
+	go.opentelemetry.io/otel/trace v1.45.0 // indirect
+	go.uber.org/goleak v1.3.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
+	google.golang.org/grpc v1.83.2 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	k8s.io/apimachinery v0.37.0 // indirect
+	k8s.io/klog/v2 v2.140.0 // indirect
+	k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad // indirect
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd // indirect
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+	sigs.k8s.io/randfill v1.0.0 // indirect
+	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 )
 
 replace (
-	// Note: the following packages are downgraded explicitly to match the version we were using when we used dep, so that
-	// dependency change is not coupled with migration to go mod. No other reason to keep them downgraded (if in the
-	// future we need to downgrade dependency due to other reason, such as incompatibility with newer version, those
-	// reasons should be noted down separately).
-	github.com/Microsoft/go-winio => github.com/Microsoft/go-winio v0.4.7
-	github.com/containernetworking/plugins => github.com/containernetworking/plugins v0.8.6
-	github.com/coreos/go-systemd => github.com/coreos/go-systemd v0.0.0-20170731111925-d21964639418
-	github.com/davecgh/go-spew => github.com/davecgh/go-spew v1.1.0
-	github.com/godbus/dbus => github.com/godbus/dbus v4.1.0+incompatible
-	github.com/golang/mock => github.com/golang/mock v1.3.1-0.20190508161146-9fa652df1129
-	github.com/golang/protobuf => github.com/golang/protobuf v1.4.1
-	github.com/jmespath/go-jmespath => github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af
-	github.com/konsorten/go-windows-terminal-sequences => github.com/konsorten/go-windows-terminal-sequences v1.0.1
-	github.com/pkg/errors v0.8.1 => github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_model => github.com/prometheus/client_model v0.0.0-20180712105110-5c3871d89910
-	github.com/sirupsen/logrus => github.com/sirupsen/logrus v1.1.1
-	github.com/stretchr/testify => github.com/stretchr/testify v1.2.2
-	github.com/vishvananda/netlink => github.com/vishvananda/netlink v0.0.0-20170220200719-fe3b5664d23a
-	github.com/vishvananda/netns => github.com/vishvananda/netns v0.0.0-20171111001504-be1fbeda1936
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20171113213409-9f005a07e0d3
-	golang.org/x/net => golang.org/x/net v0.0.0-20191204025024-5ee1b9f4859a
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190830141801-acfa387b8d69
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20171114152239-bd4635fd2559
+	github.com/aws/amazon-ecs-agent/ecs-agent => ../ecs-agent
+	github.com/aws/amazon-ecs-agent/ecs-agent/daemonimages/csidriver => ../ecs-agent/daemonimages/csidriver
+	github.com/aws/aws-sdk-go-v2/service/ecs => ../aws-sdk-go-v2/service/ecs
 )

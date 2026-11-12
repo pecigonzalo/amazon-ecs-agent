@@ -22,12 +22,13 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
-	mock_api "github.com/aws/amazon-ecs-agent/agent/api/mocks"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	mock_dockerstate "github.com/aws/amazon-ecs-agent/agent/engine/dockerstate/mocks"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	mock_ecs "github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs/mocks"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+
 	"github.com/docker/docker/api/types"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -39,6 +40,7 @@ const (
 	cluster                  = "default"
 	family                   = "sleep"
 	version                  = "1"
+	serviceName              = "someService"
 	containerID              = "cid"
 	containerName            = "sleepy"
 	imageName                = "busybox"
@@ -54,7 +56,10 @@ const (
 	volSource                = "/var/lib/volume1"
 	volDestination           = "/volume"
 	availabilityZone         = "us-west-2b"
+	availabilityZoneID       = "usw2-az2"
+	vpcID                    = "test-vpc-id"
 	containerInstanceArn     = "containerInstance-test"
+	testEndpointID           = "test-endpoint-ID"
 )
 
 func TestNewTaskContainerResponses(t *testing.T) {
@@ -62,22 +67,23 @@ func TestNewTaskContainerResponses(t *testing.T) {
 	defer ctrl.Finish()
 
 	state := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
+	ecsClient := mock_ecs.NewMockECSClient(ctrl)
 	now := time.Now()
 	task := &apitask.Task{
 		Arn:                 taskARN,
 		Family:              family,
 		Version:             version,
+		ServiceName:         serviceName,
 		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
 		KnownStatusUnsafe:   apitaskstatus.TaskRunning,
-		ENIs: []*apieni.ENI{
+		ENIs: []*ni.NetworkInterface{
 			{
-				IPV4Addresses: []*apieni.ENIIPV4Address{
+				IPV4Addresses: []*ni.IPV4Address{
 					{
 						Address: eniIPv4Address,
 					},
 				},
-				IPV6Addresses: []*apieni.ENIIPV6Address{
+				IPV6Addresses: []*ni.IPV6Address{
 					{
 						Address: eniIPv6Address,
 					},
@@ -128,13 +134,13 @@ func TestNewTaskContainerResponses(t *testing.T) {
 	containerNameToDockerContainer := map[string]*apicontainer.DockerContainer{
 		taskARN: dockerContainer,
 	}
-	gomock.InOrder(
-		state.EXPECT().TaskByArn(taskARN).Return(task, true),
-		state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true),
-		state.EXPECT().TaskByArn(taskARN).Return(task, true),
-	)
+	state.EXPECT().TaskByArn(taskARN).Return(task, true)
+	state.EXPECT().ContainerByID(containerID).Return(dockerContainer, true).AnyTimes()
+	state.EXPECT().ContainerMapByArn(taskARN).Return(containerNameToDockerContainer, true)
+	state.EXPECT().TaskByArn(taskARN).Return(task, true)
 
-	taskResponse, err := NewTaskResponse(taskARN, state, ecsClient, cluster, availabilityZone, containerInstanceArn, false)
+	taskResponse, err := NewTaskResponse(testEndpointID, taskARN, state, ecsClient, cluster,
+		availabilityZone, availabilityZoneID, vpcID, containerInstanceArn, task.ServiceName, false)
 	require.NoError(t, err)
 	_, err = json.Marshal(taskResponse)
 	require.NoError(t, err)
@@ -143,11 +149,10 @@ func TestNewTaskContainerResponses(t *testing.T) {
 	assert.Equal(t, eniIPv6Address, taskResponse.Containers[0].Networks[0].IPv6Addresses[0])
 	assert.Equal(t, ipv6SubnetCIDRBlock, taskResponse.Containers[0].Networks[0].IPv6SubnetCIDRBlock)
 	assert.Equal(t, subnetGatewayIPV4Address, taskResponse.Containers[0].Networks[0].SubnetGatewayIPV4Address)
+	assert.Equal(t, serviceName, taskResponse.ServiceName)
 
-	gomock.InOrder(
-		state.EXPECT().ContainerByID(containerID).Return(dockerContainer, true),
-		state.EXPECT().TaskByID(containerID).Return(task, true).Times(2),
-	)
+	state.EXPECT().ContainerByID(containerID).Return(dockerContainer, true).AnyTimes()
+	state.EXPECT().TaskByID(containerID).Return(task, true).Times(2)
 	containerResponse, err := NewContainerResponse(containerID, state)
 	require.NoError(t, err)
 	_, err = json.Marshal(containerResponse)

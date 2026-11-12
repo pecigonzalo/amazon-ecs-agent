@@ -138,29 +138,52 @@ func TestFindSupportedAPIVersionsFromMinAPIVersions(t *testing.T) {
 	}
 }
 
-func TestCompareDockerVersionsWithMinAPIVersion(t *testing.T) {
+// Tests that sdkclientfactory.NewFactory checks that the server's API version is not lower
+// than the client's API version.
+func TestFactoryChecksServerVersion(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	minAPIVersion := "1.12"
-	apiVersion := "1.32"
-	versions := []string{"1.11", "1.33"}
-	rightVersion := "1.25"
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
 
-	for _, version := range versions {
-		_, err := getDockerClientForVersion("endpoint", version, minAPIVersion, apiVersion, ctx)
-		assert.EqualError(t, err, "version detection using MinAPIVersion: unsupported version: "+version)
+	allVersions := dockerclient.GetKnownAPIVersions()
+
+	// Set up the mocks and expectations
+	mockClients := make(map[string]*mock_sdkclient.MockClient)
+
+	serverAPIVersion := dockerclient.Version_1_35
+
+	// Ensure that agent pings all known versions of Docker API
+	for i := 0; i < len(allVersions); i++ {
+		mockClients[string(allVersions[i])] = mock_sdkclient.NewMockClient(ctrl)
+		mockClients[string(allVersions[i])].EXPECT().
+			ServerVersion(gomock.Any()).
+			Return(docker.Version{APIVersion: serverAPIVersion.String()}, nil)
+		mockClients[string(allVersions[i])].EXPECT().Ping(gomock.Any()).AnyTimes()
 	}
 
-	mockClients := make(map[string]*mock_sdkclient.MockClient)
+	// Define the function for the mock client
+	// For simplicity, we will pretend all versions of docker are available
 	newVersionedClient = func(endpoint, version string) (sdkclient.Client, error) {
-		mockClients[version] = mock_sdkclient.NewMockClient(ctrl)
-		mockClients[version].EXPECT().Ping(gomock.Any())
 		return mockClients[version], nil
 	}
-	client, _ := getDockerClientForVersion("endpoint", rightVersion, minAPIVersion, apiVersion, ctx)
-	assert.Equal(t, mockClients[rightVersion], client)
+
+	// Count versions before serverAPIVersion
+	expectedClientCount := 0
+	for _, v := range allVersions {
+		if v.Compare(serverAPIVersion) <= 0 {
+			expectedClientCount++
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	factory := NewFactory(ctx, expectedEndpoint)
+	actualVersions := factory.FindSupportedAPIVersions()
+
+	assert.NotEmpty(t, actualVersions)
+	// Ensure that each supported version is lower than serverAPIVersion
+	for _, actualVersion := range actualVersions {
+		assert.True(t, actualVersion.Compare(serverAPIVersion) <= 0)
+	}
 }
 
 func TestGetClientCached(t *testing.T) {

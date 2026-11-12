@@ -16,8 +16,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/acs/model/ecsacs"
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 const (
@@ -48,9 +48,9 @@ type AppMesh struct {
 	ProxyEgressPort string
 	// AppPorts is the port number that application is listening on
 	AppPorts []string
-	// EgressIgnoredIPs is the list of ports for which egress traffic will be ignored
+	// EgressIgnoredIPs is the list of IPs for which egress traffic will be ignored
 	EgressIgnoredIPs []string
-	// EgressIgnoredPorts is the list of IPs for which egress traffic will be ignored
+	// EgressIgnoredPorts is the list of ports for which egress traffic will be ignored
 	EgressIgnoredPorts []string
 }
 
@@ -62,11 +62,11 @@ func AppMeshFromACS(proxyConfig *ecsacs.ProxyConfiguration) (*AppMesh, error) {
 	}
 
 	return &AppMesh{
-		ContainerName:      aws.StringValue(proxyConfig.ContainerName),
-		IgnoredUID:         aws.StringValue(proxyConfig.Properties[ignoredUID]),
-		IgnoredGID:         aws.StringValue(proxyConfig.Properties[ignoredGID]),
-		ProxyIngressPort:   aws.StringValue(proxyConfig.Properties[proxyIngressPort]),
-		ProxyEgressPort:    aws.StringValue(proxyConfig.Properties[proxyEgressPort]),
+		ContainerName:      aws.ToString(proxyConfig.ContainerName),
+		IgnoredUID:         aws.ToString(proxyConfig.Properties[ignoredUID]),
+		IgnoredGID:         aws.ToString(proxyConfig.Properties[ignoredGID]),
+		ProxyIngressPort:   aws.ToString(proxyConfig.Properties[proxyIngressPort]),
+		ProxyEgressPort:    aws.ToString(proxyConfig.Properties[proxyEgressPort]),
 		AppPorts:           buildAppPorts(proxyConfig),
 		EgressIgnoredIPs:   buildEgressIgnoredIPs(proxyConfig),
 		EgressIgnoredPorts: buildEgressIgnoredPorts(proxyConfig),

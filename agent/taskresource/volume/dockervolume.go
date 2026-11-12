@@ -21,12 +21,13 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
@@ -40,6 +41,10 @@ const (
 	DockerLocalVolumeDriver   = "local"
 	resourceProvisioningError = "VolumeError: Agent could not create task's volume resources"
 	EFSVolumeType             = "efs"
+	EBSVolumeType             = "ebs"
+	S3FilesVolumeType         = "s3files"
+	DockerVolumeType          = "docker"
+	FSHostVolumeType          = "fshost"
 	netNSFormat               = "/proc/%s/ns/net"
 )
 
@@ -129,7 +134,9 @@ func NewVolumeResource(ctx context.Context,
 	return v, nil
 }
 
-func (vol *VolumeResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (vol *VolumeResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 
@@ -151,9 +158,50 @@ func (cfg *EFSVolumeConfig) Source() string {
 	return cfg.DockerVolumeName
 }
 
+func (cfg *EFSVolumeConfig) GetType() string {
+	return EFSVolumeType
+}
+
+func (cfg *EFSVolumeConfig) GetVolumeId() string {
+	return cfg.FileSystemID
+}
+
+func (cfg *EFSVolumeConfig) GetVolumeName() string {
+	return cfg.DockerVolumeName
+}
+
 // Source returns the name of the volume resource which is used as the source of the volume mount
 func (cfg *DockerVolumeConfig) Source() string {
 	return cfg.DockerVolumeName
+}
+
+func (cfg *DockerVolumeConfig) GetType() string {
+	return DockerVolumeType
+}
+
+func (cfg *DockerVolumeConfig) GetVolumeId() string {
+	return cfg.DockerVolumeName
+}
+
+func (cfg *DockerVolumeConfig) GetVolumeName() string {
+	return cfg.DockerVolumeName
+}
+
+// Source returns the source volume host mount point for an EBS volume
+func (cfg *EBSTaskVolumeConfig) Source() string {
+	return EBSSourcePrefix + cfg.SourceVolumeHostPath
+}
+
+func (cfg *EBSTaskVolumeConfig) GetType() string {
+	return EBSVolumeType
+}
+
+func (cfg *EBSTaskVolumeConfig) GetVolumeId() string {
+	return cfg.VolumeId
+}
+
+func (cfg *EBSTaskVolumeConfig) GetVolumeName() string {
+	return cfg.VolumeName
 }
 
 // GetName returns the name of the volume resource
@@ -437,14 +485,14 @@ func (vol *VolumeResource) GetAppliedStatus() resourcestatus.ResourceStatus {
 
 // DependOnTaskNetwork shows whether the resource creation needs task network setup beforehand
 func (vol *VolumeResource) DependOnTaskNetwork() bool {
-	return vol.VolumeType == EFSVolumeType
+	return vol.VolumeType == EFSVolumeType || vol.VolumeType == S3FilesVolumeType
 }
 
 // BuildContainerDependency sets the container dependencies of the resource.
 func (vol *VolumeResource) BuildContainerDependency(containerName string, satisfied apicontainerstatus.ContainerStatus,
 	dependent resourcestatus.ResourceStatus) {
-	// No op for non-EFS volume type
-	if vol.VolumeType != EFSVolumeType {
+	// No op for non-EFS and non-S3Files volume type
+	if vol.VolumeType != EFSVolumeType && vol.VolumeType != S3FilesVolumeType {
 		return
 	}
 
@@ -462,8 +510,8 @@ func (vol *VolumeResource) BuildContainerDependency(containerName string, satisf
 
 // GetContainerDependencies returns the container dependencies of the resource.
 func (vol *VolumeResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
-	// No op for non-EFS volume type
-	if vol.VolumeType != EFSVolumeType {
+	// No op for non-EFS and non-S3Files volume type
+	if vol.VolumeType != EFSVolumeType && vol.VolumeType != S3FilesVolumeType {
 		return nil
 	}
 
@@ -487,4 +535,12 @@ func (vol *VolumeResource) GetPauseContainerPID() string {
 	defer vol.lock.RUnlock()
 
 	return vol.pauseContainerPIDUnsafe
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// Volume resource does not require task execution role credentials.
+// Note that the volume plugins (like the ECS volume plugin) may require credentials depending on the volume configuration,
+// but that's not handled by the VolumeResource object.
+func (vol *VolumeResource) RequiresExecutionRoleCredentials() bool {
+	return false
 }

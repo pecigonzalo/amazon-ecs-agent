@@ -15,14 +15,16 @@ package docker
 
 import (
 	"bytes"
-	"encoding/json"
+	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils"
 	"github.com/aws/amazon-ecs-agent/ecs-init/backoff"
 	"github.com/aws/amazon-ecs-agent/ecs-init/config"
 	"github.com/aws/amazon-ecs-agent/ecs-init/gpu"
@@ -49,36 +51,25 @@ const (
 	// in case /var/run/docker.sock is deleted and recreated outside the container
 	defaultDockerEndpoint   = "/var/run"
 	defaultDockerSocketPath = "/var/run/docker.sock"
-
 	// networkMode specifies the networkmode to create the agent container
 	networkMode = "host"
 	// usernsMode specifies the userns mode to create the agent container
 	usernsMode = "host"
-	// minBackoffDuration specifies the minimum backoff duration for ping to
+	// pingDockerSocketMinBackoffDuration specifies the minimum backoff duration for ping to
 	// return a success response from the docker socket
-	minBackoffDuration = time.Second
-	// maxBackoffDuration specifies the maximum backoff duration for ping to
+	pingDockerSocketMinBackoffDuration = time.Second
+	// pingDockerSocketMaxBackoffDuration specifies the maximum backoff duration for ping to
 	// return a success response from docker socket
-	maxBackoffDuration = 5 * time.Second
-	// backoffJitterMultiple specifies the backoff jitter multiplier
+	pingDockerSocketMaxBackoffDuration = 3 * time.Second
+	// pingDockerSocketBackoffJitterMultiple specifies the backoff jitter multiplier
 	// coefficient when pinging the docker socket
-	backoffJitterMultiple = 0.2
-	// backoffMultiple specifies the backoff multiplier coefficient when
+	pingDockerSocketBackoffJitterMultiple = 0.2
+	// pingDockerSocketBackoffMultiple specifies the backoff multiplier coefficient when
 	// pinging the docker socket
-	backoffMultiple = 2
-	// maxRetries specifies the maximum number of retries for ping to return
+	pingDockerSocketBackoffMultiple = 2
+	// pingDockerSocketMaxRetries specifies the maximum number of retries for ping to return
 	// a successful response from the docker socket
-	maxRetries = 5
-	// CapNetAdmin to start agent with NET_ADMIN capability
-	// For more information on capabilities, please read this manpage:
-	// http://man7.org/linux/man-pages/man7/capabilities.7.html
-	CapNetAdmin = "NET_ADMIN"
-	// CapSysAdmin to start agent with SYS_ADMIN capability
-	// This is needed for the ECS Agent to invoke the setns call when
-	// configuring the network namespace of the pause container
-	// For more information on setns, please read this manpage:
-	// http://man7.org/linux/man-pages/man2/setns.2.html
-	CapSysAdmin = "SYS_ADMIN"
+	pingDockerSocketMaxRetries = 5
 	// DefaultCgroupMountpoint is the default mount point for the cgroup subsystem
 	DefaultCgroupMountpoint = "/sys/fs/cgroup"
 	// pluginSocketFilesDir specifies the location of UNIX domain socket files of
@@ -117,11 +108,55 @@ const (
 	containerResourcesRootDir = "/managed-agents"
 
 	execCapabilityName     = "execute-command"
-	execBinRelativePath    = "bin"
 	execConfigRelativePath = "config"
-	execCertsRelativePath  = "certs"
 
 	execAgentLogRelativePath = "/exec"
+
+	// nvidiaGPUDevicesPresentRetryTime specifies the duration of time to wait before retrying to check if NVIDIA
+	// GPU devices are present.
+	nvidiaGPUDevicesPresentRetryTime = 3 * time.Second
+	// nvidiaGPUDevicesPresentMaxRetries specifies the maximum number of retries to attempt for checking if NVIDIA
+	// GPU devices are present.
+	nvidiaGPUDevicesPresentMaxRetries = 10
+
+	// lsblk lists information about block devices. This is used by the ECS agent for the EBS task attach functionality.
+	// Ref: https://man7.org/linux/man-pages/man8/lsblk.8.html
+	lsblkDir = "/usr/bin/lsblk"
+
+	// nsenter helps run program in different namespaces. This is used by the ECS agent for the fault inject functionality.
+	// Ref: https://man7.org/linux/man-pages/man1/nsenter.1.html
+	nsEnterDir = "/usr/bin/nsenter"
+
+	// modinfo is used to display information about a Linux kernel module. This is used by the ECS agent for the
+	// fault inject functionality. Ref: https://man7.org/linux/man-pages/man8/modinfo.8.html
+	modInfoSbinDir    = "/sbin/modinfo"
+	modInfoUsrSbinDir = "/usr/sbin/modinfo"
+
+	// mpsControlBinary is the NVIDIA MPS control front-end. The ECS agent execs it
+	// to health-check the MPS control daemon for the GPU-sharing functionality.
+	mpsControlBinary = "/usr/bin/nvidia-cuda-mps-control"
+
+	// mpsPipeDirectory is the MPS control daemon's socket directory. The ECS agent
+	// checks for it and reaches the daemon through it for the MPS health check.
+	mpsPipeDirectory = "/run/mps-ecs"
+
+	// Docker Network options to filter for the default bridge network interface of docker
+	dockerDefaultBridgeInterfaceOption = "com.docker.network.bridge.default_bridge"
+	dockerInterfaceNameOption          = "com.docker.network.bridge.name"
+)
+
+// Do NOT include "CAP_" in capability string
+const (
+	// CapNetAdmin to start agent with NET_ADMIN capability
+	// For more information on capabilities, please read this manpage:
+	// http://man7.org/linux/man-pages/man7/capabilities.7.html
+	CapNetAdmin = "NET_ADMIN"
+	// CapSysAdmin to start agent with SYS_ADMIN capability
+	// This is needed for the ECS Agent to invoke the setns call when
+	// configuring the network namespace of the pause container
+	// For more information on setns, please read this manpage:
+	// http://man7.org/linux/man-pages/man2/setns.2.html
+	CapSysAdmin = "SYS_ADMIN"
 )
 
 var pluginDirs = []string{
@@ -131,10 +166,16 @@ var pluginDirs = []string{
 }
 
 var (
-	dockerOnce      sync.Once
-	dockerClient    *client
-	dockerClientErr error
-	isPathValid     = defaultIsPathValid
+	dockerOnce                    sync.Once
+	dockerClient                  *client
+	dockerClientErr               error
+	isPathValid                   = defaultIsPathValid
+	execCommand                   = exec.Command
+	execLookPath                  = exec.LookPath
+	checkNvidiaGPUDevicesPresence = nvidiaGPUDevicesPresent
+	// ErrNoBridgeNetwork indicates no docker bridge network interface was found
+	ErrNoBridgeNetwork = errors.New(
+		"unable to find any virtual docker bridge network interfaces on the host")
 )
 
 // client enables business logic for running the Agent inside Docker
@@ -149,8 +190,8 @@ func Client() (*client, error) {
 		// Create a backoff for pinging the docker socket. This should result in 17-19
 		// seconds of delay in the worst-case between different actions that depend on
 		// docker
-		pingBackoff := backoff.NewBackoff(minBackoffDuration, maxBackoffDuration, backoffJitterMultiple,
-			backoffMultiple, maxRetries)
+		pingBackoff := backoff.NewBackoff(pingDockerSocketMinBackoffDuration, pingDockerSocketMaxBackoffDuration, pingDockerSocketBackoffJitterMultiple,
+			pingDockerSocketBackoffMultiple, pingDockerSocketMaxRetries)
 		cl, err := newDockerClient(godockerClientFactory{}, pingBackoff)
 		if err != nil {
 			dockerClientErr = err
@@ -187,7 +228,7 @@ func (c *client) LoadImage(image io.Reader) error {
 	return c.docker.LoadImage(godocker.LoadImageOptions{InputStream: image})
 }
 
-// RemoveExistingAgentContainer remvoes any existing container named
+// RemoveExistingAgentContainer removes any existing container named
 // "ecs-agent" or returns without error if none is found
 func (c *client) RemoveExistingAgentContainer() error {
 	containerToRemove, err := c.findAgentContainer()
@@ -286,8 +327,10 @@ func (c *client) getContainerConfig(envVarsFromFiles map[string]string) *godocke
 		"ECS_AVAILABLE_LOGGING_DRIVERS":         `["json-file","syslog","awslogs","fluentd","none"]`,
 		"ECS_ENABLE_TASK_IAM_ROLE":              "true",
 		"ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST": "true",
+		"ECS_EBSTA_SUPPORTED":                   "true",
 		"ECS_AGENT_LABELS":                      "",
 		"ECS_VOLUME_PLUGIN_CAPABILITIES":        `["efsAuth"]`,
+		"ECS_DETAILED_OS_FAMILY":                config.GetLinuxOSFamily(),
 	}
 
 	// for al, al2 add host ssl cert directory envvar if available
@@ -295,9 +338,24 @@ func (c *client) getContainerConfig(envVarsFromFiles map[string]string) *godocke
 		envVariables["SSL_CERT_DIR"] = certDir
 	}
 
+	// env variable is only available if the gmsa is enabled on linux
+	credentialsFetcherHost, ok := config.HostCredentialsFetcherPath()
+	if ok && credentialsFetcherHost != "" {
+		envVariables["CREDENTIALS_FETCHER_HOST_DIR"] = credentialsFetcherHost
+	}
+
 	// merge in platform-specific environment variables
 	for envKey, envValue := range getPlatformSpecificEnvVariables() {
 		envVariables[envKey] = envValue
+	}
+
+	envVar := os.Getenv(config.ECSGMSASupportEnvVar)
+	// check for the domain join only if ECS_GMSA_SUPPORTED environment variable is set to true
+	if envVar == "true" {
+		if isDomainJoined() {
+			// set the environment variable to true if the container instance is domain joined
+			envVariables["ECS_DOMAIN_JOINED_LINUX_INSTANCE"] = "true"
+		}
 	}
 
 	for key, val := range envVarsFromFiles {
@@ -306,6 +364,17 @@ func (c *client) getContainerConfig(envVarsFromFiles map[string]string) *godocke
 	if config.RunningInExternal() {
 		// Task networking is not supported when not running on EC2. Explicitly disable since it's enabled by default.
 		envVariables["ECS_ENABLE_TASK_ENI"] = "false"
+	}
+	if dockerVersionCompare(dockerAPIVersion, enableTaskENIDockerClientAPIVersion) < 0 {
+		// Task networking is not supported before docker API version 1.25
+		envVariables["ECS_ENABLE_TASK_ENI"] = "false"
+	}
+
+	if !isPathValid(config.MountDirectoryEBS(), true) {
+		// EBS Task Attach (EBSTA) is not supported for external instances
+		// If EBS mount directory fails to get created, tasks requiring EBSTA can not be supported
+		// Disable EBSTA Support for these cases
+		envVariables["ECS_EBSTA_SUPPORTED"] = "false"
 	}
 
 	var env []string
@@ -323,7 +392,7 @@ func (c *client) getContainerConfig(envVarsFromFiles map[string]string) *godocke
 func setLabels(cfg *godocker.Config, labelsStringRaw string) {
 	// Is there labels to add?
 	if len(labelsStringRaw) > 0 {
-		labels, err := generateLabelMap(labelsStringRaw)
+		labels, err := utils.JsonBlockToStringToStringMap(labelsStringRaw)
 		if err != nil {
 			// Are the labels valid?
 			log.Errorf("Failed to decode the container labels, skipping labels. Error: %s", err)
@@ -341,7 +410,13 @@ func (c *client) LoadEnvVars() map[string]string {
 	// merge in instance-specific environment variables
 	for envKey, envValue := range c.loadCustomInstanceEnvVars() {
 		if envKey == config.GPUSupportEnvVar && envValue == "true" {
-			if !nvidiaGPUDevicesPresent() {
+			// If environment variable with key `config.GPUSupportEnvVar` has value `true`, it is expected that
+			// NVIDIA GPU devices should eventually be present on the instance. Thus, do NOT give up and continue right
+			// away in the event that NVIDIA GPU devices are not yet present. Call
+			// `nvidiaGPUDevicesPresentWithRetries()` (instead of `nvidiaGPUDevicesPresent`) to retry and wait for a
+			// reasonable amount of time for NVIDIA GPU devices to be present before continuing.
+			if !nvidiaGPUDevicesPresentWithRetries() {
+				log.Warn("No GPU devices found, ignoring the GPU support config")
 				continue
 			}
 		}
@@ -388,12 +463,6 @@ func (c *client) getEnvVars(filename string) map[string]string {
 	return envVariables
 }
 
-func generateLabelMap(jsonBlock string) (map[string]string, error) {
-	out := map[string]string{}
-	err := json.Unmarshal([]byte(jsonBlock), &out)
-	return out, err
-}
-
 func (c *client) getHostConfig(envVarsFromFiles map[string]string) *godocker.HostConfig {
 	dockerSocketBind := getDockerSocketBind(envVarsFromFiles)
 
@@ -425,6 +494,23 @@ func (c *client) getHostConfig(envVarsFromFiles map[string]string) *godocker.Hos
 			if nvidiaGPUDevicesPresent() {
 				// bind mount gpu info dir
 				binds = append(binds, gpu.GPUInfoDirPath+":"+gpu.GPUInfoDirPath)
+
+				// Bind mount the MPS control binary and the MPS pipe directory so the
+				// agent can health-check the MPS control daemon for GPU sharing
+				if isPathValid(mpsControlBinary, false) {
+					binds = append(binds, mpsControlBinary+":"+mpsControlBinary)
+				}
+				if isPathValid(mpsPipeDirectory, true) {
+					binds = append(binds, mpsPipeDirectory+":"+mpsPipeDirectory)
+				}
+			}
+		}
+
+		if key == config.ECSGMSASupportEnvVar && val == "true" {
+			// only bind if the env variable gmsa support is set to true and the path to bind exists
+			credentialsfetcherSocketBind, volumeExists := getCredentialsFetcherSocketBind()
+			if volumeExists {
+				binds = append(binds, credentialsfetcherSocketBind)
 			}
 		}
 	}
@@ -432,16 +518,33 @@ func (c *client) getHostConfig(envVarsFromFiles map[string]string) *godocker.Hos
 	binds = append(binds, getDockerPluginDirBinds()...)
 
 	// only add bind mounts when the src file/directory exists on host; otherwise docker API create an empty directory on host
-	binds = append(binds, getCapabilityExecBinds()...)
+	binds = append(binds, getCapabilityBinds()...)
 
 	return createHostConfig(binds)
 }
 
+// getCredentialsFetcherSocketBind returns the corresponding bind for credentials fetcher socket.
+func getCredentialsFetcherSocketBind() (string, bool) {
+	credentialsFetcherUnixSocketHostPath, ok := config.HostCredentialsFetcherPath()
+	if ok && credentialsFetcherUnixSocketHostPath != "" {
+		// check whether the path to the credentials fetcher socket exists
+		_, err := config.OsStat(credentialsFetcherUnixSocketHostPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", false
+			}
+		}
+
+		return credentialsFetcherUnixSocketHostPath + ":" + credentialsFetcherUnixSocketHostPath, true
+	}
+	return "", false
+}
+
 // getDockerSocketBind returns the bind for Docker socket.
-// Value for the bind is as follow:
-// 1. DOCKER_HOST (as in os.Getenv) not set: source /var/run, dest /var/run
-// 2. DOCKER_HOST (as in os.Getenv) set: source DOCKER_HOST (as in os.Getenv, trim unix:// prefix),
-//   dest DOCKER_HOST (as in /etc/ecs/ecs.config, trim unix:// prefix)
+// Value for the bind is as follows:
+//  1. DOCKER_HOST (as in os.Getenv) not set: source /var/run, dest /var/run
+//  2. DOCKER_HOST (as in os.Getenv) set: source DOCKER_HOST (as in os.Getenv, trim unix:// prefix),
+//     dest DOCKER_HOST (as in /etc/ecs/ecs.config, trim unix:// prefix)
 //
 // On AL2, the value from os.Getenv is the same as the one from /etc/ecs/ecs.config, but on AL1 they might be different, which
 // is why I distinguish the two.
@@ -468,38 +571,31 @@ func getDockerPluginDirBinds() []string {
 	return pluginBinds
 }
 
-func getCapabilityExecBinds() []string {
-	hostResourcesDir := filepath.Join(hostResourcesRootDir, execCapabilityName)
-	containerResourcesDir := filepath.Join(containerResourcesRootDir, execCapabilityName)
+func getCapabilityBinds() []string {
+	var binds = []string{}
 
-	var binds []string
-
-	// bind mount the entire /host/dependency/path/execute-command/bin folder
-	hostBinDir := filepath.Join(hostResourcesDir, execBinRelativePath)
-	if isPathValid(hostBinDir, true) {
+	// bind mount the entire /host/dependency/path/ folder
+	// as readonly to support all managed dependencies
+	if isPathValid(hostResourcesRootDir, true) {
 		binds = append(binds,
-			hostBinDir+":"+filepath.Join(containerResourcesDir, execBinRelativePath)+readOnly)
+			hostResourcesRootDir+":"+containerResourcesRootDir+readOnly)
 	}
 
 	// bind mount the entire /host/dependency/path/execute-command/config folder
 	// in read-write mode to allow ecs-agent to write config files to host file system
 	// (docker will) create the config folder if it does not exist
-	hostConfigDir := filepath.Join(hostResourcesDir, execConfigRelativePath)
-	binds = append(binds,
-		hostConfigDir+":"+filepath.Join(containerResourcesDir, execConfigRelativePath))
-
-	// bind mount the entire /host/dependency/path/execute-command/certs folder
-	hostCertsDir := filepath.Join(hostResourcesDir, execCertsRelativePath)
-	if isPathValid(hostCertsDir, true) {
+	hostConfigDir := filepath.Join(hostResourcesRootDir, execCapabilityName, execConfigRelativePath)
+	// Check that execute-command folder is present not config folder
+	if isPathValid(filepath.Dir(hostConfigDir), true) {
 		binds = append(binds,
-			hostCertsDir+":"+filepath.Join(containerResourcesDir, execCertsRelativePath)+readOnly)
+			hostConfigDir+":"+filepath.Join(containerResourcesRootDir, execCapabilityName, execConfigRelativePath))
 	}
 
 	return binds
 }
 
 func defaultIsPathValid(path string, shouldBeDirectory bool) bool {
-	fileInfo, err := os.Stat(path)
+	fileInfo, err := config.OsStat(path)
 	if err != nil {
 		return false
 	}
@@ -519,6 +615,23 @@ func nvidiaGPUDevicesPresent() bool {
 		return false
 	}
 	return true
+}
+
+// nvidiaGPUDevicesPresentWithRetries checks if NVIDIA GPU devices are present in the instance. It retries if NVIDIA
+// GPU devices are not yet present every `nvidiaGPUDevicesPresentRetryTime` interval of time up to a maximum of
+// `nvidiaGPUDevicesPresentMaxRetries` retries.
+func nvidiaGPUDevicesPresentWithRetries() bool {
+	devicesPresent := checkNvidiaGPUDevicesPresence()
+	for i := 0; i < nvidiaGPUDevicesPresentMaxRetries; i++ {
+		if devicesPresent {
+			break
+		}
+		log.Warnf("NVIDIA GPU devices are not yet present, retrying (attempt %d/%d) in %d nanoseconds",
+			i+1, nvidiaGPUDevicesPresentMaxRetries, nvidiaGPUDevicesPresentRetryTime)
+		time.Sleep(nvidiaGPUDevicesPresentRetryTime)
+		devicesPresent = checkNvidiaGPUDevicesPresence()
+	}
+	return devicesPresent
 }
 
 var MatchFilePatternForGPU = FilePatternMatchForGPU
@@ -544,4 +657,56 @@ func (c *client) StopAgent() error {
 		return nil
 	}
 	return err
+}
+
+// isDomainJoined is used to validate if container instance is part of a valid active directory.
+func isDomainJoined() bool {
+	realmPath, err := execLookPath("realm")
+	if err != nil {
+		log.Error("realmd is not installed on the instance")
+		return false
+	}
+
+	if len(realmPath) == 0 {
+		log.Error("could not path of realm on the instance")
+		return false
+	}
+
+	realmCommmand := realmPath + " list"
+	realmCmdOutput, err := execCommand("bash", "-c", realmCommmand).Output()
+	if err != nil {
+		log.Error("failed to read realm info")
+		return false
+	}
+
+	realmOutputStr := string(realmCmdOutput)
+	if !strings.Contains(realmOutputStr, "realm-name") {
+		log.Error("couldn't not find realm name")
+		return false
+	}
+
+	return true
+}
+
+// FindDefaultBridgeNetworkInterfaceName is used to find the name of the default network interface
+// for docker bridge network mode.
+func (c *client) FindDefaultBridgeNetworkInterfaceName() (string, error) {
+	networks, err := c.docker.FilteredListNetworks(godocker.NetworkFilterOpts{
+		"driver": map[string]bool{"bridge": true},
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, network := range networks {
+		val, ok := network.Options[dockerDefaultBridgeInterfaceOption]
+		if ok {
+			if val == "true" {
+				interfaceName, ok := network.Options[dockerInterfaceNameOption]
+				if ok {
+					return interfaceName, nil
+				}
+			}
+		}
+	}
+	return "", ErrNoBridgeNetwork
 }

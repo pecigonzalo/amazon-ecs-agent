@@ -21,43 +21,44 @@ package mock_factory
 import (
 	reflect "reflect"
 
-	credentials "github.com/aws/amazon-ecs-agent/agent/credentials"
-	secretsmanageriface "github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
+	asm "github.com/aws/amazon-ecs-agent/agent/asm"
+	credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 	gomock "github.com/golang/mock/gomock"
 )
 
-// MockClientCreator is a mock of ClientCreator interface
+// MockClientCreator is a mock of ClientCreator interface.
 type MockClientCreator struct {
 	ctrl     *gomock.Controller
 	recorder *MockClientCreatorMockRecorder
 }
 
-// MockClientCreatorMockRecorder is the mock recorder for MockClientCreator
+// MockClientCreatorMockRecorder is the mock recorder for MockClientCreator.
 type MockClientCreatorMockRecorder struct {
 	mock *MockClientCreator
 }
 
-// NewMockClientCreator creates a new mock instance
+// NewMockClientCreator creates a new mock instance.
 func NewMockClientCreator(ctrl *gomock.Controller) *MockClientCreator {
 	mock := &MockClientCreator{ctrl: ctrl}
 	mock.recorder = &MockClientCreatorMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
+// EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockClientCreator) EXPECT() *MockClientCreatorMockRecorder {
 	return m.recorder
 }
 
-// NewASMClient mocks base method
-func (m *MockClientCreator) NewASMClient(arg0 string, arg1 credentials.IAMRoleCredentials) secretsmanageriface.SecretsManagerAPI {
+// NewASMClient mocks base method.
+func (m *MockClientCreator) NewASMClient(arg0 string, arg1 credentials.IAMRoleCredentials) (asm.SecretsManagerAPI, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "NewASMClient", arg0, arg1)
-	ret0, _ := ret[0].(secretsmanageriface.SecretsManagerAPI)
-	return ret0
+	ret0, _ := ret[0].(asm.SecretsManagerAPI)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
-// NewASMClient indicates an expected call of NewASMClient
+// NewASMClient indicates an expected call of NewASMClient.
 func (mr *MockClientCreatorMockRecorder) NewASMClient(arg0, arg1 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewASMClient", reflect.TypeOf((*MockClientCreator)(nil).NewASMClient), arg0, arg1)

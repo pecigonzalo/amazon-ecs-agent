@@ -1,5 +1,836 @@
 # Changelog
 
+# 1.108.3
+* Enhancement - Update golang.org/x/net to v0.62.0 [#5199](https://github.com/aws/amazon-ecs-agent/pull/5199)
+* Enhancement - Build the agent image CA bundle from the ca-certificates package in the Amazon Linux integrated rpm [#5195](https://github.com/aws/amazon-ecs-agent/pull/5195)
+* Enhancement - Bump ECS Exec SSM Agent to 3.3.5700.0 [#5188](https://github.com/aws/amazon-ecs-agent/pull/5188)
+* Enhancement - Bump github.com/prometheus/common from 0.72.1 to 0.73.1 in /ecs-agent and /agent [#5196](https://github.com/aws/amazon-ecs-agent/pull/5196)
+* Bugfix - Fixed false registration success on timeout [#5186](https://github.com/aws/amazon-ecs-agent/pull/5186)
+
+# 1.108.2
+* Enhancement - Enhancement - Update to golang 1.26.10 [#5183](https://github.com/aws/amazon-ecs-agent/pull/5183)
+* Enhancement - Bump github.com/klauspost/compress from 1.16.7 to 1.18.7 in /ecs-init [#5175](https://github.com/aws/amazon-ecs-agent/pull/5175)
+* Enhancement - - Bugfix - Skip ACS reconnect when the session context is already canceled [#5181](https://github.com/aws/amazon-ecs-agent/pull/5181)
+* Enhancement - Bump github.com/moby/sys/user from 0.3.0 to 0.4.1 in /ecs-init [#5172](https://github.com/aws/amazon-ecs-agent/pull/5172)
+* Enhancement - Enhancement - Narrow the Managed Instances daemon-bridge NAT source to the daemon address [#5167](https://github.com/aws/amazon-ecs-agent/pull/5167)
+* Bugfix - Bugfix - Skip CPU usage samples when the container CPU counter decreases [#5179](https://github.com/aws/amazon-ecs-agent/pull/5179)
+* Bugfix - Bugfix - Fix a data race when injecting AWS region environment variables into containers [#5178](https://github.com/aws/amazon-ecs-agent/pull/5178)
+
+# 1.108.1
+* Enhancement - Bump ECS Exec SSM Agent to 3.3.5390.0 [#5171](https://github.com/aws/amazon-ecs-agent/pull/5171)
+* Enhancement - Update to golang 1.26.9 [#5170](https://github.com/aws/amazon-ecs-agent/pull/5170)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/config from 1.33.6 to 1.33.8 in /ecs-agent, /agent and /ecs-init [#5169](https://github.com/aws/amazon-ecs-agent/pull/5169)
+* Enhancement - Stage ecs-anywhere exec binaries in a temporary directory and verify their signature [#5168](https://github.com/aws/amazon-ecs-agent/pull/5168)
+* Enhancement - Bump golang.org/x/time to 0.16.0 in /ecs-agent and /agent [#5165](https://github.com/aws/amazon-ecs-agent/pull/5165)
+
+# 1.108.0
+* Enhancement - Add ECS-Init install pointer for non-Amazon Linux AMIs to README [#5161](https://github.com/aws/amazon-ecs-agent/pull/5161)
+* Enhancement - Remove direct docker run instructions from README [#5160](https://github.com/aws/amazon-ecs-agent/pull/5160)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/config from 1.28.1 to 1.33.6 in /ecs-agent, /agent, and /ecs-init [#5159](https://github.com/aws/amazon-ecs-agent/pull/5159)
+* Feature - Enable IMDS IAM roles config resolution [#5154](https://github.com/aws/amazon-ecs-agent/pull/5154)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.33 to 1.7.36 in /agent [#5155](https://github.com/aws/amazon-ecs-agent/pull/5155)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.35 to 1.7.36 in /ecs-init [#5156](https://github.com/aws/amazon-ecs-agent/pull/5156)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/ec2 from 1.195.0 to 1.334.0 in /ecs-agent and /agent [#5148](https://github.com/aws/amazon-ecs-agent/pull/5148)
+* Enhancement - Bump google.golang.org/grpc from 1.83.1 to 1.83.2 in /ecs-agent, /ecs-agent/daemonimages/csidriver and /agent [#5153](https://github.com/aws/amazon-ecs-agent/pull/5153)
+* Enhancement - Bump go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp from 1.43.0 to 1.45.0 in /agent [#5141](https://github.com/aws/amazon-ecs-agent/pull/5141)
+* Enhancement - IMDS credential scanner/refresher updates [#5145](https://github.com/aws/amazon-ecs-agent/pull/5145)
+
+# 1.107.0
+* Feature - Add MPS GPU Sharing capability [#5139](https://github.com/aws/amazon-ecs-agent/pull/5139)
+  * Enhancement - Add MPS control daemon health gate task resource [#5107](https://github.com/aws/amazon-ecs-agent/pull/5107)
+  * Enhancement - Surface MPS control-daemon impairment reason as StatusReason [#5125](https://github.com/aws/amazon-ecs-agent/pull/5125)
+  * Enhancement - Attach the MPS control daemon health gate to MPS tasks [#5119](https://github.com/aws/amazon-ecs-agent/pull/5119)
+  * Enhancement - Add ACCELERATED_COMPUTE health check for the MPS control daemon [#5124](https://github.com/aws/amazon-ecs-agent/pull/5124)
+* Enhancement - Fetch GPG keys from S3 instead of GitHub in ECS Anywhere install script [#5130](https://github.com/aws/amazon-ecs-agent/pull/5130)
+* Enhancement - Bump github.com/prometheus/common from 0.66.1 to 0.71.0 in /ecs-agent [#5117](https://github.com/aws/amazon-ecs-agent/pull/5117)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/credentials from 1.19.32 to 1.20.4 in /agent [#5128](https://github.com/aws/amazon-ecs-agent/pull/5128)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.33 to 1.7.35 in /ecs-init [#5133](https://github.com/aws/amazon-ecs-agent/pull/5133)
+* Enhancement - Bump google.golang.org/grpc from 1.82.1 to 1.83.1 in /ecs-agent, /ecs-agent/daemonimages/csidriver and /agent [#5123](https://github.com/aws/amazon-ecs-agent/pull/5123)
+* Enhancement - Bump k8s.io/api from 0.28.1 to 0.37.0 in /agent [#5118](https://github.com/aws/amazon-ecs-agent/pull/5118)
+* Enhancement - Correct broken systemd link in README [#5129](https://github.com/aws/amazon-ecs-agent/pull/5129)
+
+# 1.106.2
+* Enhancement - Bump golang.org/x/text and related dependencies [#5100](https://github.com/aws/amazon-ecs-agent/pull/5100)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/feature/ec2/imds from 1.18.33 to 1.18.38 in /ecs-agent [#5093](https://github.com/aws/amazon-ecs-agent/pull/5093)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/secretsmanager from 1.35.2 to 1.44.7 in /agent [#5094](https://github.com/aws/amazon-ecs-agent/pull/5094)
+* Enhancement - Bump github.com/gorilla/websocket from 1.5.0 to 1.5.3 [#5108](https://github.com/aws/amazon-ecs-agent/pull/5108)
+* Enhancement - Update Go version to 1.26.7 [#5105](https://github.com/aws/amazon-ecs-agent/pull/5105)
+* Enhancement - Add amazon-ecs-agent.gpg and amazon-ssm-agent.gpg to the CodePipeline release artifacts [#5101](https://github.com/aws/amazon-ecs-agent/pull/5101)
+* Enhancement - IMDS credentials scanner/refresher: Add logging and validations [#5091](https://github.com/aws/amazon-ecs-agent/pull/5091)
+* Enhancement - Bump github.com/containerd/cgroups/v3 from 3.0.4 to 3.1.3 in /agent [#5081](https://github.com/aws/amazon-ecs-agent/pull/5081)
+* Enhancement - Bump google.golang.org/grpc from 1.81.1 to 1.82.1 in /ecs-agent and /agent [#5085](https://github.com/aws/amazon-ecs-agent/pull/5085)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/credentials from 1.19.29 to 1.19.32 in /ecs-agent, /agent and /ecs-init [#5080](https://github.com/aws/amazon-ecs-agent/pull/5080)
+* Bugfix - fix(handlers): raise fault rate limit to 1 rps [#5092](https://github.com/aws/amazon-ecs-agent/pull/5092)
+* Feature - Nvidia MPS GPU sharing (not yet enabled)
+  * Add MPS control-daemon health probe [#5095](https://github.com/aws/amazon-ecs-agent/pull/5095)
+  * Add per-GPU memory accounting to host resource manager [#5090](https://github.com/aws/amazon-ecs-agent/pull/5090)
+  * Allow MPS containers to colocate on a shared GPU [#5083](https://github.com/aws/amazon-ecs-agent/pull/5083)
+  * Mount MPS control binary and pipe dir into the agent container [#5086](https://github.com/aws/amazon-ecs-agent/pull/5086)
+  * Move MPS pipe directory to /run/mps-ecs [#5102](https://github.com/aws/amazon-ecs-agent/pull/5102)
+
+# 1.106.1
+* Enhancement - Add retry for EFS volume creation to handle plugin timeout errors caused by concurrent mount operation [#5077](https://github.com/aws/amazon-ecs-agent/pull/5077)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/config from 1.32.23 to 1.32.31 in /agent [#5064](https://github.com/aws/amazon-ecs-agent/pull/5064)
+* Enhancement - Bump google.golang.org/grpc from 1.79.3 to 1.82.1 in /ecs-agent/daemonimages/csidriver [#5056](https://github.com/aws/amazon-ecs-agent/pull/5056)
+* Enhancement - Bump github.com/gorilla/mux from 1.8.0 to 1.8.1 in /ecs-agent [#5063](https://github.com/aws/amazon-ecs-agent/pull/5063)
+* Enhancement - add nos3readcache S3 Files mount option [#5062](https://github.com/aws/amazon-ecs-agent/pull/5062)
+* Feature - Nvidia MPS GPU sharing (not yet enabled)
+  * Add ecs.capability.gpu-sharing-mps capability for NVIDIA MPS GPU sharing [#5053](https://github.com/aws/amazon-ecs-agent/pull/5053)
+  * Inject NVIDIA MPS env vars and pipe mount into MPS containers [#5082](https://github.com/aws/amazon-ecs-agent/pull/5082)
+  * Map ACS GPU sharingStrategy onto the internal container model for MPS [#5076](https://github.com/aws/amazon-ecs-agent/pull/5076)
+  * Gate gpu-sharing-mps on complete per-GPU memory- #5075 [#5075](https://github.com/aws/amazon-ecs-agent/pull/5075)
+  * Regenerate ACS model for GPU sharingStrategy and validate it [#5071](https://github.com/aws/amazon-ecs-agent/pull/5071)
+  * Report per-GPU memory at container instance registration for GPU sharing [#5061](https://github.com/aws/amazon-ecs-agent/pull/5061)
+  * Regenerate ECS SDK with gpuInfo on PlatformDevice [#5060](https://github.com/aws/amazon-ecs-agent/pull/5060)
+
+# 1.106.0
+* Feature - Feature - Add FIS-driven DNS refresh add-sources endpoint for network-latency and network-packet-loss faults [#5029](https://github.com/aws/amazon-ecs-agent/pull/5029)
+* Enhancement - Enhancement: Update SSM Agent version to 3.3.4624.0 for ECS exec [#5054](https://github.com/aws/amazon-ecs-agent/pull/5054)
+* Enhancement - Backfill host DNS config on isolated platform [#5047](https://github.com/aws/amazon-ecs-agent/pull/5047)
+* Enhancement - Bump github.com/aws/smithy-go from 1.27.3 to 1.27.4 in /agent [#5051](https://github.com/aws/amazon-ecs-agent/pull/5051)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/credentials in /ecs-agent, /agent and /ecs-init to 1.19.29 [#5050](https://github.com/aws/amazon-ecs-agent/pull/5050)
+* Enhancement - Bump actions/setup-go from 6 to 7 in /.github/workflows [#5049](https://github.com/aws/amazon-ecs-agent/pull/5049)
+* Enhancement - Update Go version to 1.25.12 [#5048](https://github.com/aws/amazon-ecs-agent/pull/5048)
+* Enhancement - Bump github.com/vishvananda/netlink from 1.2.1-beta.2 to 1.3.1 in /ecs-agent, /agent and /ecs-init [#5037](https://github.com/aws/amazon-ecs-agent/pull/5037)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/credentials from 1.19.22 to 1.19.28 in /agent [#5038](https://github.com/aws/amazon-ecs-agent/pull/5038)
+* Enhancement - Bump github.com/hectane/go-acl from 0.0.0-20190604041725-da78bae5fc95 to 1.0.0 in /agent [#5022](https://github.com/aws/amazon-ecs-agent/pull/5022)
+* Enhancement - chore(deps): bump github.com/cilium/ebpf from v0.16.0 to v0.22.0 in /agent [#5034](https://github.com/aws/amazon-ecs-agent/pull/5034)
+* Enhancement - Bump golang.org/x/net from 0.48.0 to 0.55.0 in /ecs-agent/daemonimages/csidriver [#5031](https://github.com/aws/amazon-ecs-agent/pull/5031)
+* Enhancement - api-2.json: Add CONFIDENTIAL_PARTITION and attestationPolicy to api m… [#5033](https://github.com/aws/amazon-ecs-agent/pull/5033)
+* Bugfix - Fix flaky TestHostResourceManagerTrickleQueue integration test [#5026](https://github.com/aws/amazon-ecs-agent/pull/5026)
+
+# 1.105.1
+* Enhancement - Populate ImageDigest for Service Connect sidecar containers [#5006](https://github.com/aws/amazon-ecs-agent/pull/5006)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.32 to 1.7.33 in /agent [#5013](https://github.com/aws/amazon-ecs-agent/pull/5013)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.32 to 1.7.33 in /ecs-init [#5014](https://github.com/aws/amazon-ecs-agent/pull/5014)
+* Enhancement - Bump github.com/container-storage-interface/spec from 1.9.0 to 1.12.0 in /agent [#5008](https://github.com/aws/amazon-ecs-agent/pull/5008)
+* Bugfix - Validate environment file S3 keys so they stay within the task resource directory [#5011](https://github.com/aws/amazon-ecs-agent/pull/5011)
+
+# 1.105.0
+* Feature - feat(acs-model): Add LogDriverVolumeConfiguration to ACS Volume shape [#5005](https://github.com/aws/amazon-ecs-agent/pull/5005)
+* Enhancement - Removed cloudwatch from windows agent capabilities [#5002](https://github.com/aws/amazon-ecs-agent/pull/5002)
+* Enhancement - Update Go version to 1.25.11 [#5003](https://github.com/aws/amazon-ecs-agent/pull/5003)
+* Enhancement - Update golang.org/x/net to v0.56.0 [#5004](https://github.com/aws/amazon-ecs-agent/pull/5004)
+* Enhancement - Add IsolatedDebugPlatform with DNS field backfill [#4998](https://github.com/aws/amazon-ecs-agent/pull/4998)
+* Enhancement - enhancement: Migrate EBS CSI Driver image to AL2023 [#4979](https://github.com/aws/amazon-ecs-agent/pull/4979)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/config from 1.29.14 to 1.32.23 in /agent [#4997](https://github.com/aws/amazon-ecs-agent/pull/4997)
+* Enhancement - Detect cloud-init failure at startup to prevent silent cluster miscon… [#4988](https://github.com/aws/amazon-ecs-agent/pull/4988)
+* Enhancement - Add isolated_linux platform for isolated container networking [#4991](https://github.com/aws/amazon-ecs-agent/pull/4991)
+* Enhancement - Emit failure metrics from IMDS credentials scanner [#4995](https://github.com/aws/amazon-ecs-agent/pull/4995)
+* Enhancement - Update SSM GPG key for ECS Anywhere installation [#4992](https://github.com/aws/amazon-ecs-agent/pull/4992)
+* Enhancement - Add Host type and BuildHosts to populate netNS.Hosts [#4985](https://github.com/aws/amazon-ecs-agent/pull/4985)
+* Bugfix - Fix TestClientProxy to obtain available port dynamically [#4999](https://github.com/aws/amazon-ecs-agent/pull/4999)
+* Bugfix - Fix flaky TestDPEAndACSConnFailureTrackerTracking nil pointer panic [#4993](https://github.com/aws/amazon-ecs-agent/pull/4993)
+
+# 1.104.0
+* Feature - Add support for ECS S3 Files integration [#4962](https://github.com/aws/amazon-ecs-agent/pull/4962)
+* Feature - Add ECS_PROPAGATE_TASK_MEMORY_LIMIT_CGROUPV2 opt-in config [#4986](https://github.com/aws/amazon-ecs-agent/pull/4986)
+* Enhancement - rename IMDSCredentialRefresher to IMDSCredentialsRefresher [#4969](https://github.com/aws/amazon-ecs-agent/pull/4969)
+* Enhancement - inject AWS_REGION and AWS_DEFAULT_REGION into task containers [#4946](https://github.com/aws/amazon-ecs-agent/pull/4946)
+* Enhancement - Export namespace prefix in IMDS scanner shared library. [#4977](https://github.com/aws/amazon-ecs-agent/pull/4977)
+* Enhancement - Add TrustedExecutionConfiguration to task payload models [#4980](https://github.com/aws/amazon-ecs-agent/pull/4980)
+* Enhancement - Add FailureTracker for DiscoverPollEndpoint + ACS/TCS connect workflows [#4983](https://github.com/aws/amazon-ecs-agent/pull/4983)
+* Enhancement - Bump github.com/gorilla/mux from 1.8.0 to 1.8.1 in /agent [#4976](https://github.com/aws/amazon-ecs-agent/pull/4976)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.29 to 1.7.32 in /ecs-init [#4970](https://github.com/aws/amazon-ecs-agent/pull/4970)
+* Enhancement - Bump google.golang.org/grpc from 1.79.3 to 1.81.1 in /ecs-agent [#4974](https://github.com/aws/amazon-ecs-agent/pull/4974)
+* Enhancement - Bump github.com/containerd/containerd from 1.7.29 to 1.7.32 in /agent [#4982](https://github.com/aws/amazon-ecs-agent/pull/4982)
+* Enhancement - Bump github.com/opencontainers/image-spec from 1.1.0 to 1.1.1 in /agent [#4987](https://github.com/aws/amazon-ecs-agent/pull/4987)
+
+# 1.103.2
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/fsx from 1.53.1 to 1.65.10 in /agent [#4966](https://github.com/aws/amazon-ecs-agent/pull/4966)
+* Enhancement - Add semgrep security scan for command injection [#4959](https://github.com/aws/amazon-ecs-agent/pull/4959)
+* Enhancement - Bump golang.org/x/tools from 0.39.0 to 0.45.0 in /ecs-agent [#4965](https://github.com/aws/amazon-ecs-agent/pull/4965)
+* Enhancement - Add integration test for credential refresher [#4961](https://github.com/aws/amazon-ecs-agent/pull/4961)
+* Enhancement - Bump golang.org/x/tools from 0.42.0 to 0.45.0 in /agent [#4873](https://github.com/aws/amazon-ecs-agent/pull/4873)
+* Enhancement - Update Go version to 1.25.10 [#4960](https://github.com/aws/amazon-ecs-agent/pull/4960)
+* Enhancement - Bump go.etcd.io/bbolt from 1.3.9 to 1.4.3 in /ecs-agent [#4872](https://github.com/aws/amazon-ecs-agent/pull/4872)
+* Enhancement - update credentials-fetcher retry comments/tests [#4954](https://github.com/aws/amazon-ecs-agent/pull/4954)
+* Enhancement - Enhancement - Add retry mechanism to credentialsfetcher [#4948](https://github.com/aws/amazon-ecs-agent/pull/4948)
+* Enhancement - Add IMDS credential refresher [#4953](https://github.com/aws/amazon-ecs-agent/pull/4953)
+* Bugfix - fix flaky tests depending on timers [#4955](https://github.com/aws/amazon-ecs-agent/pull/4955)
+
+# 1.103.1
+* Feature - Implement IMDS scanner for task credential retrieval, in the shared library [#4945](https://github.com/aws/amazon-ecs-agent/pull/4945)
+* Feature - Add config/capability for IMDS-based task credential retrieval (disabled for now) [#4938](https://github.com/aws/amazon-ecs-agent/pull/4938)
+* Feature - Add IMDS credential scanner interface and capability constant for IMDS-based task credential retrieval [#4937](https://github.com/aws/amazon-ecs-agent/pull/4937)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs from 1.47.3 to 1.65.0 in /agent [#4921](https://github.com/aws/amazon-ecs-agent/pull/4921)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/s3 from 1.63.1 to 1.97.3 in /ecs-init [#4923](https://github.com/aws/amazon-ecs-agent/pull/4923)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/s3 from 1.79.2 to 1.97.3 in /agent [#4924](https://github.com/aws/amazon-ecs-agent/pull/4924)
+* Enhancement - Bump go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp from 1.32.0 to 1.43.0 in /agent [#4926](https://github.com/aws/amazon-ecs-agent/pull/4926)
+* Enhancement - Truncate log values to make agent logs less verbose [#4940](https://github.com/aws/amazon-ecs-agent/pull/4940)
+
+# 1.103.0
+* Enhancement - Golang bump: 1.25.9 [#4935](https://github.com/aws/amazon-ecs-agent/pull/4935)
+* Enhancement - Use env variable to read user input when mounting FSx volumes [#4934](https://github.com/aws/amazon-ecs-agent/pull/4934)
+* Enhancement - Enhancement - Replace SSM Dualstack endpoint resolution logic with UseDualStackEndpoint [#4931](https://github.com/aws/amazon-ecs-agent/pull/4931)
+* Enhancement - Emit duration metrics for TACS connect/disconnect [#4928](https://github.com/aws/amazon-ecs-agent/pull/4928)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream from 1.6.10 to 1.7.8 in /agent [#4922](https://github.com/aws/amazon-ecs-agent/pull/4922)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream from 1.6.5 to 1.7.8 in /ecs-init [#4925](https://github.com/aws/amazon-ecs-agent/pull/4925)
+* Enhancement - Track and emit metric for disconnect time from ACS [#4920](https://github.com/aws/amazon-ecs-agent/pull/4920)
+* Enhancement - engine: skip execution role checks when task desired status is stopped [#4918](https://github.com/aws/amazon-ecs-agent/pull/4918)
+* Enhancement - Add NeuronDevices type and sysfs-based device discovery [#4919](https://github.com/aws/amazon-ecs-agent/pull/4919)
+* Bugfix - Fix release workflow branch handling and add GitHub App token [#4929](https://github.com/aws/amazon-ecs-agent/pull/4929)
+* Bugfix - Conditionally add IPv6 subnet to IPAM config when IPv6 … [#4916](https://github.com/aws/amazon-ecs-agent/pull/4916)
+
+# 1.102.2
+* Enhancement - Update SSM exec agent version to 3.3.4108.0 [#4912](https://github.com/aws/amazon-ecs-agent/pull/4912)
+* Enhancement - Update Go version to 1.25.8 [#4894](https://github.com/aws/amazon-ecs-agent/pull/4894)
+* Enhancement - Apply skip-gpg-check to both ecs-init and ssm agent [#4901](https://github.com/aws/amazon-ecs-agent/pull/4901)
+* Enhancement - Bump google.golang.org/grpc from 1.78.0 to 1.79.3 [#4906](https://github.com/aws/amazon-ecs-agent/pull/4906)
+
+# 1.102.1
+* Enhancement - Improve ENI watcher udev logging [#4887](https://github.com/aws/amazon-ecs-agent/pull/4887)
+* Enhancement - Update go version to 1.25.7, Update unit test coverage logic [#4886](https://github.com/aws/amazon-ecs-agent/pull/4886)
+* Enhancement - Upgrade prometheus deps [#4883](https://github.com/aws/amazon-ecs-agent/pull/4883)
+* Enhancement - Use static IP for daemon tasks for Managed Instances, also updates amazon-ecs-cni-plugins [#4881](https://github.com/aws/amazon-ecs-agent/pull/4881)
+* Bugfix - Fix IMDS client rate limiting to prevent token refresh failures after 401 responses [#4870](https://github.com/aws/amazon-ecs-agent/pull/4870)
+
+# 1.102.0
+* Enhancement - Support AZ ID for TMDS [#4848](https://github.com/aws/amazon-ecs-agent/pull/4848)
+* Enhancement - Improved net utils logging [#4861](https://github.com/aws/amazon-ecs-agent/pull/4861)
+* Enhancement - FIPS support for Service Connect [#4866](https://github.com/aws/amazon-ecs-agent/pull/4866)
+* Bugfix - netlib: Add IPv6 support for daemon-bridge network mode on managed Linux platform [#4862](https://github.com/aws/amazon-ecs-agent/pull/4862)
+* Bugfix - Update golang to 1.24.13 [#4869](https://github.com/aws/amazon-ecs-agent/pull/4869)
+
+# 1.101.3
+* Enhancement - Added ecs-init config for Chainguard OS [#4775](https://github.com/aws/amazon-ecs-agent/pull/4775)
+* Enhancement - fix resolv.conf for SC tasks on ECS Managed Instances [#4849](https://github.com/aws/amazon-ecs-agent/pull/4849)
+* Enhancement - Cached IMDS responses to mitigate linklocal throttle [#4847](https://github.com/aws/amazon-ecs-agent/pull/4847)
+* Enhancement - Update Go version for builds to 1.24.12 [#4852](https://github.com/aws/amazon-ecs-agent/pull/4852)
+* Enhancement - Bump github.com/containernetworking/cni from 1.2.3 to 1.3.0 in /agent [#4846](https://github.com/aws/amazon-ecs-agent/pull/4846)
+* Enhancemnet - Bump google.golang.org/grpc from 1.62.0 to 1.78.0 in /ecs-agent [#4845](https://github.com/aws/amazon-ecs-agent/pull/4845)
+* BugFix - Fixed ECR authentication failure when AWS_USE_FIPS_ENDPOINT=true and ECS control plane sends a FIPS endpoint override [#4850](https://github.com/aws/amazon-ecs-agent/pull/4850)
+
+# 1.101.2
+* Enhancement - Update SSM Agent version to 3.3.3572.0 [#4837](https://github.com/aws/amazon-ecs-agent/pull/4837)
+* Bugfix - Wait for execution role credentials to create task resource upon agent restart [#4827](https://github.com/aws/amazon-ecs-agent/pull/4827)
+* Bugfix - Fix tmds response for unavailable credentials upon agent restart [4833](https://github.com/aws/amazon-ecs-agent/pull/4833)
+* Bugfix - Make block I/O stat Op parsing case insensitive [#4836](https://github.com/aws/amazon-ecs-agent/pull/4836)
+* Bugfix - Fixes EBS volumes failing to mount on Windows due to chown/chmod [#4838](https://github.com/aws/amazon-ecs-agent/pull/4838)
+
+# 1.101.1
+* Enhancement - Bump github.com/containerd/containerd from 1.7.27 to 1.7.29 in /ecs-init [#4809](https://github.com/aws/amazon-ecs-agent/pull/4809)
+* Enhancement - Update go version to 1.24.11 [#4823](https://github.com/aws/amazon-ecs-agent/pull/4823)
+
+# 1.101.0
+* Feature - Add new environment variable `ECS_PAUSE_LABELS` to apply custom labels to pause containers [#4789](https://github.com/aws/amazon-ecs-agent/pull/4789)
+* Enhancement - Update Go version to 1.24.9 [#4813](https://github.com/aws/amazon-ecs-agent/pull/4813)
+
+# 1.100.1
+* Enhancement - Update SSM Agent version to 3.3.3050.0 [#4793](https://github.com/aws/amazon-ecs-agent/pull/4793)
+* Enhancement - Update amazon-vpc-cni-plugins to consume updated dependencies in a4e9ac0 [#4801](https://github.com/aws/amazon-ecs-agent/pull/4801)
+* Enhancement - Check if ECS data directory exists within agent container [#4802](https://github.com/aws/amazon-ecs-agent/pull/4802)
+* Bugfix - Stop collecting Service Connect stats only when there are zero running containers in the task [#4796](https://github.com/aws/amazon-ecs-agent/pull/4796)
+
+# 1.100.0
+* Feature - Add flowsPercent parameter to network latency and packet loss fault injection endpoints [4780](https://github.com/aws/amazon-ecs-agent/pull/4780)
+* Enhancement - Default to size-based log file rollover instead of hourly [4776](https://github.com/aws/amazon-ecs-agent/pull/4776)
+* Enhancement - Use same precedence for credential providers in Windows and Linux [4788](https://github.com/aws/amazon-ecs-agent/pull/4788)
+* Bugfix - Skip iptables rules for introspection access from docker bridge when no bridge is found [4785](https://github.com/aws/amazon-ecs-agent/pull/4785)
+* Bugfix - Fixes bug in DNS configuration for SC tasks in BR platforms [4787](https://github.com/aws/amazon-ecs-agent/pull/4787)
+* Bugfix - Fix undercounting of network stats when using the awsvpc networking mode [4766](https://github.com/aws/amazon-ecs-agent/pull/4766)
+
+# 1.99.1
+* Enhancement - Update README and remove circular directions [4774](https://github.com/aws/amazon-ecs-agent/pull/4774)
+* Bugfix - Fix agent update handling for IPv6-only instances [4781](https://github.com/aws/amazon-ecs-agent/pull/4781)
+
+# 1.99.0
+* Feature - Handle ecs.os-type-detailed attribute container instance registration [4724](https://github.com/aws/amazon-ecs-agent/pull/4724)
+* Feature - Support EBS task attach non-root user mode [4757](https://github.com/aws/amazon-ecs-agent/pull/4757)
+* Enhancement - Add container name visibility to the ListTagsForResource CloudTrail events coming from ECS agent [4760](https://github.com/aws/amazon-ecs-agent/pull/4760)
+* Enhancement - Get correct S3 URL suffix for EUSC regions in ecs-anywhere-install.sh [4761](https://github.com/aws/amazon-ecs-agent/pull/4761)
+* Enhancement - Remove unwanted docker-remote-api capabilities [4765](https://github.com/aws/amazon-ecs-agent/pull/4765)
+* Enhancement - Update ECS Anywhere exec agent version to 3.3.2958.0 [4768](https://github.com/aws/amazon-ecs-agent/pull/4768)
+
+# 1.98.0
+* Feature - Support for IPv6-only environments [4695](https://github.com/aws/amazon-ecs-agent/pull/4695)
+* Enhancement - Add groundwork for ECS_INSTANCE_IP_COMPATIBILITY override parameter [#4745](https://github.com/aws/amazon-ecs-agent/pull/4745)
+* Enhancement - Populate HostIPv6Address in container metadata file for IPv6-only instances [4753](https://github.com/aws/amazon-ecs-agent/pull/4753)
+* Enhancement - Update network latency fault check [4726](https://github.com/aws/amazon-ecs-agent/pull/4726)
+* Enhancement - Update exec agent configuration to support ipv6-only environments when ready [4708](https://github.com/aws/amazon-ecs-agent/pull/4708)
+* Enhancement - Bump minimum required docker version for ecs-init rpm to 20.10 [4732](https://github.com/aws/amazon-ecs-agent/pull/4732)
+* Bugfix - Initialize LastUpdated during healthcheck initialization. [#4750](https://github.com/aws/amazon-ecs-agent/pull/4750)
+* Bugfix - Make bridge pause containers appear first in task metadata response as a workaround for Service Connect Agents v1.29.12.1 and older [4749](https://github.com/aws/amazon-ecs-agent/pull/4749)
+* Bugfix - Fix CloudWatchLogs endpoints key in exec SSM Agent config for IPv6-only case [4755](https://github.com/aws/amazon-ecs-agent/pull/4755)
+
+# 1.97.1
+* Enhancement - Check if IPv6 kernel config file exists before using ip6tables [#4744](https://github.com/aws/amazon-ecs-agent/pull/4744)
+* Bugfix - Scope down IP address depletion fix to managed linux platform only [#4741](https://github.com/aws/amazon-ecs-agent/pull/4741)
+
+# 1.97.0
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/ssm to 1.60.0 in /agent [#4704](https://github.com/aws/amazon-ecs-agent/pull/4704)
+* Enhancement - Add Exponential/Backoff retry to GetResourceTags [#4710](https://github.com/aws/amazon-ecs-agent/pull/4710)
+* Enhancement - Add detailed OS family value to HTTPClient User Agent header [#4705](https://github.com/aws/amazon-ecs-agent/pull/4705)
+* Enhancement - Bump github.com/aws/aws-sdk-go-v2/service/ecr to 1.45.1 in /agent [#4713](https://github.com/aws/amazon-ecs-agent/pull/4713)
+* Enhancement - Fixed "unrecognized formatter" error by registering custom log formatter before loading seelog configuration [#4718](https://github.com/aws/amazon-ecs-agent/pull/4718)
+* Enhancement - Update aws-sdk-go-v2 to 1.36.6 [#4723](https://github.com/aws/amazon-ecs-agent/pull/4723)
+* Enhancement - Add eusc-de-east-1 to unresolved regions for CW logs endpoint [#4725](https://github.com/aws/amazon-ecs-agent/pull/4725)
+* Enhancement - Restrict introspection server access to local network by default [#4706](https://github.com/aws/amazon-ecs-agent/pull/4706)
+* Enhancement - Update Go version to 1.23.11 [#4728](https://github.com/aws/amazon-ecs-agent/pull/4728)
+
+# 1.96.0
+* Feature - Support ECS Firelens non-root user mode [#4697](https://github.com/aws/amazon-ecs-agent/pull/4697)
+* Enhancement - Consume dns server from payload [#4668](https://github.com/aws/amazon-ecs-agent/pull/4668)
+* Enhancement - [TMDS Fault Injection] Improve network interface detection to handle multiple default interfaces in host mode and update IPv6-only task identification [#4670](https://github.com/aws/amazon-ecs-agent/pull/4670)
+* Enhancement - Stricter validation for task metadata in fault injection handlers [#4676](https://github.com/aws/amazon-ecs-agent/pull/4676)
+* Enhancement - Require ip6tables for fault injection capability on IPv6-only instances [#4675](https://github.com/aws/amazon-ecs-agent/pull/4675)
+* Enhancement - Add empty implementation for GetDefaultNetworkInterfaces method on unsupported platforms [#4681](https://github.com/aws/amazon-ecs-agent/pull/4681)
+* Enhancement - Update SSM Agent for Exec for ECS Anywhere to 3.3.2299.0 [#4690](https://github.com/aws/amazon-ecs-agent/pull/4690)
+* Enhancement - Update Go version to 1.23.10 [#4698](https://github.com/aws/amazon-ecs-agent/pull/4698)
+* Bugfix - Network latency and packet loss faults should apply to all default network interfaces in host mode [#4671](https://github.com/aws/amazon-ecs-agent/pull/4671)
+* Bugfix - Determine IP compatibility of the instance using all ENIS and not just the primary ENI [#4674](https://github.com/aws/amazon-ecs-agent/pull/4674)
+* Bugfix - Fix "default" ecs cluster auto-create logic [#4689](https://github.com/aws/amazon-ecs-agent/pull/4689)
+
+# 1.95.0
+* Enhancement - IPv6-only support
+  * Add support for IPv6 targets to network-latency and network-packet-loss faults [#4645](https://github.com/aws/amazon-ecs-agent/pull/4645)
+  * SubnetGatewayIPV6Address and IPv6SubnetCIDRBlock metadata for IPv6-only tasks [#4649](https://github.com/aws/amazon-ecs-agent/pull/4649)
+  * Network bindings for IPv6-only instances [#4651](https://github.com/aws/amazon-ecs-agent/pull/4651)
+  * ECS Client dual stack endpoint usage [#4652](https://github.com/aws/amazon-ecs-agent/pull/4652)
+  * Dual stack EC2 client on IPv6-only instances [#4658](https://github.com/aws/amazon-ecs-agent/pull/4658)
+  * Net utils for finding default network interfaces [#4665](https://github.com/aws/amazon-ecs-agent/pull/4665)
+* Enhancement - clean up v1 credentials chain [#4647](https://github.com/aws/amazon-ecs-agent/pull/4647)
+* Enhancement - Set DeviceName to eth1 for managed instances [#4636](https://github.com/aws/amazon-ecs-agent/pull/4636)
+* Enhancement - Migrate from github.com/docker/distribution/reference to github.com/distribution/reference [#4643](https://github.com/aws/amazon-ecs-agent/pull/4643)
+* Enhancement - Enable DualStack ECR Image URI [#4612](https://github.com/aws/amazon-ecs-agent/pull/4612)
+* Enhancement - Move duplicate awsrulesfn package to the ecs-agent module [#4661](https://github.com/aws/amazon-ecs-agent/pull/4661)
+* Enhancement - Fault Injection - Add a general error case for default network interface resolution errors [#4666](https://github.com/aws/amazon-ecs-agent/pull/4666)
+* Bugfix - Make loopback interface lookup more robust [#4648](https://github.com/aws/amazon-ecs-agent/pull/4648)
+* Bugfix - SubnetGatewayIPv6Address metadata field name fix [#4650](https://github.com/aws/amazon-ecs-agent/pull/4650)
+* Bugfix - Remove duplicate ipcompatibilty package [#4654](https://github.com/aws/amazon-ecs-agent/pull/4654)
+
+# 1.94.0
+* Enhancement - aws-sdk-go-v2 migration
+  * Migrate awserr/request to aws-go-sdk-v2 [#4624](https://github.com/aws/amazon-ecs-agent/pull/4624)
+  * Migrate jsonutil to encoding/json for aws-sdk-go-v2 migration [#4626](https://github.com/aws/amazon-ecs-agent/pull/4626)
+* Enhancement - Add support for custom providers to determine the initial amount of available memory on a container instance [#4617](https://github.com/aws/amazon-ecs-agent/pull/4617)
+* Enhancement - IPv6-only support
+  * Include container IPv6 addresses (if available) in container metadata file for bridge mode tasks [#4616](https://github.com/aws/amazon-ecs-agent/pull/4616)
+  * Create a route for TMDS access on host mode on IPv6-only instances [#4633](https://github.com/aws/amazon-ecs-agent/pull/4633)
+  * Expand the network blackhole port to allow drop packets for IPv6 [#4629](https://github.com/aws/amazon-ecs-agent/pull/4629)
+  * Add a DualStackEnabled ECS client option and a SubnetGatewayIPV6Address field under NetworkInterfaceProperties [#4632](https://github.com/aws/amazon-ecs-agent/pull/4632)
+  * Use IPv6 addresses when generating extraHosts for IPv6-only awsvpc mode tasks [#4627](https://github.com/aws/amazon-ecs-agent/pull/4627)
+  * SSM Client resolves to dualstack endpoint on IPV6-only instances [#4623](https://github.com/aws/amazon-ecs-agent/pull/4623)
+  * Support task ENI setup for IPv6 only tasks [#4641](https://github.com/aws/amazon-ecs-agent/pull/4641)
+* Enhancement - Use ECS_AGENT_PID_NAMESPACE_HOST to run agent container in pid host mode [#4595](https://github.com/aws/amazon-ecs-agent/pull/4595)
+* Bugfix - reduce unnecessary "redundant state change" logs [#4639](https://github.com/aws/amazon-ecs-agent/pull/4639)
+
+# 1.93.1
+* Enhancement - aws-sdk-go-v2 migration
+  * ECR Client [#4550](https://github.com/aws/amazon-ecs-agent/pull/4550)
+  * S3 Client [#4564](https://github.com/aws/amazon-ecs-agent/pull/4564)
+  * TCS Client [#4554](https://github.com/aws/amazon-ecs-agent/pull/4554)
+  * SSM Client [#4611](https://github.com/aws/amazon-ecs-agent/pull/4611)
+  * FSx Client [#4621](https://github.com/aws/amazon-ecs-agent/pull/4621)
+  * ECS-agent shared library [#4583](https://github.com/aws/amazon-ecs-agent/pull/4583)
+  * Docker agent-related files [#4608](https://github.com/aws/amazon-ecs-agent/pull/4608)
+  * Add awslogs-endpoint for isolated regions [#4570](https://github.com/aws/amazon-ecs-agent/pull/4570)
+  * Replace v1 endpoints package with internal AWS SDK v2 partition metadata [#4614](https://github.com/aws/amazon-ecs-agent/pull/4614)
+* Enhancement - IPv6-only support
+  * S3 and S3Manager clients resolve to dualstack endpoint on IPV6-only instances [#4580](https://github.com/aws/amazon-ecs-agent/pull/4580)
+  * TaskProtection Client resolves to dualstack endpoint on IPV6-only instances [#4607](https://github.com/aws/amazon-ecs-agent/pull/4607)
+  * Populate IPv6 subnet gateway address from ACS payload [#4604](https://github.com/aws/amazon-ecs-agent/pull/4604)
+  * IPv6 default route for IPv6-only awsvpc tasks [#4603](https://github.com/aws/amazon-ecs-agent/pull/4603)
+  * Add IPv6 fields in the task network config for IPv6 only host mode tasks [#4605](https://github.com/aws/amazon-ecs-agent/pull/4605)
+* Bugfix - Adds RestartPolicy for ServiceConnect Relay Instance Task [#4602](https://github.com/aws/amazon-ecs-agent/pull/4602)
+
+# 1.93.0
+* Enhancement - Add visibility to the ECS Agent for the upcoming release of Windows Server 2025 ECS AMIs and adds integration test support for Windows Server 2025 [#4547](https://github.com/aws/amazon-ecs-agent/pull/4547)
+* Enhancement - Modify CW endpoint short term solution to include more regions [#4569](https://github.com/aws/amazon-ecs-agent/pull/4569)
+* Enhancement - Determine the fluentd log driver's async option based on Docker server version [#4558](https://github.com/aws/amazon-ecs-agent/pull/4558)
+* Enhancement - Agent resolves CloudWatch Logs dual stack endpoint on IPv6-only instances and sets it as awslogs-endpoint option for awslogs logging driver [#4577](https://github.com/aws/amazon-ecs-agent/pull/4577)
+* Enhancement - Include container IPv6 addresses (if available) in container and task metadata v4 responses for bridge mode tasks [#4581](https://github.com/aws/amazon-ecs-agent/pull/4581)
+* Enhancement - Changes to support for Service Connect in IPv6-only environments [#4584](https://github.com/aws/amazon-ecs-agent/pull/4584)
+* Enhancement - Update Go version to 1.23.8 [#4587](https://github.com/aws/amazon-ecs-agent/pull/4587)
+* Bugfix - Surface task augmentation errors for Service Connect tasks [#4588](https://github.com/aws/amazon-ecs-agent/pull/4588)
+
+# 1.92.0
+* Enhancement - Migrate ECS client to aws-sdk-go-v2 [#4447](https://github.com/aws/amazon-ecs-agent/pull/4447)
+* Enhancement - Update tcs api model to rename osFilesystem to rootFileSystem. [#4525](https://github.com/aws/amazon-ecs-agent/pull/4525)
+* Enhancement - Enhance unit test TestSetInstanceIdentity [#4533](https://github.com/aws/amazon-ecs-agent/pull/4533)
+* Enhancement - Increased container exit reason message size from 255 to 1024 characters [#4545](https://github.com/aws/amazon-ecs-agent/pull/4545)
+* Enhancement - Bump golang.org/x/net from 0.33.0 to 0.36.0 in /agent [#4532](https://github.com/aws/amazon-ecs-agent/pull/4532)
+* Enhancement - Migrate ACS over to AWS SDK Go V2 [#4534](https://github.com/aws/amazon-ecs-agent/pull/4534)
+* Enhancement - Migrate ASM to aws-sdk-go-v2 [#4556](https://github.com/aws/amazon-ecs-agent/pull/4556)
+* Enhancement - Add IPv4 and IPv6 detection to Agent [#4561](https://github.com/aws/amazon-ecs-agent/pull/4561)
+* Enhancement - Update Agent build golang version to 1.23.7 [#4563](https://github.com/aws/amazon-ecs-agent/pull/4563)
+* Bugfix - Update tcs api model to rename BytesUtilized to bytesUtilized [#4537](https://github.com/aws/amazon-ecs-agent/pull/4537)
+* Bugfix - Change back to having struct field pointers within TaskProtectionResponse [#4559](https://github.com/aws/amazon-ecs-agent/pull/4559)
+
+# 1.91.2
+* Bugfix - Revert "Migrate ECR client to aws-sdk-go-v2". [4539](https://github.com/aws/amazon-ecs-agent/pull/4539)
+
+# 1.91.1
+* Enhancement - Add adaptive retry logic in RCI call for non-terminal errors. [#4499](https://github.com/aws/amazon-ecs-agent/pull/4499)
+* Enhancement - Refactor introspection api to consume shared server in ecs-agent [#4483](https://github.com/aws/amazon-ecs-agent/pull/4483)
+* Enhancement - Migrate ECR client to aws-sdk-go-v2. [#4512](https://github.com/aws/amazon-ecs-agent/pull/4512)
+* Bugfix - Fixed a race condition with concurrent DiscoverPollEndpoint calls [#4504](https://github.com/aws/amazon-ecs-agent/pull/4504)
+* Bugfix - Migrate over to smithy ResponseError for obtaining status code of IMDS GetMetadata calls [#4516](https://github.com/aws/amazon-ecs-agent/pull/4516)
+* Enhancement -  Update tcs api model. Includes update to field names to be camelCased and not CamelCased. [#4525](https://github.com/aws/amazon-ecs-agent/pull/4525)
+* Enhancement - Increase LogConfig default max-buffer-size from 1m to 10m. [#4524](https://github.com/aws/amazon-ecs-agent/pull/4524)
+* Enhancement - Modify amazon linux codebuild and spec file to include baking in the CSI driver tar file [#4526](https://github.com/aws/amazon-ecs-agent/pull/4526)
+
+# 1.91.0
+* Enhancement - Make the fluentd-async-connect log driver option configurable [#4476](https://github.com/aws/amazon-ecs-agent/pull/4476)
+* Enhancement - Update amazon-ssm-agent version for exec to 3.3.1802.0 for ecs-anywhere [#4511](https://github.com/aws/amazon-ecs-agent/pull/4511)
+* Bugfix - Ensure proper cleanup of gMSA Linux credentials by assigning leaseId to taskResource for credentialfetcher tasks [#4490](https://github.com/aws/amazon-ecs-agent/pull/4490)
+
+# 1.90.0
+* Enhancement - Upgrade to latest NVIDIA NVML package [#4469](https://github.com/aws/amazon-ecs-agent/pull/4469)
+* Enhancement - Update SSM GPG key for ECS anywhere installation [#4474](https://github.com/aws/amazon-ecs-agent/pull/4474)
+
+# 1.89.3
+* Enhancement - Migrate ec2 package to aws-sdk-go-v2 [#4446](https://github.com/aws/amazon-ecs-agent/pull/4446)
+* Enhancement - Handle specific exception codes on RCI call [#4457](https://github.com/aws/amazon-ecs-agent/pull/4457)
+* Enhancement - Rename duplicate time field to be more descriptive and unique [#4465](https://github.com/aws/amazon-ecs-agent/pull/4465)
+
+# 1.89.2
+* Enhancement - Refactors Branch ENI configuration to support all platform types [#4436](https://github.com/aws/amazon-ecs-agent/pull/4436)
+* Enhancement - Update agent version of https://github.com/containerd/cgroups from v3.0.2 to v3.0.4 [#4350](https://github.com/aws/amazon-ecs-agent/pull/4350)
+* Enhancement - Implement credentials chain for aws-sdk-go-v2 [#4424](https://github.com/aws/amazon-ecs-agent/pull/4424)
+* Enhancement - Update amazon-ecs-cni-plugins to 2024.09.0 [#4442](https://github.com/aws/amazon-ecs-agent/pull/4442)
+* Enhancement - Remove typos from annotations in ecs-init/docker/docker.go [#4426](https://github.com/aws/amazon-ecs-agent/pull/4426)
+* Enhancement - Add check if tc is compatible before advertising fault injection capability [#4434](https://github.com/aws/amazon-ecs-agent/pull/4434)
+* Enhancement - Add /etc/pki directory to appnet agent's bind mounts for service connect [#4437](https://github.com/aws/amazon-ecs-agent/pull/4437)
+
+# 1.89.1
+* Changes included from discarded v1.89.0 release
+
+# 1.89.0
+* Enhancement - Bump google.golang.org/grpc from 1.64.0 to 1.64.1 in /ecs-agent/daemonimages/csidriver [#4361](https://github.com/aws/amazon-ecs-agent/pull/4361)
+* Enhancement - Log unresolved dependencies at info level [#4419](https://github.com/aws/amazon-ecs-agent/pull/4419)
+* Enhancement - Make the path to resolv.conf a configuration parameter instead of a hardcoded string [#4421](https://github.com/aws/amazon-ecs-agent/pull/4421)
+* Bugfix - Implement reference counting of volume mounts in amazon-ecs-volume-plugin [#4425](https://github.com/aws/amazon-ecs-agent/pull/4425)
+* Bugfix - Set firelens mem_buf_limit by default [#4405](https://github.com/aws/amazon-ecs-agent/pull/4405)
+
+# 1.88.0
+* Feature - Fault Injection Service Integration [#4414](https://github.com/aws/amazon-ecs-agent/pull/4414)
+* Bugfix - Retry GPU devices check during env vars load if instance supports GPU [#4387](https://github.com/aws/amazon-ecs-agent/pull/4387)
+* Enhancement - Add additional logging for BHP fault [#4394](https://github.com/aws/amazon-ecs-agent/pull/4394)
+* Bugfix - Remove unnecessary set driver and instance log level calls [#4396](https://github.com/aws/amazon-ecs-agent/pull/4396)
+* Enhancement - Migrate ecs-init to aws-sdk-go-v2. [#4372](https://github.com/aws/amazon-ecs-agent/pull/4372)
+* Bugfix - Prevent TMDS access from being impacted by network-blackhole-port fault. [#4403](https://github.com/aws/amazon-ecs-agent/pull/4403)
+* Enhancement - Adding fault injection integration tests [#4399](https://github.com/aws/amazon-ecs-agent/pull/4399)
+* Enhancement - log acs/tacs endpoint [#4401](https://github.com/aws/amazon-ecs-agent/pull/4401)
+* Enhancement - Add SourcesToFilter support for network-blackhole-port fault [#4408](https://github.com/aws/amazon-ecs-agent/pull/4408)
+* Bugfix-  Add validation to prevent Fault Injection APIs from accepting IPv6 addresses. [#4411](https://github.com/aws/amazon-ecs-agent/pull/4411)
+
+# 1.87.1
+* Enhancement - Update Go version to 1.22.7
+* Enhancement - Update SSM Agent version to 3.3.859.0
+* Bugfix - Always re-generate an ECR auth token when task execution credentials ID change.
+* Bugfix - Do no err on duplicate netns creation.
+
+# 1.87.0
+* Feature - Add support for EBS Task Attach on Windows. [#4353](https://github.com/aws/amazon-ecs-agent/pull/4353)
+* Enhancement - Validate ECS_OFFHOST_INTROSPECTION_INTERFACE_NAME is a valid interface name. [#4275](https://github.com/aws/amazon-ecs-agent/pull/4275)
+* Enhancement - add a warning to ecs-init when it doesnt detect GPU devices and moves on. [#4338](https://github.com/aws/amazon-ecs-agent/pull/4338)
+* Enhancement - Add resources to the log message "Resources not consumed, enough resources not available". [#4328](https://github.com/aws/amazon-ecs-agent/pull/4328)
+* Bugfix - Add read lock to task object String method. [#4288](https://github.com/aws/amazon-ecs-agent/pull/4288)
+
+# 1.86.3
+* Bugfix: AWSVPC task containers' transition to MANIFEST_PULLED state should depend on the network pause container reaching RESOURCES_PROVISIONED state. [#4286](https://github.com/aws/amazon-ecs-agent/pull/4286)
+* Enhancement: Update manifest pull retry strategy so that first few retries are quicker to help setups on which image repository calls depend on network pause container being initialized [#4289](https://github.com/aws/amazon-ecs-agent/pull/4289)
+* Bugfix: Streamline how tasks stopped per ECS Control Plane [#4301](https://github.com/aws/amazon-ecs-agent/pull/4301)
+
+# 1.86.2
+* Bugfix - Add more validation of stats received from Docker [#4295](https://github.com/aws/amazon-ecs-agent/pull/4295)
+
+# 1.86.1
+* Bugfix - Update environment variable details in README.md and PR Template [#4271](https://github.com/aws/amazon-ecs-agent/pull/4271)
+* Bugfix - pull the image with the <image>@<digest> format [#4256](https://github.com/aws/amazon-ecs-agent/pull/4256)
+* Bugfix - Revert ecs.service behavior while maintaining resiliency [#4277](https://github.com/aws/amazon-ecs-agent/pull/4277)
+
+# 1.86.0
+* Feature - Container Restart Policy [#4264](https://github.com/aws/amazon-ecs-agent/pull/4264)
+
+# 1.85.3
+* Bugfix - Revert "Resolving Cloudwatch endpoint in all regions" except isolated regions. [4260](https://github.com/aws/amazon-ecs-agent/pull/4260)
+* Bugfix - Add awslogs-endpoint for isolated regions when creating containers. [#4262](https://github.com/aws/amazon-ecs-agent/pull/4262)
+
+# 1.85.2
+* Bugfix - Disable Digest Resolution for Manifest V2 Schema 1 [#4249](https://github.com/aws/amazon-ecs-agent/pull/4249)
+* Bugfix - Fix digest resolution for locally cached images when image reference in the task payload contains docker.io or docker.io/library prefix [#4251](https://github.com/aws/amazon-ecs-agent/pull/4251)
+* Bugfix - Use FIPS S3 endpoints only when available in region [#4246](https://github.com/aws/amazon-ecs-agent/pull/4246)
+* Bugfix - Resolving Cloudwatch endpoint in all regions [#4191](https://github.com/aws/amazon-ecs-agent/pull/4191)
+
+# 1.85.1
+* Bugfix - UpdateDesiredStatus for task stop verification ACK. [#4240](https://github.com/aws/amazon-ecs-agent/pull/4240)
+
+# 1.85.0
+* Enhancement - Remove unused "generic metrics" code and processing. [#4225](https://github.com/aws/amazon-ecs-agent/pull/4225)
+* Enhancement - Add new build specs for building Agent artifacts for Amazon Linux and Windows. [#4220](https://github.com/aws/amazon-ecs-agent/pull/4220)
+* Enhancement - Update dev-build CloudFormation stack to add new CodeBuild jobs for building artifacts for Amazon Linux. [#4228](https://github.com/aws/amazon-ecs-agent/pull/4228)
+* Enhancement - Change ECS service's dependency on Docker service from 'requires' to 'wants' and check if docker is running during ECS service PreStart. [#4233](https://github.com/aws/amazon-ecs-agent/pull/4233)
+
+# 1.84.0
+* Enhancement - CannotPullContainerError/ASM error message enhancements [#4181](https://github.com/aws/amazon-ecs-agent/pull/4181)
+* Enhancement - update go to 1.22.3 [#4184](https://github.com/aws/amazon-ecs-agent/pull/4184)
+* Enhancement - cap cpu shares to the max allowed value on Linux [#4204](https://github.com/aws/amazon-ecs-agent/pull/4204)
+* Bugfix - S3 config changes to use S3 FIPS endpoints on FIPS hosts [#4202](https://github.com/aws/amazon-ecs-agent/pull/4202)
+
+# 1.83.0
+* Feature - Expedited reporting of container image manifest digests to ECS backend. This change makes Agent resolve container image manifest digests for container images prior to image pulls by either calling image registries or inspecting local images depending on the host state and Agent configuration. Resolved digests will be reported to ECS backend using an additional SubmitTaskStateChange API call [#4177](https://github.com/aws/amazon-ecs-agent/pull/4177)
+* Enhancement - Update ACS model restart policy in ecs-agent [#4175](https://github.com/aws/amazon-ecs-agent/pull/4175)
+* Enhancement - Update TMDS response for container restarts [#4178](https://github.com/aws/amazon-ecs-agent/pull/4178)
+* Enhancement - Enable agent to detect FIPS enabled hosts [#4189](https://github.com/aws/amazon-ecs-agent/pull/4189)
+* Bugfix - Fixed a bug that could prevent ECS agent from starting on SUSE Linux 15 [#4173](https://github.com/aws/amazon-ecs-agent/pull/4173)
+
+
+# 1.82.4
+* Enhancement - Add retries to DockerClient's manifest pull functionality and add utils/reference package [#4150](https://github.com/aws/amazon-ecs-agent/pull/4150)
+* Enhancement - ContainerRestartPolicy ACS and TCS models, TMDS updates [#4158](https://github.com/aws/amazon-ecs-agent/pull/4158)[#4163](https://github.com/aws/amazon-ecs-agent/pull/4163)
+* Enhancement - Add restart tracker and restart policy to ecs-agent module [#4162](https://github.com/aws/amazon-ecs-agent/pull/4162)
+* Enhancement - Add BackendStatusString method to ContainerStatus [#4167](https://github.com/aws/amazon-ecs-agent/pull/4167)
+* Enhancement - Simplify ContainerStatus.BackendStatusString() method [#4168](https://github.com/aws/amazon-ecs-agent/pull/4168)
+* Enhancement - Bump github.com/docker/docker from 23.0.8+incompatible to 24.0.9+incompatible in /ecs-init [#4122](https://github.com/aws/amazon-ecs-agent/pull/4122)
+* Bugfix - Update ca-certs base image [#4153](https://github.com/aws/amazon-ecs-agent/pull/4153)
+* Bugfix - fixing command typo [#4165](https://github.com/aws/amazon-ecs-agent/pull/4165)
+
+# 1.82.3
+* Enhancement - Implement TextMarshaler for ContainerStatus [#4135](https://github.com/aws/amazon-ecs-agent/pull/4135)
+* Enhancement - Add MANIFEST_PULLED internal container and task states [#4137](https://github.com/aws/amazon-ecs-agent/pull/4137)
+* Enhancement - Fail early when an unsupported docker API version is found [#4141](https://github.com/aws/amazon-ecs-agent/pull/4141)
+* Enhancement - Add functionality to pull image manifests to DockerClient [#4140](https://github.com/aws/amazon-ecs-agent/pull/4140)
+* Bugfix - Fix AL2023 integration tests [#4132](https://github.com/aws/amazon-ecs-agent/pull/4132)
+* Bugfix - Fix TestExecCommandAgent flakiness on AL1 [#4138](https://github.com/aws/amazon-ecs-agent/pull/4138)
+* Bugfix - Delete containers before the task from BoltDB [#3987](https://github.com/aws/amazon-ecs-agent/pull/3987)
+* Bugfix - Specifically set the CW endpoint when using awslogs as log driver for specifc regions [#4143](https://github.com/aws/amazon-ecs-agent/pull/4143)
+
+# 1.82.2
+* Enhancement - Bump aws-sdk-go version to 1.51.3 [#4120](https://github.com/aws/amazon-ecs-agent/pull/4120)
+* Enhancement - Update dependencies to include security patches reported by dependabot for agent [#4113](https://github.com/aws/amazon-ecs-agent/pull/4113)
+* Enhancement - Order network interfaces according to index value [#4126](https://github.com/aws/amazon-ecs-agent/pull/4126)
+* Bugfix - Explicitly set up ECS config dir in spec files [#4131](https://github.com/aws/amazon-ecs-agent/pull/4131)
+
+# 1.82.1
+* Bugfix - Pass clusterARN in task state change struct. [#4107](https://github.com/aws/amazon-ecs-agent/pull/4107)
+* Enhancement - Update go module dependencies [#4109](https://github.com/aws/amazon-ecs-agent/pull/4109)
+* Enhancement - ecs-init support for old docker engines (pre docker 17.x) and future docker engines (when api 1.25 is deprecated). [#4080](https://github.com/aws/amazon-ecs-agent/pull/4080)
+* Enhancement - Bump google.golang.org/protobuf from 1.31.0 to 1.33.0 [#4115](https://github.com/aws/amazon-ecs-agent/pull/4115)
+* Enhancement - Update SSM Agent version to 3.2.2303.0 for ECS exec [#4116](https://github.com/aws/amazon-ecs-agent/pull/4116)
+
+## 1.82.0
+* Enhancement - Make ecs-init log level configurable [#4097](https://github.com/aws/amazon-ecs-agent/pull/4097).
+* Enhancement - Add ECS_EBSTA_SUPPORTED environment variable to enable/disable EBS Task Attach capabilities. The environment variable is set automatically by ecs-init [#4091](https://github.com/aws/amazon-ecs-agent/pull/4091).
+
+## 1.81.1
+* Enhancement - Update go version to 1.20.12 [#4092](https://github.com/aws/amazon-ecs-agent/pull/4092)
+* Enhancement - Add extra logs in netlib package [#4095](https://github.com/aws/amazon-ecs-agent/pull/4095)
+* Bugfix - fix bug where the lock is never released for FSx task resource [#4088](https://github.com/aws/amazon-ecs-agent/pull/4088)
+* Bugfix - Create DNS files for second ENI [#4087](https://github.com/aws/amazon-ecs-agent/pull/4087)
+
+## 1.81.0
+* Bugfix - Fix ECS agent docker API failures on docker engine 25.x [#4075](https://github.com/aws/amazon-ecs-agent/pull/4075)
+* Bugfix - Fix a bug in the creation of network namespace models for AWSVPC mode tasks which causes the agent to crash in an edge case situation. [#4076](https://github.com/aws/amazon-ecs-agent/pull/4076)
+
+## 1.80.0
+* Enhancement - Add a mock for VolumeDriver interface [#4056](https://github.com/aws/amazon-ecs-agent/pull/4056)
+* Enhancement - Update logger Config setter access pattern [#4051](https://github.com/aws/amazon-ecs-agent/pull/4051)
+* Enhancement - Add AppArmor support [#4062](https://github.com/aws/amazon-ecs-agent/pull/4062)
+* Enhancement - Update credentials-fetcher docker file [#4068](https://github.com/aws/amazon-ecs-agent/pull/4068)
+* Enhancement - Add ECSClientFactory to create new ECS clients [ #4061](https://github.com/aws/amazon-ecs-agent/pull/4061)
+* Enhancement - Add CSI nodeUnstage retries. [#4069](https://github.com/aws/amazon-ecs-agent/pull/4069)
+* Bugfix - Fix EFS unmount hanging issue for awsvpc tasks [#4053](https://github.com/aws/amazon-ecs-agent/pull/4053)
+* Bugfix - Windows numCPU returning incorrectly for values above 64 [#4067](https://github.com/aws/amazon-ecs-agent/pull/4067)
+* Bugfix - fsx windows fileserver SSM arn parsing was incorrect [#4058](https://github.com/aws/amazon-ecs-agent/pull/4058)
+
+## 1.79.2
+* Enhancement - Set device names while building task network config [#4026](https://github.com/aws/amazon-ecs-agent/pull/4026)
+* Enhancement - Record and emit the timestamp that the last connection was established [#4035](https://github.com/aws/amazon-ecs-agent/pull/4035)
+* Enhancement - Add network delete workflow for AWSVPC [#4031](https://github.com/aws/amazon-ecs-agent/pull/4031)
+* Enhancement - Consume ECS client from ecs-agent module in agent module  [#4032](https://github.com/aws/amazon-ecs-agent/pull/4032)
+* Enhancement - Add Firecracker platform implementation in netlib [#4038](https://github.com/aws/amazon-ecs-agent/pull/4038)
+* Enhancement - Add containerId, networkNameSpace, containerCGroup to ManagedDaemon [#4041](https://github.com/aws/amazon-ecs-agent/pull/4041)
+* Enhancement - Trim managed agent reason + add retries for getting instance identity signature [#4042](https://github.com/aws/amazon-ecs-agent/pull/4042)
+* Code Quality Improvement  - Add check in ecs clint library to ensure only non empty values are added to API request. [#4044](https://github.com/aws/amazon-ecs-agent/pull/4044)
+* Enhancement - Update grpc contract credfetcher [#4043](https://github.com/aws/amazon-ecs-agent/pull/4043)
+* Enhancement - Add credentials-fetcher Dockerfile [#4047](https://github.com/aws/amazon-ecs-agent/pull/4047)
+
+## 1.79.1
+* Enhancement - Update golang.org/x/net to v0.17.0 [#3964](https://github.com/aws/amazon-ecs-agent/pull/3964)
+* Enhancement - Update google.golang.org/grpc to 1.56.3 [#3991](https://github.com/aws/amazon-ecs-agent/pull/3991)
+* Enhancement - Implement regular ENI and branch ENI configuration for the containerd platform [#3972](https://github.com/aws/amazon-ecs-agent/pull/3972)
+* Enhancement - Decouple ENI in ecs-agent/ AttachmentStateChange [#4019](https://github.com/aws/amazon-ecs-agent/pull/4019)
+* Bugfix - Bugfix to log EBS CSI to a file [#4010](https://github.com/aws/amazon-ecs-agent/pull/4010)
+
+## 1.79.0
+* Feature - Add support for finding EBS devices on Xen instances [#3971](https://github.com/aws/amazon-ecs-agent/pull/3971)
+* Feature - Add network builder and platform APIs [#3939](https://github.com/aws/amazon-ecs-agent/pull/3939)
+* Enhancement - Load managed daemon images in background to speed up startup time [#3984](https://github.com/aws/amazon-ecs-agent/pull/3984)
+* Enhancement - ECS client API update [#3974](https://github.com/aws/amazon-ecs-agent/pull/3974)
+* Enhancement - Upgrade Golang version to 1.20.10 [#3988](https://github.com/aws/amazon-ecs-agent/pull/3988)
+* Enhancement - Integrate the applicable shared ECS interfaces with agent [#4008](https://github.com/aws/amazon-ecs-agent/pull/4008)
+* Enhancement - Add generic Attachment interface to allow for multiple attachment types [#3969](https://github.com/aws/amazon-ecs-agent/pull/3969)
+* Enhancement - Minor refactor of TTL cache (allow nil TTL + get TTL) [#3968](https://github.com/aws/amazon-ecs-agent/pull/3968)
+* Enhancement - Update ecs-agent/ ECS model with missing fields + consume the same [#3999](https://github.com/aws/amazon-ecs-agent/pull/3999)
+* Bugfix - Update ecs-agent in-container path for managed daemon logging [#3982](https://github.com/aws/amazon-ecs-agent/pull/3982)
+* Bugfix - Fix local agent state for CSI driver daemon task [#3970](https://github.com/aws/amazon-ecs-agent/pull/3970)
+* Bugfix - Fix invalid task volumes field for EBS-backed task payload [#3975](https://github.com/aws/amazon-ecs-agent/pull/3975)
+* Bugfix - Bugfixes for EBS Task Attach [#3965](https://github.com/aws/amazon-ecs-agent/pull/3965)
+
+## 1.78.1
+* Bugfix - revert "add apparmor support". [3993](https://github.com/aws/amazon-ecs-agent/pull/3993)
+
+## 1.78.0
+* Feature - Add AppArmor support. [#3941](https://github.com/aws/amazon-ecs-agent/pull/3941)
+* Enhancement - Update SSM Agent version to 3.2.1630.0 for ECS exec. [#3952](https://github.com/aws/amazon-ecs-agent/pull/3952)
+* Bugfix - fixing an edge case for 'START' container dependency. [#3927](https://github.com/aws/amazon-ecs-agent/pull/3927)
+
+## 1.77.0
+* Feature - ECS_TASK_PIDS_LIMIT for setting the task-level PIDs limit. [#3923](https://github.com/aws/amazon-ecs-agent/pull/3923)
+* Enhancement - Add interface for csi client [#3899](https://github.com/aws/amazon-ecs-agent/pull/3899)
+* Enhancement - Add new network data structures [#3909](https://github.com/aws/amazon-ecs-agent/pull/3909)
+* Enhancement - Update Managed Daemon to allow for privilege and mount propagation [#3910](https://github.com/aws/amazon-ecs-agent/pull/3910)
+* Enhancenent - Add NodeStageVolume to common CSI client library [3905](https://github.com/aws/amazon-ecs-agent/pull/3905)
+* Enhancement - Add a default wait timeout for attachment payload messages [3914](https://github.com/aws/amazon-ecs-agent/pull/3914)
+* Enhancement - Add CNI to ecs-agent/netlib/model and update dependencies [3897](https://github.com/aws/amazon-ecs-agent/pull/3897)
+* Enhancement - Update Minimal CSI Driver with NodeStage method [3918](https://github.com/aws/amazon-ecs-agent/pull/3918)
+* Enhancement - Add support to handle task payload with EBS volume attachments [3917](https://github.com/aws/amazon-ecs-agent/pull/3917)
+* Enhancement - Bump cgroups and containernetworking/plugins version [3903](https://github.com/aws/amazon-ecs-agent/pull/3903)
+* Enhancement - Add AgentConfigAccessor interface to ecs-agent/ [#3928](https://github.com/aws/amazon-ecs-agent/pull/3928)
+* Enhancement - Adding new container metadata to the introspection response [#3926](https://github.com/aws/amazon-ecs-agent/pull/3926)
+* Enhancement - Support AttachmentType for the attachment payload for EBS Attach [#3911](https://github.com/aws/amazon-ecs-agent/pull/3911)
+* Bug - Fix flaky EBS watcher test for windows [#3904](https://github.com/aws/amazon-ecs-agent/pull/3904)
+* Bug - Add fix for the failing functional gMSA S3 test [#3886](https://github.com/aws/amazon-ecs-agent/pull/3886)
+* Code Quality Improvement - Update PR template and enable dependabot for ecs-agent module [3908](https://github.com/aws/amazon-ecs-agent/pull/3908)
+* Code Quality Improvement - Move container/task statuses to ecs-agent module [3924](https://github.com/aws/amazon-ecs-agent/pull/3924)
+
+## 1.76.0
+* Feature - Adding EBS watcher implementation [#3866](https://github.com/aws/amazon-ecs-agent/pull/3866)
+* Feature - Added the implementation for EBS volume discovery on Windows [#49](https://github.com/aws/amazon-ecs-agent/pull/49)
+* Enhancement - Update GetVolumeMetrics in the CSI client [#3884](https://github.com/aws/amazon-ecs-agent/pull/3884)
+* Enhancement - Migrate Agent to use vpc-eni plugin for awsvpc mode instead of ecs-eni plugin on Linux [#3873](https://github.com/aws/amazon-ecs-agent/pull/3873)
+* Enhancement - Move periodic timeout implementation to wsclient library [#3883](https://github.com/aws/amazon-ecs-agent/pull/3883)
+* Enhancement - Redact ECR layer URLs from container pull errors [#3885](https://github.com/aws/amazon-ecs-agent/pull/3885)
+* Enhancement - Update TACS model [#3889](https://github.com/aws/amazon-ecs-agent/pull/3889)
+* Enhancement - Move ACS session to ecs-agent module and refactor [#3887](https://github.com/aws/amazon-ecs-agent/pull/3887)
+* Enhancement - Model transformer: model reconciliation for agent upgrades [#3878](https://github.com/aws/amazon-ecs-agent/pull/3878)
+* Ehhancement - Cosmetic improvements to ACS code [#3890](https://github.com/aws/amazon-ecs-agent/pull/3890)
+* Enhancement - Tcs api modification [#3893](https://github.com/aws/amazon-ecs-agent/pull/3893)
+* Enhancement - Skip Task resource accounting for Fargate 1.3.0 launch type [#3896](https://github.com/aws/amazon-ecs-agent/pull/3896)
+
+## 1.75.3
+* Enhancement - Update Read Me for the environment variable ECS_POLLING_METRICS_WAIT_DURATION [#3863](https://github.com/aws/amazon-ecs-agent/pull/3863)
+
+## 1.75.2
+* Enhancement - Update SSM GPG key for ECS anywhere installation [#3875](https://github.com/aws/amazon-ecs-agent/pull/3875)
+* Enhancement - Update ECS anywhere installation script to use the SSM Agent GPG key and ECS Agent GPG key from amazon-ecs-agent repository [#3869](https://github.com/aws/amazon-ecs-agent/pull/3869)
+
+## 1.75.1
+* Enhancement - Upgrade Golang version to 1.20.7 [#3864](https://github.com/aws/amazon-ecs-agent/pull/3864)
+* Enhancement - Use float64 for network rate stats [#3865](https://github.com/aws/amazon-ecs-agent/pull/3865)
+* Bug - count gpu as list for task resource accounting [#3852](https://github.com/aws/amazon-ecs-agent/pull/3852)
+
+## 1.75.0
+* Enhancement - Add task stop verification ack to ecs-agent module [#3820](https://github.com/aws/amazon-ecs-agent/pull/3820)
+* Enhancement - Increase test coverage of some ACS responders [#3826](https://github.com/aws/amazon-ecs-agent/pull/3826)
+* Enhancement - Refactor ACS refresh credentials message handling [#3830](https://github.com/aws/amazon-ecs-agent/pull/3830)
+* Enhancement - Move appnet client interface to ecs-agent [#3827](https://github.com/aws/amazon-ecs-agent/pull/3827)
+* Enhancement - Add gpu-driver-version ECS attribute [#3836](https://github.com/aws/amazon-ecs-agent/pull/3826)
+* Enhancement - Modify ResourceAttachment and integrate into Docker task state engine [#3832](https://github.com/aws/amazon-ecs-agent/pull/3832)
+* Enhancement - Add negative integration tests for gmsa on Linux [#3752](https://github.com/aws/amazon-ecs-agent/pull/3752)
+* Enhancement - Upgrade Golang version to 1.20.6 [#3842](https://github.com/aws/amazon-ecs-agent/pull/3842)
+
+## 1.74.1
+* Enhancement - Update amazon linux build spec to match current ecs agent golang version [#3817](https://github.com/aws/amazon-ecs-agent/pull/3817)
+* Bug - Merge Feature/task-resource-accounting to dev [#3819](https://github.com/aws/amazon-ecs-agent/pull/3819)
+* Code Quality Improvement - Add Snapshotter field to V4 Container Response [#3818](https://github.com/aws/amazon-ecs-agent/pull/3818)
+* Code Quality Improvement - Add some unit tests for config parsers where coverage was missing [#3809](https://github.com/aws/amazon-ecs-agent/pull/3809)
+
+## 1.74.0
+* Enhancement - Update go version to 1.19.10 [#3799](https://github.com/aws/amazon-ecs-agent/pull/3799)
+* Enhancement - Add EBS volume stats implementation in the csi driver daemon and add one makefile rule to build the tar file [#3774](https://github.com/aws/amazon-ecs-agent/pull/3774)
+* Enhancement - Add daemon manager package with initial daemon task creation methods [#3789](https://github.com/aws/amazon-ecs-agent/pull/3789)
+* Enhancement - Enable FSx capability by default for Windows [#3780](https://github.com/aws/amazon-ecs-agent/pull/3780)
+* Enhancement - Update error prefix of v4 container stats endpoint for task lookup failure case [#3794](https://github.com/aws/amazon-ecs-agent/pull/3794)
+* Enhancement - Update Agent to be more resilient in case of unauthenticated timeouts with IMDS [#3795](https://github.com/aws/amazon-ecs-agent/pull/3795)
+* Bug - Always report service connect metrics when both health and task metrics are disabled [#3786](https://github.com/aws/amazon-ecs-agent/pull/3786)
+* Bug - Allow variables to be set to empty string in envFiles [#3797](https://github.com/aws/amazon-ecs-agent/pull/3797)
+* Code Quality Improvement - Move task protection handler to ecs-agent module [#3779](https://github.com/aws/amazon-ecs-agent/pull/3779)
+* Code Quality Improvement - Move TMDS v4 container stats types to ecs-agent module [#3785](https://github.com/aws/amazon-ecs-agent/pull/3785)
+* Code Quality Improvement - Move v4 TMDS container and task stats endpoint handlers to ecs-agent module [#3791](https://github.com/aws/amazon-ecs-agent/pull/3791)
+* Code Quality Improvement - Integrate with tcsHandler in ecs-agent module [#3743](https://github.com/aws/amazon-ecs-agent/pull/3743)
+* Code Quality Improvement - Update metrics interface to couple metric completion and publish [#3803](https://github.com/aws/amazon-ecs-agent/pull/3803)
+* Code Quality Improvement - Add ACS attach resource responder to ecs-agent [#3807](https://github.com/aws/amazon-ecs-agent/pull/3807) [#3810](https://github.com/aws/amazon-ecs-agent/pull/3810)
+* Code Quality Improvement - Add THIRD_PARTY.md attribution file to ecs-agent [#3808](https://github.com/aws/amazon-ecs-agent/pull/3808)
+
+## 1.73.1
+* Fix - Revert task resource accounting to avoid tasks stuck in PENDING on oversubscribed instance. [#3781](https://github.com/aws/amazon-ecs-agent/pull/3781)
+* Code Quality Improvement - Improve test coverage of v2, v3, and v4 container stats endpoints [#3758](https://github.com/aws/amazon-ecs-agent/pull/3758)
+* Code Quality Improvement - Improve test coverage of v2, v3, and v4 task stats endpoints. [#3761](https://github.com/aws/amazon-ecs-agent/pull/3761)
+* Code Quality Improvement - Move ECSTaskProtectionSDK interface to ecs-agent [#3756](https://github.com/aws/amazon-ecs-agent/pull/3756)
+* Code Quality Improvement - Downgrade the docker version used in the ecs-agent/go.mod to v20.10.24 [#3767](https://github.com/aws/amazon-ecs-agent/pull/3767)
+* Enhancement - Add the EBS volume metrics collector to ecs-agent. [#3766](https://github.com/aws/amazon-ecs-agent/pull/3766)
+* Code Quality Improvement - Refactor ACS attach instance ENI message handling [#3765](https://github.com/aws/amazon-ecs-agent/pull/3765)
+* Bug - Skip sending internal task events to ECS control plane [#3772](https://github.com/aws/amazon-ecs-agent/pull/3772)
+* Code Quality Improvement - Move TMDS task protection types to ecs-agent (refactoring only). [#3764](https://github.com/aws/amazon-ecs-agent/pull/3764)
+* Code Quality Improvement - Add missing copyright header to files [#3777](https://github.com/aws/amazon-ecs-agent/pull/3777)
+
+## 1.73.0
+* Feature - Task Resource Accounting - Adds host resource manager in docker task engine which keeps account of host resources for tasks started on the host. Removes task serialization and uses host resource manager to start tasks on the host as soon as resources become available for a task. [#3684](https://github.com/aws/amazon-ecs-agent/pull/3684) [#3706](https://github.com/aws/amazon-ecs-agent/pull/3706) [#3700](https://github.com/aws/amazon-ecs-agent/pull/3700) [#3723](https://github.com/aws/amazon-ecs-agent/pull/3723) [#3741](https://github.com/aws/amazon-ecs-agent/pull/3741) [#3747](https://github.com/aws/amazon-ecs-agent/pull/3747) [#3750](https://github.com/aws/amazon-ecs-agent/pull/3750)
+* Enhancement - Update containernetworking/cni dependency to v1.1.2 and the vpc-cni plugin version [#3702](https://github.com/aws/amazon-ecs-agent/pull/3702)
+* Code Quality Improvement - Refactor ACS attach task ENI message handling [#3744](https://github.com/aws/amazon-ecs-agent/pull/3744)
+* Code Quality Improvement - Add "more than one ECS failure" case to Task Protection TMDS tests [#3749](https://github.com/aws/amazon-ecs-agent/pull/3749)
+* Code Quality Improvement - Move eventstream to /ecs-agent and remove /agent/wsclient [#3746](https://github.com/aws/amazon-ecs-agent/pull/3746)
+* Code Quality Improvement - Move TCS Client to ecs-agent module, and switch to use wsclient in ecs-agent module [#3726](https://github.com/aws/amazon-ecs-agent/pull/3726)
+* Code Quality Improvement - Add tests for GetTaskProtection API and UpdateTaskProtection API to high-level TMDS tests [3739](https://github.com/aws/amazon-ecs-agent/pull/3739) [#3740](https://github.com/aws/amazon-ecs-agent/pull/3740)
+* Code Quality Improvement - Refactor ACS heartbeat message handling [#3724](https://github.com/aws/amazon-ecs-agent/pull/3724)
+* Code Quality Improvement - Move v4 task metadata handler to ecs-agent module with a more generic implementation [#3733](https://github.com/aws/amazon-ecs-agent/pull/3733)
+* Fix - Make task not found error message for task protection endpoint consistent with Fargate [#3748](https://github.com/aws/amazon-ecs-agent/pull/3748)
+
+## 1.72.0
+* Feature - Add domainless gMSA support on windows/linux [#3735](https://github.com/aws/amazon-ecs-agent/pull/3735)
+* Enhancement - Update golang.org/x/net to v0.8.0 [#3730](https://github.com/aws/amazon-ecs-agent/pull/3730)
+* Enhancement - Change a log.Info message to log.Debug  [#3713](https://github.com/aws/amazon-ecs-agent/pull/3713)
+* Code Quality Improvement - Add more tests for v2, v3, and v4 container metadata handlers [#3708](https://github.com/aws/amazon-ecs-agent/pull/3708)
+* Code Quality Improvement - Move utils/retry and api/errors to ecs-agent [#3711](https://github.com/aws/amazon-ecs-agent/pull/3711)
+* Code Quality Improvement - Move v4 metadata models to ecs-agent module [#3715](https://github.com/aws/amazon-ecs-agent/pull/3715)
+* Code Quality Improvement - Move ACS client to ecs-agent module and refactor [#3710](https://github.com/aws/amazon-ecs-agent/pull/3710)
+* Code Quality Improvement - Move statsEngine initiation from tcs session initialization, and adding channels to statsEngine [#3717](https://github.com/aws/amazon-ecs-agent/pull/3717)
+* Code Quality Improvement - Channel based docker stats engine implementation (DockerStatsEngine -> TCSClient) [#3683](https://github.com/aws/amazon-ecs-agent/pull/3683)
+* Code Quality Improvement - Remove telemetry message logging to avoid polluting debug log [#3725](https://github.com/aws/amazon-ecs-agent/pull/3725)
+* Code Quality Improvement - Add v4 container metadata handler to ecs-agent module [#3720](https://github.com/aws/amazon-ecs-agent/pull/3720)
+* Code Quality Improvement - Add more v2, v3, and v4 task metadata tests [#3722](https://github.com/aws/amazon-ecs-agent/pull/3722)
+* Code Quality Improvement - Consume v4 container metadata handler from ecs-agent module [#3727](https://github.com/aws/amazon-ecs-agent/pull/3727)
+* Code Quality Improvement - Improve test coverage for taskWithTags endpoints [#3729](https://github.com/aws/amazon-ecs-agent/pull/3729)
+* Fix - Update amazon-ecs-cni-plugins submodule [#3732](https://github.com/aws/amazon-ecs-agent/pull/3732)
+
+## 1.71.2
+* Improvement - Add structured logging for Task and Docker Image Manager [#3677](https://github.com/aws/amazon-ecs-agent/pull/3677) [#3696](https://github.com/aws/amazon-ecs-agent/pull/3696)
+* Enhancement - Update dependencies to include security patches reported by dependabot for agent [#3632](https://github.com/aws/amazon-ecs-agent/pull/3632) [#3691](https://github.com/aws/amazon-ecs-agent/pull/3691)
+* Code Quality Improvement - Refactor common ENI attachment functionality [#3685](https://github.com/aws/amazon-ecs-agent/pull/3685)
+* Code Quality Improvement - Move handlers utils, v2 metadata models, v1 and v2 TMDS credentials endpoints  to ecs-agent module [#3698](https://github.com/aws/amazon-ecs-agent/pull/3698) [#3701](https://github.com/aws/amazon-ecs-agent/pull/3698) [#3705](https://github.com/aws/amazon-ecs-agent/pull/3705)
+* Code Quality Improvement - Add wsclient library to ecs-agent module [#3690](https://github.com/aws/amazon-ecs-agent/pull/3690)
+* Fix - Support firelens for bridge mode ServiceConnect task [#3693](https://github.com/aws/amazon-ecs-agent/pull/3693)
+* Fix - Support special characters in the password for FSx : windows [#3669](https://github.com/aws/amazon-ecs-agent/pull/3669)
+
+## 1.71.1
+* Enhancement - Add new release config file called agentVersionV2-.json to our release CodePipeline project [#3680](https://github.com/aws/amazon-ecs-agent/pull/3680)
+* Enhancement - Update third party attribution files [#3655](https://github.com/aws/amazon-ecs-agent/pull/3655)
+* Enhancement - Add metrics interface and corresponding no-ops to ecs-agent/ [#3654](https://github.com/aws/amazon-ecs-agent/pull/3654)
+* Enhancement - Task state change logging refactor [#3674](https://github.com/aws/amazon-ecs-agent/pull/3674)
+* Enhancement - Add default AES256 encryption and enable versioning to buckets [#3673](https://github.com/aws/amazon-ecs-agent/pull/3673)
+* Code Quality Improvement - Move TMDS initialization and Audit Logger interface to ecs-agent module, and update agent module to consume them [#3653](https://github.com/aws/amazon-ecs-agent/pull/3653) [#3660](https://github.com/aws/amazon-ecs-agent/pull/3660) [#3663](https://github.com/aws/amazon-ecs-agent/pull/3663) [#3666](https://github.com/aws/amazon-ecs-agent/pull/3666)
+* Code Quality Improvement - Clean up ACS model, gogenerate, and tool dependencies [#3659](https://github.com/aws/amazon-ecs-agent/pull/3659) [#3670](https://github.com/aws/amazon-ecs-agent/pull/3670)
+* Code Quality Improvement - Move container instance health doctor to ecs-agent/ [#3662](https://github.com/aws/amazon-ecs-agent/pull/3662)
+* Code Quality Improvement - Move agent logger to ecs-agent module [#3681](https://github.com/aws/amazon-ecs-agent/pull/3681)
+
+## 1.71.0
+* Enhancement - update docker client library to latest in ecs-init [#3635](https://github.com/aws/amazon-ecs-agent/pull/3635)
+* Enhancement - Update vendor directory of agent package. [#3645](https://github.com/aws/amazon-ecs-agent/pull/3645)
+* Enhancement - Add ecs-agent/ ACS model and cleanup gogenerate make [#3643](https://github.com/aws/amazon-ecs-agent/pull/3643)
+* Enhancement - Integrate ecs-agent module with CI. Add make targets for ecs-agent module [#3651](https://github.com/aws/amazon-ecs-agent/pull/3651)
+* Fix - Fix misleading error response codes for v4 metadata and stats endpoints for TMDE. The endpoints will now return a 404 Not Found error code when task/container is not found and a 500 Internal Server Error on unexpected failures. TMDE clients that branch logic based on error response status codes will behave differently. For example, clients that retry on 5XX errors but not on 4XX errors will no longer perform futile retries [#3644](https://github.com/aws/amazon-ecs-agent/pull/3644)
+
+## 1.70.2
+* Enhancement -  Update README for generic-rpm-integrated [#3631](https://github.com/aws/amazon-ecs-agent/pull/3631)
+* Fix - Add ISO partition for downloading agent appropriately [#3630](https://github.com/aws/amazon-ecs-agent/pull/3630)
+* Fix - Change disable metrics default for Windows in the README to false [#3615](https://github.com/aws/amazon-ecs-agent/pull/3615)
+* Fix - Skip testing memory swappiness for cgroupv2 [#3638](https://github.com/aws/amazon-ecs-agent/pull/3638)
+
+## 1.70.1
+* Enhancement - Update the description of ECS_DYNAMIC_HOST_PORT_RANGE [#3609](https://github.com/aws/amazon-ecs-agent/pull/3609)
+* Enhancement - simplified ACS handler refactor [#3225](https://github.com/aws/amazon-ecs-agent/pull/3225)
+* Fix - change code suite to code services in readme [#3613](https://github.com/aws/amazon-ecs-agent/pull/3613)
+* Fix - Remove scripts/verify-agent-artifacts [#3617](https://github.com/aws/amazon-ecs-agent/pull/3617)
+* Enhancement - logging cleanup for unnecessary warn/error messages [#3621](https://github.com/aws/amazon-ecs-agent/pull/3621)
+* Enhancement - dependency updates [#3458](https://github.com/aws/amazon-ecs-agent/pull/3458), [#3606](https://github.com/aws/amazon-ecs-agent/pull/3606)
+
+## 1.70.0
+* Enhancement - Update docker client library to latest [#3598](https://github.com/aws/amazon-ecs-agent/pull/3598)
+* Enhancement - Provide imageDigest for images from all container repositories [3576](https://github.com/aws/amazon-ecs-agent/pull/3576)
+* Enhancement - Explicitly provide the network name override to nat when using bridge network mode [3564](https://github.com/aws/amazon-ecs-agent/pull/3564)
+* Enhancement - Support dynamic host port range assignment for singular ports. The dynamic host port range can be configured with ECS_DYNAMIC_HOST_PORT_RANGE in ecs.config; if there is no user-specified ECS_DYNAMIC_HOST_PORT_RANGE, ECS Agent will assign host ports within the default port range, based on platform and Docker API version, for containers that do not have user-specified host ports in task definitions. [3601](https://github.com/aws/amazon-ecs-agent/pull/3601)
+
+## 1.69.0
+* Enhancement - Use T.TempDir to create temporary test directory [#3159](https://github.com/aws/amazon-ecs-agent/pull/3159) and [#3560](https://github.com/aws/amazon-ecs-agent/pull/3560)
+* Enhancement - remove set-output GitHub action command [#3487](https://github.com/aws/amazon-ecs-agent/pull/3487)
+* Enhancement - periodically disconnect from ACS [#3586](https://github.com/aws/amazon-ecs-agent/pull/3586)
+* Bug - Fixed a bug that incorrectly advertised the gMSA and fsx capability [#3540](https://github.com/aws/amazon-ecs-agent/pull/3540)
+* Bug - Remove fallback to Docker for host port ranges assignment [#3569](https://github.com/aws/amazon-ecs-agent/pull/3569)
+* Bug - fix ecs-init log message [#3577](https://github.com/aws/amazon-ecs-agent/pull/3577)
+* Bug - Update CNI plugin versions, IMDS access works properly over IPv6 [#3581](https://github.com/aws/amazon-ecs-agent/pull/3581)
+
+## 1.68.2
+* Enhancement: Skip sending STSC events for internal tasks [#3541](https://github.com/aws/amazon-ecs-agent/pull/3541) and [#3559](https://github.com/aws/amazon-ecs-agent/pull/3559)
+* Enhancement: Update go version in module file, update most vendored build dependencies to latest library [#3534](https://github.com/aws/amazon-ecs-agent/pull/3534) and [#3551](https://github.com/aws/amazon-ecs-agent/pull/3551)
+* Enhancement - Refactor build and remove legacy packaging [#3552](https://github.com/aws/amazon-ecs-agent/pull/3552)
+* Bug - Address envFile resource naming defect [#3554](https://github.com/aws/amazon-ecs-agent/pull/3554)
+* Bug - Enumerate port ranges into the docker config [#3558](https://github.com/aws/amazon-ecs-agent/pull/3558)
+* Bug - Revert CNI Plugin submodule update [#3565](https://github.com/aws/amazon-ecs-agent/pull/3565)
+
+## 1.68.1
+* Bug - Update ECS CNI and VPC plugins to fix instances with IMDSv1 disabled [#3531](https://github.com/aws/amazon-ecs-agent/pull/3531)
+* Bug - Filter out metricCount=0 and its corresponding metricValue for service connect metric TargetResponseTime [#3537](https://github.com/aws/amazon-ecs-agent/pull/3537)
+
+## 1.68.0
+* Bug - Add ServiceConnect image to clean-up exclusion list [#3521](https://github.com/aws/amazon-ecs-agent/pull/3521)
+* Enhancement: added new agent configuration to specify ephemeral host port range [#3522](https://github.com/aws/amazon-ecs-agent/pull/3522)
+
+## 1.67.2
+* Bug - Fix the generation of network bindings for Service Connect container [#3513](https://github.com/aws/amazon-ecs-agent/pull/3513)
+* Bug - Prevent resetting valid agent state db when IMDS fails on startup [#3509](https://github.com/aws/amazon-ecs-agent/pull/3509)
+
+## 1.67.1
+* Bug - Read git hash from RELEASE_COMMIT file if possible [#3508](https://github.com/aws/amazon-ecs-agent/pull/3508)
+
+## 1.67.0
+* Bug - Don't log errors on instances not using GMSA [#3489](https://github.com/aws/amazon-ecs-agent/pull/3489)
+* Enhancement - Update packaging Readme files with updated instructions to build init files [#3490](https://github.com/aws/amazon-ecs-agent/pull/3490)
+* Bug - Fix unit tests for cgroup v2 [#3491](https://github.com/aws/amazon-ecs-agent/pull/3491)
+* Enhancement - Update readme for ECS_SELINUX_CAPABLE to clarify Z-mode mount only and limited support [#3496](https://github.com/aws/amazon-ecs-agent/pull/3496)
+* Bug - Fix agent short hash version bug [#3497](https://github.com/aws/amazon-ecs-agent/pull/3497)
+* Bug - Use Ubuntu 20.04 for linux GH Unit tests [#3501](https://github.com/aws/amazon-ecs-agent/pull/3501)
+* Feature - Container port range mapping [#3506](https://github.com/aws/amazon-ecs-agent/pull/3506)
+
+## 1.66.2
+* Bug - Add ecs-serviceconnect to CNI and Agent build scripts [#3482](https://github.com/aws/amazon-ecs-agent/pull/3482)
+* Bug - add call to update-version.sh to dockerfree-agent-image [#3484](https://github.com/aws/amazon-ecs-agent/pull/3484)
+
+## 1.66.1
+* Bug - Update ecs agent version short hash to point to built head [#3476](https://github.com/aws/amazon-ecs-agent/pull/3476)
+* Bug - Remove CAP_CHOWN [#3480](https://github.com/aws/amazon-ecs-agent/pull/3480)
+
+## 1.66.0
+* Feature - gMSA on Linux support [#3464](https://github.com/aws/amazon-ecs-agent/pull/3464)
+* Enhancement - Restart AppNet Relay on failure [#3469](Restart AppNet Relay on failure)
+
+## 1.65.1
+* Enhancement - Add grpc vendor dependencies [#3439](https://github.com/aws/amazon-ecs-agent/pull/3439)
+* Bug - Workaround git-secrets scan issue: awslabs/git-secrets#221 [#3442](https://github.com/aws/amazon-ecs-agent/pull/3442)
+
+## 1.65.0
+* Feature - ECS Agent changes to support task scale in protection feature. ECS Agent API Endpoint is also introduced with this feature. This feature allows a user to update and get task protection state of a task from a task container by calling ECS Agent API Endpoint, which protects the task from being terminated in a scale-in event [#3427](https://github.com/aws/amazon-ecs-agent/pull/3427) Github feature request - [#125](https://github.com/aws/containers-roadmap/issues/125)
+* Enhancement - Update service connect config validator to validate fields with a global standard, or consumed and proceeded by ECS Agent for service connect [#3424](https://github.com/aws/amazon-ecs-agent/pull/3424)
+* Enhancement - ServiceConnect AppNet version handling; init bootstrap; CNI interface name update for service connect [#3436](https://github.com/aws/amazon-ecs-agent/pull/3436)
+* Enhancement - Add file watcher for Appnet agent image update for service connect [#3435](https://github.com/aws/amazon-ecs-agent/pull/3435)
+* Enhancement - Change method for retrieving Windows network statistics in case of awsvpc network mode for Windows [#3425](https://github.com/aws/amazon-ecs-agent/pull/3425)
+* Bug - Fix minor unreachable code caused by t.Fatal [#3372](https://github.com/aws/amazon-ecs-agent/pull/3372)
+
+## 1.64.0
+* Feature - Add service connect feature. This feature enables ECS Service to be discoverable and ECS will leverage the container port mappings, service name and default application namespace associated with the cluster and the service to register your service for discovery and to enable discovery of dependencies through DNS lookup [#3414](https://github.com/aws/amazon-ecs-agent/pull/3414)
+* Bugfix: Bump Go to 1.19.1 for CVE-2022-27664 [#3398](https://github.com/aws/amazon-ecs-agent/pull/3398)
+
+## 1.63.1
+* Feature - Add VPC ID to TMDE v4 Task Responses. [#3288](https://github.com/aws/amazon-ecs-agent/pull/3288) [#3385](https://github.com/aws/amazon-ecs-agent/pull/3385)
+* Feature - Add ServiceName to TMDE v4 Task Responses. [#3362](https://github.com/aws/amazon-ecs-agent/pull/3362)
+* Enhancement - Add codeowners file and update token permission to read only for workflow. [#3374](https://github.com/aws/amazon-ecs-agent/pull/3374)
+* Enhancement - Dependabot ecs-init fixes. [#3388](https://github.com/aws/amazon-ecs-agent/pull/3388)
+
+## 1.63.0
+* Feature - Add configurable default profile ECS_ALTERNATE_CREDENTIAL_PROFILE. [#3365](https://github.com/aws/amazon-ecs-agent/pull/3365)
+* Enhancement - Update ECS_RESERVED_MEMORY description in README. [#3363](https://github.com/aws/amazon-ecs-agent/pull/3363)
+* Enhancement - Update dependencies to include security patches reported by dependabot for agent [#3367](https://github.com/aws/amazon-ecs-agent/pull/3367)
+* Enhancement - Update dependencies to include security patches reported by dependabot for ecs-init. [#3277](https://github.com/aws/amazon-ecs-agent/pull/3277)
+* Enhancement - Reduce the flakiness of TestExecCommandAgent. [#3355](https://github.com/aws/amazon-ecs-agent/pull/3355)
+* Bug - Add appmesh path to agent container image config. [#3378](https://github.com/aws/amazon-ecs-agent/pull/3378)
+* Bug - Fix cgroupv2 mem usage calculation to match docker cli. [#3370](https://github.com/aws/amazon-ecs-agent/pull/3370)
+* Bug - Fix json syntax in release-config. [#3359](https://github.com/aws/amazon-ecs-agent/pull/3359)
+* Bug - Update validation script with more comprehensive set of files. [#3358](https://github.com/aws/amazon-ecs-agent/pull/3358)
+* Bug - Update changelog generation to add missing spec file. [#3356](https://github.com/aws/amazon-ecs-agent/pull/3356)
+* Bug - Fix format string for ecs-init. [#3282](https://github.com/aws/amazon-ecs-agent/pull/3282)
+
 ## 1.62.2
 * Enhancement - Load ServiceName from ACS Task Payload. [#3342](https://github.com/aws/amazon-ecs-agent/pull/3342)
 * Bug - Update healthcheck and ports in dockerfree build. [#3343](https://github.com/aws/amazon-ecs-agent/pull/3343)
@@ -11,6 +842,7 @@
 ## 1.62.0
 * Enhancement - Update golang version to 1.18.3 [#3301](https://github.com/aws/amazon-ecs-agent/pull/3301)
 * Enhancement - Update windows golang version to 1.18.3 [#3317](https://github.com/aws/amazon-ecs-agent/pull/3317)
+* Bugfix - amazon-ecs-cni-plugins: Always run DeleteVeth on cleanup, fixes veth "exchange full" errors [#3311](https://github.com/aws/amazon-ecs-agent/pull/3311)
 
 ## 1.61.3
 * Enhancement - Add command and error logging for FSx file mapping when calling out to PowerShell [#3240](https://github.com/aws/amazon-ecs-agent/pull/3240)
@@ -27,7 +859,7 @@
 * Enhancement - Simplify api/task code [#3176](https://github.com/aws/amazon-ecs-agent/pull/3176)
 * Enhancement - Remove unused .travis.yml file [#3171](https://github.com/aws/amazon-ecs-agent/pull/3171)
 * Bug - Fix potential goroutine leaks [#3170](https://github.com/aws/amazon-ecs-agent/pull/3170)
-* Bug - Fix credential rotation issue with ECS-A Windows [#3184](https://github.com/aws/amazon-ecs-agent/pull/3184)  
+* Bug - Fix credential rotation issue with ECS-A Windows [#3184](https://github.com/aws/amazon-ecs-agent/pull/3184)
 * Bug - Fix Windows base image versions for integration tests [#3179](https://github.com/aws/amazon-ecs-agent/pull/3179)
 
 ## 1.61.0
@@ -42,7 +874,7 @@
 * Enhancement - Update cgroups library to the latest release [#3126](https://github.com/aws/amazon-ecs-agent/pull/3126)
 * Enhancement - Improve log readability [#3134](https://github.com/aws/amazon-ecs-agent/pull/3134)
 * Enhancement - Add Host IP to port response for v4 container response [#3136](https://github.com/aws/amazon-ecs-agent/pull/3136)
-  
+
 ## 1.59.0
 * Feature - prevent instances in EC2 Autoscaling warm pool from being registered with cluster [#3123](https://github.com/aws/amazon-ecs-agent/pull/3123)
 * Enhancement - DiscoverPollEndpoint: lengthen cache ttl and improve resiliency [#3109](https://github.com/aws/amazon-ecs-agent/pull/3109)
@@ -56,7 +888,7 @@
 * Enhancement - Add support for metrics when using awsvpc network mode on Windows [#3087](https://github.com/aws/amazon-ecs-agent/pull/3087)
 * Enhancement - Update Agent build golang version to 1.17.3 [#3097](https://github.com/aws/amazon-ecs-agent/pull/3097)
 * Enhancement - Lower task cleanup duration [#3088](https://github.com/aws/amazon-ecs-agent/pull/3088)
-* Bug - Fix memory leak in task stats collector [#3082](https://github.com/aws/amazon-ecs-agent/pull/3082) 
+* Bug - Fix memory leak in task stats collector [#3082](https://github.com/aws/amazon-ecs-agent/pull/3082)
 
 ## 1.57.0
 * Feature - Add instance health status feature. [#3071](https://github.com/aws/amazon-ecs-agent/pull/3071)
@@ -78,7 +910,7 @@
 * Enhancement - Upgrade Windows builds to golang version v1.17
 [#3010](https://github.com/aws/amazon-ecs-agent/pull/3010)
 * Enhancement - Introduce a new environment variable ECS_EXCLUDE_IPV6_PORTBINDING. When enabled, this filters the IPv6 port bindings for default network mode tasks in DescribeTasks API call [#3025](https://github.com/aws/amazon-ecs-agent/pull/3025)
-* Bug - Fix a issue that agent does not clean task execution credentials from credential manager when stopping a task [#2993](https://github.com/aws/amazon-ecs-agent/pull/2993) 
+* Bug - Fix a issue that agent does not clean task execution credentials from credential manager when stopping a task [#2993](https://github.com/aws/amazon-ecs-agent/pull/2993)
 
 ## 1.55.2
 * Enhancement - Add runtime-stats log file to periodically log agent's runtime stats such as used memory and CPU; also add new configuration setting to enable/disable pprof [#3001](https://github.com/aws/amazon-ecs-agent/pull/3001)
@@ -183,7 +1015,7 @@
 
 ## 1.44.3
 * Bug - Revert Introspection API scope change [#2605](https://github.com/aws/amazon-ecs-agent/pull/2605)
-* Bug - Fix a bug where ECS_LOGLEVEL stopped controlling logging level on instance [#2597](https://github.com/aws/amazon-ecs-agent/pull/2597) 
+* Bug - Fix a bug where ECS_LOGLEVEL stopped controlling logging level on instance [#2597](https://github.com/aws/amazon-ecs-agent/pull/2597)
 
 ## 1.44.2
 * Bug - Fix Introspection API scope and bind to localhost [#2588](https://github.com/aws/amazon-ecs-agent/pull/2588)
@@ -239,7 +1071,7 @@ to be ignored in some situations [#2513](https://github.com/aws/amazon-ecs-agent
 
 ## 1.36.1
 * Bug - Fixed potential file descriptor leak with context logger [#2337](https://github.com/aws/amazon-ecs-agent/pull/2337)
- 
+
 ## 1.36.0
 * Feature - structured logs and logfile rollover features [#2311](https://github.com/aws/amazon-ecs-agent/pull/2311), [#2319](https://github.com/aws/amazon-ecs-agent/pull/2319), [#2330](https://github.com/aws/amazon-ecs-agent/pull/2330)
 
@@ -255,14 +1087,14 @@ to be ignored in some situations [#2513](https://github.com/aws/amazon-ecs-agent
 ## 1.33.0
 * Feature - Agent performs a sync between task state on the instance and on the backend everytime Agent establishes a connection with the backend. This ensures that task state is as expected on the instance after the instance reconnects with the instance after a disconnection [#2191](https://github.com/aws/amazon-ecs-agent/pull/2191)
 * Enhancement - Update Docker LoadImage API timeout based on benchmarking test [#2269](https://github.com/aws/amazon-ecs-agent/pull/2269)
-* Enhancement - Enable the detection of health status of ECS Agent using HEALTHCHECK directive [#2260](https://github.com/aws/amazon-ecs-agent/pull/2260)  
+* Enhancement - Enable the detection of health status of ECS Agent using HEALTHCHECK directive [#2260](https://github.com/aws/amazon-ecs-agent/pull/2260)
 * Enhancement - Add `NON_ECS_IMAGE_MINIMUM_CLEANUP_AGE` flag which when set allows the user to set the minimum time interval between when a non ECS image is created and when it can be considered for automated image cleanup [#2251](https://github.com/aws/amazon-ecs-agent/pull/2251)
 
 ## 1.32.1
-* Enhancement - Add `ECS_ENABLE_MEMORY_UNBOUNDED_WINDOWS_WORKAROUND` flag which when set ignores the memory reservation 
+* Enhancement - Add `ECS_ENABLE_MEMORY_UNBOUNDED_WINDOWS_WORKAROUND` flag which when set ignores the memory reservation
 parameter along with memory bounded tasks in windows [@julienduchesne](https://github.com/julienduchesn) [#2239](https://github.com/aws/amazon-ecs-agent/pull/2239)
 * Bug - Fixed a bug when config attribute in hostConfig is nil when starting a task [#2249](https://github.com/aws/amazon-ecs-agent/pull/2249)
-* Bug - Fixed a bug where start container failed with EOF and container is started anyways [#2245](https://github.com/aws/amazon-ecs-agent/pull/2245) 
+* Bug - Fixed a bug where start container failed with EOF and container is started anyways [#2245](https://github.com/aws/amazon-ecs-agent/pull/2245)
 * Bug - Fixed a bug where incorrect error type was detected when the `vpc-id` could not be detected on ec2-classic [#2243](https://github.com/aws/amazon-ecs-agent/pull/2243)
 * Bug - Fixed a bug where Agent did not reopen Docker event stream when it gets EOF/UnexpectedEOF error [#2240](https://github.com/aws/amazon-ecs-agent/pull/2240)
 

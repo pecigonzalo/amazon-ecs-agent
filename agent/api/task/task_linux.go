@@ -19,19 +19,24 @@ package task
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/utils"
-
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
 	resourcetype "github.com/aws/amazon-ecs-agent/agent/taskresource/types"
+	taskresourcevolume "github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/daemonimages/csidriver/util"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/arn"
 	"github.com/cihub/seelog"
 	"github.com/containernetworking/cni/libcni"
 	dockercontainer "github.com/docker/docker/api/types/container"
@@ -41,11 +46,38 @@ import (
 
 const (
 	// Reference: http://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDefinition.html
-	minimumCPUShare = 2
+	// These min, max values are defined in the kernel:
+	// https://github.com/torvalds/linux/blob/0bddd227f3dc55975e2b8dfa7fc6f959b062a2c7/kernel/sched/sched.h#L427-L428
+	// We need to make sure task and container cgroups have cpu shares within this range.
+	minimumCPUShares = 2
+	maximumCPUShares = 262144
 
 	minimumCPUPercent = 0
 	bytesPerMegabyte  = 1024 * 1024
 )
+
+// getSupplementaryGroups returns the supplementary groups for a container
+// if it has EBS Task Attach volumes mounted
+func (task *Task) getSupplementaryGroups(container *apicontainer.Container) []string {
+
+	if !task.IsEBSTaskAttachEnabled() {
+		return nil
+	}
+
+	// Check container's mount points against task volumes
+	for _, mp := range container.MountPoints {
+		if vol, ok := task.HostVolumeByName(mp.SourceVolume); ok {
+			if ebsConfig, ok := vol.(*taskresourcevolume.EBSTaskVolumeConfig); ok {
+				// This container mounts an EBS volume, generate GID from SourceVolumeHostPath
+				gid := util.GenerateGIDFromPath(ebsConfig.SourceVolumeHostPath)
+				logger.Debug("Generated a GID from EBS volume's host path",
+					logger.Fields{field.TaskID: task.GetID(), "EBS SourceVolumeHostPath": ebsConfig.SourceVolumeHostPath, "GID": strconv.Itoa(gid)})
+				return []string{strconv.Itoa(gid)}
+			}
+		}
+	}
+	return nil
+}
 
 // PlatformFields consists of fields specific to Linux for a task
 type PlatformFields struct{}
@@ -56,12 +88,23 @@ func (task *Task) adjustForPlatform(cfg *config.Config) {
 	task.MemoryCPULimitsEnabled = cfg.TaskCPUMemLimit.Enabled()
 }
 
-func (task *Task) initializeCgroupResourceSpec(cgroupPath string, cGroupCPUPeriod time.Duration, resourceFields *taskresource.ResourceFields) error {
+func (task *Task) initializeCgroupResourceSpec(cgroupPath string, cGroupCPUPeriod time.Duration, taskPidsLimit int, resourceFields *taskresource.ResourceFields) error {
+	if !task.MemoryCPULimitsEnabled {
+		if task.CPU > 0 || task.Memory > 0 {
+			// Client-side validation/warning if a task with task-level CPU/memory limits specified somehow lands on an instance
+			// where agent does not support it. These limits will be ignored.
+			logger.Warn("Ignoring task-level CPU/memory limits since agent does not support the TaskCPUMemLimits capability", logger.Fields{
+				field.TaskID: task.GetID(),
+			})
+		}
+		return nil
+	}
+
 	cgroupRoot, err := task.BuildCgroupRoot()
 	if err != nil {
 		return errors.Wrapf(err, "cgroup resource: unable to determine cgroup root for task")
 	}
-	resSpec, err := task.BuildLinuxResourceSpec(cGroupCPUPeriod)
+	resSpec, err := task.BuildLinuxResourceSpec(cGroupCPUPeriod, taskPidsLimit)
 	if err != nil {
 		return errors.Wrapf(err, "cgroup resource: unable to build resource spec for task")
 	}
@@ -80,7 +123,7 @@ func (task *Task) initializeCgroupResourceSpec(cgroupPath string, cGroupCPUPerio
 // Example v1: /ecs/task-id
 // Example v2: ecstasks-$TASKID.slice
 func (task *Task) BuildCgroupRoot() (string, error) {
-	taskID, err := utils.TaskIdFromArn(task.Arn)
+	taskID, err := arn.TaskIdFromArn(task.Arn)
 	if err != nil {
 		return "", err
 	}
@@ -98,17 +141,18 @@ func buildCgroupV1Root(taskID string) string {
 // buildCgroupV2Root creates a root cgroup using the systemd driver's special "-"
 // character. The "-" specifies a parent slice, so tasks and their containers end up
 // looking like this in the cgroup directory:
-//   /sys/fs/cgroup/ecstasks.slice/
-//   ├── ecstasks-XXXXf406f70c4c678073ae96944fXXXX.slice
-//   │   └── docker-XXXX7c6dc81f2e9a8bf1c566dc769733ccba594b3007dd289a0f50ad7923XXXX.scope
-//   └── ecstasks-XXXX30467358463ab6bbba4e73afXXXX.slice
-//       └── docker-XXXX7ef4e942552437c96051356859c1df169f16e1cf9a9fc96fd30614e6XXXX.scope
+//
+//	/sys/fs/cgroup/ecstasks.slice/
+//	├── ecstasks-XXXXf406f70c4c678073ae96944fXXXX.slice
+//	│   └── docker-XXXX7c6dc81f2e9a8bf1c566dc769733ccba594b3007dd289a0f50ad7923XXXX.scope
+//	└── ecstasks-XXXX30467358463ab6bbba4e73afXXXX.slice
+//	    └── docker-XXXX7ef4e942552437c96051356859c1df169f16e1cf9a9fc96fd30614e6XXXX.scope
 func buildCgroupV2Root(taskID string) string {
 	return fmt.Sprintf("%s-%s.slice", config.DefaultTaskCgroupV2Prefix, taskID)
 }
 
 // BuildLinuxResourceSpec returns a linuxResources object for the task cgroup
-func (task *Task) BuildLinuxResourceSpec(cGroupCPUPeriod time.Duration) (specs.LinuxResources, error) {
+func (task *Task) BuildLinuxResourceSpec(cGroupCPUPeriod time.Duration, taskPidsLimit int) (specs.LinuxResources, error) {
 	linuxResourceSpec := specs.LinuxResources{}
 
 	// If task level CPU limits are requested, set CPU quota + CPU period
@@ -134,6 +178,15 @@ func (task *Task) BuildLinuxResourceSpec(cGroupCPUPeriod time.Duration) (specs.L
 		linuxResourceSpec.Memory = &linuxMemorySpec
 	}
 
+	// Set task pids limit if set via ECS_TASK_PIDS_LIMIT env var
+	if taskPidsLimit > 0 {
+		pidsLimitValue := int64(taskPidsLimit)
+		pidsLimit := &specs.LinuxPids{
+			Limit: &pidsLimitValue,
+		}
+		linuxResourceSpec.Pids = pidsLimit
+	}
+
 	return linuxResourceSpec, nil
 }
 
@@ -156,11 +209,16 @@ func (task *Task) buildImplicitLinuxCPUSpec() specs.LinuxCPU {
 	// aggregate container CPU shares when present
 	var taskCPUShares uint64
 	for _, container := range task.Containers {
-		if container.CPU < minimumCPUShare {
-			taskCPUShares += minimumCPUShare
+		if container.CPU < minimumCPUShares {
+			taskCPUShares += minimumCPUShares
 		} else {
 			taskCPUShares += uint64(container.CPU)
 		}
+	}
+
+	// If the task CPU shares exceed the maximumCPUShares, we set it to be the maximum permitted by the kernel.
+	if taskCPUShares > maximumCPUShares {
+		taskCPUShares = maximumCPUShares
 	}
 
 	return specs.LinuxCPU{
@@ -214,31 +272,20 @@ func (task *Task) overrideCgroupParent(hostConfig *dockercontainer.HostConfig) e
 // Docker silently converts 0 to 1024 CPU shares, which is probably not what we
 // want.  Instead, we convert 0 to 2 to be closer to expected behavior. The
 // reason for 2 over 1 is that 1 is an invalid value (Linux's choice, not Docker's).
+// Similarly, if the container CPU shares is more than the max permitted value (Linux's choice again),
+// we set it to the maximum.
 func (task *Task) dockerCPUShares(containerCPU uint) int64 {
-	if containerCPU <= 1 {
+	if containerCPU < minimumCPUShares {
 		seelog.Debugf(
-			"Converting CPU shares to allowed minimum of 2 for task arn: [%s] and cpu shares: %d",
-			task.Arn, containerCPU)
-		return 2
+			"Converting CPU shares to allowed minimum of %d for task arn: [%s] and cpu shares: %d",
+			minimumCPUShares, task.Arn, containerCPU)
+		return minimumCPUShares
+	} else if containerCPU > maximumCPUShares {
+		seelog.Debugf("Converting CPU shares to allowed maximum of %d for task arn [%s] and cpu shares: %d",
+			maximumCPUShares, task.Arn, containerCPU)
+		return maximumCPUShares
 	}
 	return int64(containerCPU)
-}
-
-// requiresCredentialSpecResource returns true if at least one container in the task
-// needs a valid credentialspec resource
-func (task *Task) requiresCredentialSpecResource() bool {
-	return false
-}
-
-// initializeCredentialSpecResource builds the resource dependency map for the credentialspec resource
-func (task *Task) initializeCredentialSpecResource(config *config.Config, credentialsManager credentials.Manager,
-	resourceFields *taskresource.ResourceFields) error {
-	return errors.New("task credentialspec is only supported on windows")
-}
-
-// GetCredentialSpecResource retrieves credentialspec resource from resource map
-func (task *Task) GetCredentialSpecResource() ([]taskresource.TaskResource, bool) {
-	return []taskresource.TaskResource{}, false
 }
 
 func enableIPv6SysctlSetting(hostConfig *dockercontainer.HostConfig) {
@@ -260,9 +307,9 @@ func (task *Task) initializeFSxWindowsFileServerResource(cfg *config.Config, cre
 	return errors.New("task with FSx for Windows File Server volumes is only supported on Windows container instance")
 }
 
-// BuildCNIConfig builds a list of CNI network configurations for the task.
+// BuildCNIConfigAwsvpc builds a list of CNI network configurations for the task.
 // If includeIPAMConfig is set to true, the list also includes the bridge IPAM configuration.
-func (task *Task) BuildCNIConfig(includeIPAMConfig bool, cniConfig *ecscni.Config) (*ecscni.Config, error) {
+func (task *Task) BuildCNIConfigAwsvpc(includeIPAMConfig bool, cniConfig *ecscni.Config) (*ecscni.Config, error) {
 	if !task.IsNetworkModeAWSVPC() {
 		return nil, errors.New("task config: task network mode is not AWSVPC")
 	}
@@ -276,10 +323,10 @@ func (task *Task) BuildCNIConfig(includeIPAMConfig bool, cniConfig *ecscni.Confi
 		switch eni.InterfaceAssociationProtocol {
 		// If the association protocol is set to "default" or unset (to preserve backwards
 		// compatibility), consider it a "standard" ENI attachment.
-		case "", apieni.DefaultInterfaceAssociationProtocol:
+		case "", ni.DefaultInterfaceAssociationProtocol:
 			cniConfig.ID = eni.MacAddress
-			ifName, netconf, err = ecscni.NewENINetworkConfig(eni, cniConfig)
-		case apieni.VLANInterfaceAssociationProtocol:
+			ifName, netconf, err = ecscni.NewVPCENINetworkConfig(eni, cniConfig)
+		case ni.VLANInterfaceAssociationProtocol:
 			cniConfig.ID = eni.MacAddress
 			ifName, netconf, err = ecscni.NewBranchENINetworkConfig(eni, cniConfig)
 		default:
@@ -321,7 +368,56 @@ func (task *Task) BuildCNIConfig(includeIPAMConfig bool, cniConfig *ecscni.Confi
 		})
 	}
 
+	// Build a CNI network configuration for ServiceConnect-enabled task in AWSVPC mode
+	if task.IsServiceConnectEnabled() {
+		ifName, netconf, err = ecscni.NewServiceConnectNetworkConfig(
+			task.ServiceConnectConfig,
+			ecscni.NAT,
+			false,
+			task.shouldEnableIPv4(),
+			task.shouldEnableIPv6(),
+			cniConfig)
+		if err != nil {
+			return nil, err
+		}
+		cniConfig.NetworkConfigs = append(cniConfig.NetworkConfigs, &ecscni.NetworkConfig{
+			IfName:           ifName,
+			CNINetworkConfig: netconf,
+		})
+	}
+
 	cniConfig.ContainerNetNS = fmt.Sprintf(ecscni.NetnsFormat, cniConfig.ContainerPID)
 
+	return cniConfig, nil
+}
+
+// BuildCNIConfigBridgeMode builds a list of CNI network configurations for a task in docker bridge mode.
+// Currently the only plugin in available is for Service Connect
+func (task *Task) BuildCNIConfigBridgeMode(cniConfig *ecscni.Config, containerName string) (*ecscni.Config, error) {
+	if !task.IsNetworkModeBridge() || !task.IsServiceConnectEnabled() {
+		return nil, errors.New("only bridge-mode Service-Connect-enabled task should invoke BuildCNIConfigBridgeMode")
+	}
+
+	var netconf *libcni.NetworkConfig
+	var ifName string
+	var err error
+
+	scNetworkConfig := task.GetServiceConnectNetworkConfig()
+	ifName, netconf, err = ecscni.NewServiceConnectNetworkConfig(
+		task.ServiceConnectConfig,
+		ecscni.TPROXY,
+		!task.IsContainerServiceConnectPause(containerName),
+		scNetworkConfig.SCPauseIPv4Addr != "",
+		scNetworkConfig.SCPauseIPv6Addr != "",
+		cniConfig)
+	if err != nil {
+		return nil, err
+	}
+	cniConfig.NetworkConfigs = append(cniConfig.NetworkConfigs, &ecscni.NetworkConfig{
+		IfName:           ifName,
+		CNINetworkConfig: netconf,
+	})
+
+	cniConfig.ContainerNetNS = fmt.Sprintf(ecscni.NetnsFormat, cniConfig.ContainerPID)
 	return cniConfig, nil
 }

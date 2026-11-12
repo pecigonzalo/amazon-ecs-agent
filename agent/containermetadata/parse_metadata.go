@@ -19,6 +19,7 @@ import (
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 
+	tmdsresponse "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/response"
 	"github.com/cihub/seelog"
 	"github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
@@ -43,6 +44,7 @@ func (manager *metadataManager) parseMetadataAtContainerCreate(task *apitask.Tas
 		availabilityZone:       manager.availabilityZone,
 		hostPrivateIPv4Address: manager.hostPrivateIPv4Address,
 		hostPublicIPv4Address:  manager.hostPublicIPv4Address,
+		hostIPv6Address:        manager.hostIPv6Address,
 	}
 }
 
@@ -66,6 +68,7 @@ func (manager *metadataManager) parseMetadata(dockerContainer *types.ContainerJS
 		availabilityZone:        manager.availabilityZone,
 		hostPrivateIPv4Address:  manager.hostPrivateIPv4Address,
 		hostPublicIPv4Address:   manager.hostPublicIPv4Address,
+		hostIPv6Address:         manager.hostIPv6Address,
 	}
 }
 
@@ -138,21 +141,38 @@ func parseNetworkMetadata(settings *types.NetworkSettings, hostConfig *dockercon
 	// We get the NetworkMode (Network interface name) from the HostConfig because this
 	// this is the network with which the container is created
 	ipv4AddressFromSettings := settings.IPAddress
+	ipv6AddressFromSettings := settings.GlobalIPv6Address
 	networkModeFromHostConfig := string(hostConfig.NetworkMode)
 
 	// Extensive Network information is not available for Docker API versions 1.17-1.20
 	// Instead we only get the details of the first network
-	networkList := make([]Network, 0)
+	networkList := make([]tmdsresponse.Network, 0)
 	if len(settings.Networks) > 0 {
 		for modeFromSettings, containerNetwork := range settings.Networks {
 			networkMode := modeFromSettings
 			ipv4Addresses := []string{containerNetwork.IPAddress}
-			network := Network{NetworkMode: networkMode, IPv4Addresses: ipv4Addresses}
+			var ipv6Addresses []string
+			if containerNetwork.GlobalIPv6Address != "" {
+				ipv6Addresses = []string{containerNetwork.GlobalIPv6Address}
+			}
+			network := tmdsresponse.Network{
+				NetworkMode:   networkMode,
+				IPv4Addresses: ipv4Addresses,
+				IPv6Addresses: ipv6Addresses,
+			}
 			networkList = append(networkList, network)
 		}
 	} else {
 		ipv4Addresses := []string{ipv4AddressFromSettings}
-		network := Network{NetworkMode: networkModeFromHostConfig, IPv4Addresses: ipv4Addresses}
+		var ipv6Addresses []string
+		if ipv6AddressFromSettings != "" {
+			ipv6Addresses = []string{ipv6AddressFromSettings}
+		}
+		network := tmdsresponse.Network{
+			NetworkMode:   networkModeFromHostConfig,
+			IPv4Addresses: ipv4Addresses,
+			IPv6Addresses: ipv6Addresses,
+		}
 		networkList = append(networkList, network)
 	}
 

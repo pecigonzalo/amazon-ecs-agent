@@ -1,28 +1,37 @@
 name: Windows
 
-on: [pull_request]
+on: [push, pull_request]
 
+permissions: read-all
 jobs:
   windows-unit-tests:
     name: Windows unit tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           path: src/github.com/aws/amazon-ecs-agent
       - name: get GO_VERSION
-        run:  |
+        id: get-go-version
+        run: |
           cd "$Env:GITHUB_WORKSPACE"
           cd "src/github.com/aws/amazon-ecs-agent"
-          echo "GO_VERSION_WINDOWS=$(type GO_VERSION_WINDOWS)" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf-8 -Append
-      - uses: actions/setup-go@v2
+          $ErrorActionPreference = "Stop"
+          $go_version_win = $(type GO_VERSION_WINDOWS)
+          $go_version_re = "^\d+\.{1,2}\d+$"
+          if (-Not ($go_version_win.Length -le 10 -or $go_version_win -match $go_version_re) ) {
+            echo "invalid GO version"
+            exit 1
+          }
+          "GO_VERSION_WINDOWS=$go_version_win" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: actions/setup-go@v7
         with:
-          go-version: ${{ env.GO_VERSION_WINDOWS }}
-      - uses: actions/checkout@v2
+          go-version: ${{ steps.get-go-version.outputs.GO_VERSION_WINDOWS }}
+      - uses: actions/checkout@v7
         with:
           submodules: true
           path: src/github.com/aws/amazon-ecs-agent
-      - name: run tests
+      - name: run agent tests
         working-directory:
         run: |
           $Env:GOPATH = "$Env:GITHUB_WORKSPACE"
@@ -31,4 +40,13 @@ jobs:
           gcc --version
           $env:ZZZ_SKIP_WINDOWS_SERVER_VERSION_CHECK_NOT_SUPPORTED_IN_PRODUCTION = 'true'
           $packages=go list .\... | Where-Object {$_ -NotMatch 'vendor'}
-          go test -v -tags unit -timeout=40s $packages
+          go test -v -tags unit -timeout=120s $packages
+      - name: run ecs-agent tests
+        working-directory:
+        run: |
+          $Env:GOPATH = "$Env:GITHUB_WORKSPACE"
+          cd "$Env:GITHUB_WORKSPACE"
+          cd "src/github.com/aws/amazon-ecs-agent/ecs-agent"
+          gcc --version
+          $packages=go list .\... | Where-Object {$_ -NotMatch 'vendor'}
+          go test -v -tags unit -timeout=120s $packages

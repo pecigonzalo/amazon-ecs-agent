@@ -24,10 +24,10 @@ import (
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
-	mock_netlink "github.com/aws/amazon-ecs-agent/agent/eni/netlinkwrapper/mocks"
 	mock_resolver "github.com/aws/amazon-ecs-agent/agent/stats/resolver/mock"
 	mock_nswrapper "github.com/aws/amazon-ecs-agent/agent/utils/nswrapper/mocks"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	mock_netlink "github.com/aws/amazon-ecs-agent/ecs-agent/utils/netlinkwrapper/mocks"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -35,6 +35,7 @@ import (
 )
 
 func TestTaskStatsCollection(t *testing.T) {
+	t.Parallel()
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
@@ -92,11 +93,12 @@ func TestTaskStatsCollection(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, networkStatsSet)
-	rxSum := (*networkStatsSet.RxBytes.SampleCount * (int64(50))) / int64(numberOfContainers)
+	rxSum := *networkStatsSet.RxBytes.SampleCount * (int64(50))
 	assert.EqualValues(t, rxSum, *networkStatsSet.RxBytes.Sum)
 }
 
 func TestTaskStatsCollectionError(t *testing.T) {
+	t.Parallel()
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
@@ -155,8 +157,8 @@ func TestTaskStatsCollectionError(t *testing.T) {
 
 	networkStatsSet, err := taskStats.StatsQueue.GetNetworkStatsSet()
 	assert.NoError(t, err)
-	assert.EqualValues(t, 50, *networkStatsSet.RxBytes.Sum)
-	assert.EqualValues(t, 2, *networkStatsSet.RxPackets.Sum)
+	assert.EqualValues(t, 100, *networkStatsSet.RxBytes.Sum)
+	assert.EqualValues(t, 4, *networkStatsSet.RxPackets.Sum)
 	assert.EqualValues(t, 2, *networkStatsSet.RxPackets.SampleCount)
 	assert.EqualValues(t, 2, *networkStatsSet.TxPackets.SampleCount)
 }

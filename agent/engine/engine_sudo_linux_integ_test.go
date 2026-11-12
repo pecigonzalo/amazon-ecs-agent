@@ -18,56 +18,42 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cihub/seelog"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"github.com/docker/docker/api/types"
-	dockercontainer "github.com/docker/docker/api/types/container"
-	sdkClient "github.com/docker/docker/client"
-	"github.com/pborman/uuid"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	"github.com/aws/amazon-ecs-agent/agent/api"
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient/sdkclientfactory"
-	"github.com/aws/amazon-ecs-agent/agent/ec2"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
+	engineserviceconnect "github.com/aws/amazon-ecs-agent/agent/engine/serviceconnect"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	cgroup "github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup/control"
-	"github.com/aws/amazon-ecs-agent/agent/taskresource/firelens"
 	taskresourcevolume "github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
+
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/cihub/seelog"
+	"github.com/docker/docker/api/types"
+	sdkClient "github.com/docker/docker/client"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -75,43 +61,31 @@ var (
 )
 
 const (
-	testLogSenderImage           = "public.ecr.aws/amazonlinux/amazonlinux:2.0.20210126.0"
-	testFluentbitImage           = "public.ecr.aws/aws-observability/aws-for-fluent-bit:2.10.1"
-	testVolumeImage              = "127.0.0.1:51670/amazon/amazon-ecs-volumes-test:latest"
-	testCluster                  = "testCluster"
-	validTaskArnPrefix           = "arn:aws:ecs:region:account-id:task/"
+	testVolumeImage    = "127.0.0.1:51670/amazon/amazon-ecs-volumes-test:latest"
+	testFluentBitImage = "public.ecr.aws/aws-observability/aws-for-fluent-bit:stable"
+	// the fluentd image release is outside our direct control, hence we use a specific version to not get impacted by
+	// a bad rollout.
+	testFluentdImage             = "public.ecr.aws/docker/library/fluentd:v1.18-1"
 	testDataDir                  = "/var/lib/ecs/data/"
 	testDataDirOnHost            = "/var/lib/ecs/"
-	testInstanceID               = "testInstanceID"
-	testTaskDefFamily            = "testFamily"
-	testTaskDefVersion           = "1"
-	testECSRegion                = "us-east-1"
-	testLogGroupName             = "test-fluentbit"
-	testLogGroupPrefix           = "firelens-fluentbit-"
 	testExecCommandAgentImage    = "127.0.0.1:51670/amazon/amazon-ecs-exec-command-agent-test:latest"
 	testExecCommandAgentSleepBin = "/sleep"
 	testExecCommandAgentKillBin  = "/kill"
 )
 
-var (
-	mockTaskMeatadataHandler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		rw.Write([]byte(`{"TaskARN": "arn:aws:ecs:region:account-id:task/task-id"}`))
-	})
-)
-
 func TestStartStopWithCgroup(t *testing.T) {
-	cfg := defaultTestConfigIntegTest()
+	cfg := DefaultTestConfigIntegTest()
 	cfg.TaskCleanupWaitDuration = 1 * time.Second
 	cfg.TaskCPUMemLimit.Value = config.ExplicitlyEnabled
 	cfg.CgroupPath = "/cgroup"
 
-	taskEngine, done, _ := setup(cfg, nil, t)
+	taskEngine, done, _, _ := SetupIntegTestTaskEngine(cfg, nil, t)
 	defer done()
 
 	stateChangeEvents := taskEngine.StateChangeEvents()
 
 	taskArn := "arn:aws:ecs:us-east-1:123456789012:task/testCgroup"
-	testTask := createTestTask(taskArn)
+	testTask := CreateTestTask(taskArn)
 	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
 	for _, container := range testTask.Containers {
 		container.TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
@@ -128,11 +102,14 @@ func TestStartStopWithCgroup(t *testing.T) {
 	}
 	go taskEngine.AddTask(testTask)
 
-	verifyContainerRunningStateChange(t, taskEngine)
-	verifyTaskIsRunning(stateChangeEvents, testTask)
+	VerifyContainerManifestPulledStateChange(t, taskEngine)
+	VerifyTaskManifestPulledStateChange(t, taskEngine)
 
-	verifyContainerStoppedStateChange(t, taskEngine)
-	verifyTaskIsStopped(stateChangeEvents, testTask)
+	VerifyContainerRunningStateChange(t, taskEngine)
+	VerifyTaskIsRunning(stateChangeEvents, testTask)
+
+	VerifyContainerStoppedStateChange(t, taskEngine)
+	VerifyTaskIsStopped(stateChangeEvents, testTask)
 
 	// Should be stopped, let's verify it's still listed...
 	task, ok := taskEngine.(*DockerTaskEngine).State().TaskByArn(taskArn)
@@ -156,8 +133,8 @@ func TestStartStopWithCgroup(t *testing.T) {
 }
 
 func TestLocalHostVolumeMount(t *testing.T) {
-	cfg := defaultTestConfigIntegTest()
-	taskEngine, done, _ := setup(cfg, nil, t)
+	cfg := DefaultTestConfigIntegTest()
+	taskEngine, done, _, _ := SetupIntegTestTaskEngine(cfg, nil, t)
 	defer done()
 
 	// creates a task with local volume
@@ -165,10 +142,12 @@ func TestLocalHostVolumeMount(t *testing.T) {
 	stateChangeEvents := taskEngine.StateChangeEvents()
 	go taskEngine.AddTask(testTask)
 
-	verifyContainerRunningStateChange(t, taskEngine)
-	verifyTaskIsRunning(stateChangeEvents, testTask)
-	verifyContainerStoppedStateChange(t, taskEngine)
-	verifyTaskIsStopped(stateChangeEvents, testTask)
+	VerifyContainerManifestPulledStateChange(t, taskEngine)
+	VerifyTaskManifestPulledStateChange(t, taskEngine)
+	VerifyContainerRunningStateChange(t, taskEngine)
+	VerifyTaskIsRunning(stateChangeEvents, testTask)
+	VerifyContainerStoppedStateChange(t, taskEngine)
+	VerifyTaskIsStopped(stateChangeEvents, testTask)
 
 	assert.NotNil(t, testTask.Containers[0].GetKnownExitCode(), "No exit code found")
 	assert.Equal(t, 0, *testTask.Containers[0].GetKnownExitCode(), "Wrong exit code")
@@ -178,7 +157,7 @@ func TestLocalHostVolumeMount(t *testing.T) {
 }
 
 func createTestLocalVolumeMountTask() *apitask.Task {
-	testTask := createTestTask("testLocalHostVolumeMount")
+	testTask := CreateTestTask("testLocalHostVolumeMount")
 	testTask.Volumes = []apitask.TaskVolume{{Name: "test-tmp", Volume: &taskresourcevolume.LocalDockerVolume{}}}
 	testTask.Containers[0].Image = testVolumeImage
 	testTask.Containers[0].MountPoints = []apicontainer.MountPoint{{ContainerPath: "/host/tmp", SourceVolume: "test-tmp"}}
@@ -188,208 +167,108 @@ func createTestLocalVolumeMountTask() *apitask.Task {
 	return testTask
 }
 
-func TestFirelensFluentbit(t *testing.T) {
-	// Skipping the test for arm as they do not have official support for Arm images
-	if runtime.GOARCH == "arm64" {
-		t.Skip("Skipping test, unsupported image for arm64")
-	}
-	cfg := defaultTestConfigIntegTest()
+// TestFirelens integration test verifies the following:
+//
+// 1. Firelens data directory creation and ownership configuration
+// 2. Task and container state events
+// 3. Firelens container's ability to log to a destination (local file)
+// 4. Firelens resource cleanup after the task stops
+// 5. Verifies all the above across both Fluentd and Fluent Bit log router options.
+//
+// This test validates the integration of different ECS agent components. It mocks the payload received from ECS backend,
+// and does not rely on external logging destinations (like CloudWatch) for logging functionality verification.
+func TestFirelens(t *testing.T) {
+	// Setup agent config
+	cfg := DefaultTestConfigIntegTest()
 	cfg.DataDir = testDataDir
 	cfg.DataDirOnHost = testDataDirOnHost
 	cfg.TaskCleanupWaitDuration = 1 * time.Second
-	cfg.Cluster = testCluster
-	taskEngine, done, _ := setup(cfg, nil, t)
-	defer done()
+	cfg.Cluster = TestCluster
 
-	// Mock task metadata server as the firelens container needs to access it.
-	// Note that the listener has to be overwritten here, because the default one from httptest.NewServer
-	// only listens to localhost and isn't reachable from container running in bridge network mode.
-	l, err := net.Listen("tcp", ":0")
-	require.NoError(t, err)
-	server := httptest.NewUnstartedServer(mockTaskMeatadataHandler)
-	server.Listener = l
-	server.Start()
-	defer server.Close()
-
-	port := getPortFromAddr(t, server.URL)
-	serverURL := fmt.Sprintf("http://%s:%s", getHostPrivateIP(t, ec2.NewEC2MetadataClient(nil)), port)
-	defer setV3MetadataURLFormat(serverURL + "/v3/%s")()
-
-	testTask := createFirelensTask(t)
+	// Setup task engine
+	taskEngine, done, _, _ := SetupIntegTestTaskEngine(cfg, nil, t)
 	taskEngine.(*DockerTaskEngine).resourceFields = &taskresource.ResourceFields{
 		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			EC2InstanceID: testInstanceID,
+			EC2InstanceID: TestInstanceID,
 		},
 	}
-	go taskEngine.AddTask(testTask)
-	testEvents := InitEventCollection(taskEngine)
+	defer done()
 
-	//Verify logsender container is running
-	err = VerifyContainerStatus(apicontainerstatus.ContainerRunning, testTask.Arn+":logsender", testEvents, t)
-	assert.NoError(t, err, "Verify logsender container is running")
+	// Setup task metadata server
+	setupTaskMetadataServer(t)
 
-	//Verify firelens container is running
-	err = VerifyContainerStatus(apicontainerstatus.ContainerRunning, testTask.Arn+":firelens", testEvents, t)
-	assert.NoError(t, err, "Verify firelens container is running")
-
-	//Verify task is in running state
-	err = VerifyTaskStatus(apitaskstatus.TaskRunning, testTask.Arn, testEvents, t)
-	assert.NoError(t, err, "Not verified task running")
-
-	//Verify logsender container is stopped
-	err = VerifyContainerStatus(apicontainerstatus.ContainerStopped, testTask.Arn+":logsender", testEvents, t)
-	assert.NoError(t, err)
-
-	//Verify firelens container is stopped
-	err = VerifyContainerStatus(apicontainerstatus.ContainerStopped, testTask.Arn+":firelens", testEvents, t)
-	assert.NoError(t, err)
-
-	//Verify the task itself has stopped
-	err = VerifyTaskStatus(apitaskstatus.TaskStopped, testTask.Arn, testEvents, t)
-	assert.NoError(t, err)
-
-	taskID := testTask.GetID()
-
-	//declare a cloudwatch client
-	cwlClient := cloudwatchlogs.New(session.New(), aws.NewConfig().WithRegion(testECSRegion))
-	params := &cloudwatchlogs.GetLogEventsInput{
-		LogGroupName:  aws.String(testLogGroupName),
-		LogStreamName: aws.String(fmt.Sprintf("firelens-fluentbit-logsender-firelens-%s", taskID)),
-	}
-
-	// wait for the cloud watch logs
-	resp, err := waitCloudwatchLogs(cwlClient, params)
-	require.NoError(t, err)
-	// there should only be one event as we are echoing only one thing that part of the include-filter
-	assert.Equal(t, 1, len(resp.Events))
-
-	message := aws.StringValue(resp.Events[0].Message)
-	jsonBlob := make(map[string]string)
-	err = json.Unmarshal([]byte(message), &jsonBlob)
-	require.NoError(t, err)
-	assert.Equal(t, "stdout", jsonBlob["source"])
-	assert.Equal(t, "include", jsonBlob["log"])
-	assert.Contains(t, jsonBlob, "container_id")
-	assert.Contains(t, jsonBlob["container_name"], "logsender")
-	assert.Equal(t, testCluster, jsonBlob["ecs_cluster"])
-	assert.Equal(t, testTask.Arn, jsonBlob["ecs_task_arn"])
-
-	testTask.SetSentStatus(apitaskstatus.TaskStopped)
-	time.Sleep(3 * cfg.TaskCleanupWaitDuration)
-
-	for i := 0; i < 60; i++ {
-		_, ok := taskEngine.(*DockerTaskEngine).State().TaskByArn(testTask.Arn)
-		if !ok {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-	// Make sure all the resource is cleaned up
-	_, err = ioutil.ReadDir(filepath.Join(testDataDir, "firelens", testTask.Arn))
-	assert.Error(t, err)
-}
-
-// getPortFromAddr returns the port part of an address in format "http://<addr>:<port>".
-func getPortFromAddr(t *testing.T, addr string) string {
-	u, err := url.Parse(addr)
-	require.NoErrorf(t, err, "unable to parse address: %s", addr)
-	_, port, err := net.SplitHostPort(u.Host)
-	require.NoErrorf(t, err, "unable to get port from address: %s", addr)
-	return port
-}
-
-// getHostPrivateIP returns the host's private IP.
-func getHostPrivateIP(t *testing.T, ec2MetadataClient ec2.EC2MetadataClient) string {
-	ip, err := ec2MetadataClient.PrivateIPv4Address()
-	require.NoError(t, err)
-	return ip
-}
-
-// setV3MetadataURLFormat sets the container metadata URI format and returns a function to set it back.
-func setV3MetadataURLFormat(fmt string) func() {
-	backup := apicontainer.MetadataURIFormat
-	apicontainer.MetadataURIFormat = fmt
-	return func() {
-		apicontainer.MetadataURIFormat = backup
-	}
-}
-
-func createFirelensTask(t *testing.T) *apitask.Task {
-	testTask := createTestTask(validTaskArnPrefix + uuid.New())
-	rawHostConfigInputForLogSender := dockercontainer.HostConfig{
-		LogConfig: dockercontainer.LogConfig{
-			Type: logDriverTypeFirelens,
-			Config: map[string]string{
-				"Name":              "cloudwatch",
-				"exclude-pattern":   "exclude",
-				"include-pattern":   "include",
-				"log_group_name":    testLogGroupName,
-				"log_stream_prefix": testLogGroupPrefix,
-				"region":            testECSRegion,
-				"auto_create_group": "true",
-			},
-		},
-	}
-	rawHostConfigForLogSender, err := json.Marshal(&rawHostConfigInputForLogSender)
-	require.NoError(t, err)
-	testTask.Containers = []*apicontainer.Container{
+	testCases := []struct {
+		name                   string
+		firelensType           string
+		firelensContainerImage string
+		firelensContainerUser  string
+	}{
 		{
-			Name:      "logsender",
-			Image:     testLogSenderImage,
-			Essential: true,
-			// TODO: the firelens router occasionally failed to send logs when it's shut down very quickly after started.
-			// Let the task run for a while with a sleep helps avoid that failure, but still needs to figure out the
-			// root cause.
-			Command: []string{"sh", "-c", "echo exclude; echo include; sleep 10;"},
-			DockerConfig: apicontainer.DockerConfig{
-				HostConfig: func() *string {
-					s := string(rawHostConfigForLogSender)
-					return &s
-				}(),
-			},
-			DependsOnUnsafe: []apicontainer.DependsOn{
-				{
-					ContainerName: "firelens",
-					Condition:     "START",
-				},
-			},
+			name:                   "fluent_bit_default",
+			firelensType:           "fluentbit",
+			firelensContainerImage: testFluentBitImage,
 		},
 		{
-			Name:      "firelens",
-			Image:     testFluentbitImage,
-			Essential: true,
-			FirelensConfig: &apicontainer.FirelensConfig{
-				Type: firelens.FirelensConfigTypeFluentbit,
-				Options: map[string]string{
-					"enable-ecs-log-metadata": "true",
-				},
-			},
-			Environment: map[string]string{
-				"AWS_EXECUTION_ENV": "AWS_ECS_EC2",
-				"FLB_LOG_LEVEL":     "debug",
-			},
-			TransitionDependenciesMap: make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet),
+			name:                   "fluent_bit_root_user",
+			firelensType:           "fluentbit",
+			firelensContainerImage: testFluentBitImage,
+			firelensContainerUser:  "0:1000",
 		},
+		{
+			name:                   "fluent_bit_non_root_user",
+			firelensType:           "fluentbit",
+			firelensContainerImage: testFluentBitImage,
+			firelensContainerUser:  "1234:5678",
+		},
+		{
+			name:                   "fluent_d_root_user",
+			firelensType:           "fluentd",
+			firelensContainerImage: testFluentdImage,
+			firelensContainerUser:  "0:1000",
+		},
+		{
+			name:                   "fluent_d_non_root_user",
+			firelensType:           "fluentd",
+			firelensContainerImage: testFluentdImage,
+			firelensContainerUser:  "1234:5678",
+		},
+		// No fluentd default config test case since all the available fluentd images hard-code a container user in the image.
+		// We will rely on functional test for this test case, where we build our own custom fluentd log router image.
 	}
-	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
-	return testTask
-}
 
-func waitCloudwatchLogs(client *cloudwatchlogs.CloudWatchLogs, params *cloudwatchlogs.GetLogEventsInput) (*cloudwatchlogs.GetLogEventsOutput, error) {
-	// The test could fail for timing issue, so retry for 30 seconds to make this test more stable
-	for i := 0; i < 30; i++ {
-		resp, err := client.GetLogEvents(params)
-		if err != nil {
-			awsError, ok := err.(awserr.Error)
-			if !ok || awsError.Code() != "ResourceNotFoundException" {
-				return nil, err
-			}
-		} else if len(resp.Events) > 0 {
-			return resp, nil
-		}
-		time.Sleep(time.Second)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a temporary directory to send app logs to
+			tmpDir := createFirelensLogDir(t, "firelens", tc.firelensContainerUser)
+			defer func() {
+				err := os.RemoveAll(tmpDir)
+				require.NoError(t, err)
+			}()
+
+			// Create the Firelens task
+			firelensTask := createFirelensTask(t, tc.name, tc.firelensContainerImage, tc.firelensContainerUser,
+				tc.firelensType, tmpDir)
+
+			// Start the Firelens task
+			go taskEngine.AddTask(firelensTask)
+
+			// Validate the Firelens task/container statuses during task start
+			verifyFirelensTaskEvents(t, taskEngine, firelensTask, "start")
+
+			// Verify Firelens data directory configuration
+			firelensDataDir := filepath.Join(testDataDir, "firelens", firelensTask.GetID())
+			verifyFirelensDataDir(t, firelensDataDir, tc.firelensContainerUser)
+
+			// Verify app logs from the destination file
+			verifyFirelensLogs(t, firelensTask, tc.firelensType, tmpDir)
+
+			// Validate the Firelens task/container statuses during task stop
+			verifyFirelensTaskEvents(t, taskEngine, firelensTask, "stop")
+
+			// Verify Firelens task resource cleanup
+			verifyFirelensResourceCleanup(t, cfg, firelensTask, taskEngine, firelensDataDir)
+		})
 	}
-	return nil, fmt.Errorf("timeout waiting for the logs to be sent to cloud watch logs")
 }
 
 // TestExecCommandAgent validates ExecCommandAgent start and monitor processes. The algorithm to test is as follows:
@@ -417,7 +296,7 @@ func TestExecCommandAgent(t *testing.T) {
 
 	testExecCmdHostBinDir := "/managed-agents/execute-command/bin"
 
-	taskEngine, done, _ := setupEngineForExecCommandAgent(t, testExecCmdHostBinDir)
+	taskEngine, done, _, cfg := setupEngineForExecCommandAgent(t, testExecCmdHostBinDir)
 	stateChangeEvents := taskEngine.StateChangeEvents()
 	defer done()
 
@@ -432,8 +311,10 @@ func TestExecCommandAgent(t *testing.T) {
 
 	go taskEngine.AddTask(testTask)
 
-	verifyContainerRunningStateChange(t, taskEngine)
-	verifyTaskRunningStateChange(t, taskEngine)
+	VerifyContainerManifestPulledStateChange(t, taskEngine)
+	VerifyTaskManifestPulledStateChange(t, taskEngine)
+	VerifyContainerRunningStateChange(t, taskEngine)
+	VerifyTaskRunningStateChange(t, taskEngine)
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
@@ -442,13 +323,14 @@ func TestExecCommandAgent(t *testing.T) {
 	cid := containerMap[testTask.Containers[0].Name].DockerID
 
 	// session limit is 2
-	testConfigFileName, _ := execcmd.GetExecAgentConfigFileName(2)
+	testConfigFileName, _ := execcmd.GetExecAgentConfigFileName(2, cfg, testTask)
 	testLogConfigFileName, _ := execcmd.GetExecAgentLogConfigFile()
 	verifyExecCmdAgentExpectedMounts(t, ctx, client, testTaskId, cid, testContainerName, testExecCmdHostBinDir+"/1.0.0.0", testConfigFileName, testLogConfigFileName)
 	pidA := verifyMockExecCommandAgentIsRunning(t, client, cid)
 	seelog.Infof("Verified mock ExecCommandAgent is running (pidA=%s)", pidA)
 	killMockExecCommandAgent(t, client, cid, pidA)
 	seelog.Infof("kill signal sent to ExecCommandAgent (pidA=%s)", pidA)
+	waitForKillProcToFinish(t, client, cid)
 	verifyMockExecCommandAgentIsStopped(t, client, cid, pidA)
 	seelog.Infof("Verified mock ExecCommandAgent was killed (pidA=%s)", pidA)
 	pidB := verifyMockExecCommandAgentIsRunning(t, client, cid)
@@ -461,7 +343,7 @@ func TestExecCommandAgent(t *testing.T) {
 
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second*20)
 	go func() {
-		verifyTaskIsStopped(stateChangeEvents, testTask)
+		VerifyTaskIsStopped(stateChangeEvents, testTask)
 		cancel()
 	}()
 
@@ -509,7 +391,7 @@ func TestManagedAgentEvent(t *testing.T) {
 
 			testExecCmdHostBinDir := "/managed-agents/execute-command/bin"
 
-			taskEngine, done, _ := setupEngineForExecCommandAgent(t, testExecCmdHostBinDir)
+			taskEngine, done, _, _ := setupEngineForExecCommandAgent(t, testExecCmdHostBinDir)
 			defer done()
 
 			testTask := createTestExecCommandAgentTask(testTaskId, testContainerName, time.Minute*tc.ManagedAgentLifetime)
@@ -523,8 +405,10 @@ func TestManagedAgentEvent(t *testing.T) {
 
 			go taskEngine.AddTask(testTask)
 
-			verifyContainerRunningStateChange(t, taskEngine)
-			verifyTaskRunningStateChange(t, taskEngine)
+			VerifyContainerManifestPulledStateChange(t, taskEngine)
+			VerifyTaskManifestPulledStateChange(t, taskEngine)
+			VerifyContainerRunningStateChange(t, taskEngine)
+			VerifyTaskRunningStateChange(t, taskEngine)
 
 			if tc.ShouldBeRunning {
 				containerMap, _ := taskEngine.(*DockerTaskEngine).state.ContainerMapByArn(testTask.Arn)
@@ -552,8 +436,8 @@ func TestManagedAgentEvent(t *testing.T) {
 }
 
 func createTestExecCommandAgentTask(taskId, containerName string, sleepFor time.Duration) *apitask.Task {
-	testTask := createTestTask("arn:aws:ecs:us-west-2:1234567890:task/" + taskId)
-	testTask.PIDMode = ecs.PidModeHost
+	testTask := CreateTestTask("arn:aws:ecs:us-west-2:1234567890:task/" + taskId)
+	testTask.PIDMode = string(ecstypes.PidModeHost)
 	testTask.Containers[0].Name = containerName
 	testTask.Containers[0].Image = testExecCommandAgentImage
 	testTask.Containers[0].Command = []string{testExecCommandAgentSleepBin, "-time=" + sleepFor.String()}
@@ -564,13 +448,15 @@ func createTestExecCommandAgentTask(taskId, containerName string, sleepFor time.
 // setupEngineForExecCommandAgent creates a new TaskEngine with a custom execcmd.Manager that will attempt to read the
 // host binaries from the directory passed as parameter (as opposed to the default directory).
 // Additionally, it overrides the engine's monitorExecAgentsInterval to one second.
-func setupEngineForExecCommandAgent(t *testing.T, hostBinDir string) (TaskEngine, func(), credentials.Manager) {
+func setupEngineForExecCommandAgent(
+	t *testing.T, hostBinDir string,
+) (TaskEngine, func(), credentials.Manager, *config.Config) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
 	skipIntegTestIfApplicable(t)
 
-	cfg := defaultTestConfigIntegTest()
+	cfg := DefaultTestConfigIntegTest()
 	sdkClientFactory := sdkclientfactory.NewFactory(ctx, dockerEndpoint)
 	dockerClient, err := dockerapi.NewDockerGoClient(sdkClientFactory, cfg, context.Background())
 	if err != nil {
@@ -581,16 +467,19 @@ func setupEngineForExecCommandAgent(t *testing.T, hostBinDir string) (TaskEngine
 	imageManager := NewImageManager(cfg, dockerClient, state)
 	imageManager.SetDataClient(data.NewNoopClient())
 	metadataManager := containermetadata.NewManager(dockerClient, cfg)
-	execCmdMgr := execcmd.NewManagerWithBinDir(hostBinDir)
+	execCmdMgr := execcmd.NewManagerWithBinDir(hostBinDir, cfg)
+	hostResources := getTestHostResources()
+	hostResourceManager := NewHostResourceManager(hostResources)
+	daemonManagers := getTestDaemonManagers()
 
 	taskEngine := NewDockerTaskEngine(cfg, dockerClient, credentialsManager,
-		eventstream.NewEventStream("ENGINEINTEGTEST", context.Background()), imageManager, state, metadataManager,
-		nil, execCmdMgr)
+		eventstream.NewEventStream("ENGINEINTEGTEST", context.Background()), imageManager, &hostResourceManager, state, metadataManager,
+		nil, execCmdMgr, engineserviceconnect.NewManager(), daemonManagers)
 	taskEngine.monitorExecAgentsInterval = time.Second
 	taskEngine.MustInit(context.TODO())
 	return taskEngine, func() {
 		taskEngine.Shutdown()
-	}, credentialsManager
+	}, credentialsManager, cfg
 }
 
 const (
@@ -602,7 +491,8 @@ func verifyExecCmdAgentExpectedMounts(t *testing.T,
 	ctx context.Context,
 	client *sdkClient.Client,
 	testTaskId, containerId, containerName, testExecCmdHostVersionedBinDir, testConfigFileName, testLogConfigFileName string) {
-	inspectState, _ := client.ContainerInspect(ctx, containerId)
+	inspectState, err := client.ContainerInspect(ctx, containerId)
+	require.NoError(t, err)
 
 	expectedMounts := []struct {
 		source    string
@@ -682,31 +572,16 @@ func verifyMockExecCommandAgentStatus(t *testing.T, client *sdkClient.Client, co
 	execCmdAgentProcessRegex := filepath.Join(containerDepsPrefixRegex, execcmd.SSMAgentBinName)
 	go func() {
 		for {
-			top, err := client.ContainerTop(ctx, containerId, nil)
+			pid, _, err := findContainerProcess(client, containerId, execCmdAgentProcessRegex)
 			if err != nil {
+				seelog.Errorf("Error when finding container process %s in container %s: %v",
+					execCmdAgentProcessRegex, containerId, err)
 				continue
 			}
-			cmdPos := -1
-			pidPos := -1
-			for i, t := range top.Titles {
-				if strings.ToUpper(t) == "CMD" {
-					cmdPos = i
-				}
-				if strings.ToUpper(t) == "PID" {
-					pidPos = i
-				}
-
+			if pid != "" {
+				res <- pid
+				return
 			}
-			require.NotEqual(t, -1, cmdPos, "CMD title not found in the container top response")
-			require.NotEqual(t, -1, pidPos, "PID title not found in the container top response")
-			for _, proc := range top.Processes {
-				matched, _ := regexp.MatchString(execCmdAgentProcessRegex, proc[cmdPos])
-				if matched {
-					res <- proc[pidPos]
-					return
-				}
-			}
-			seelog.Infof("Processes running in container: %s", top.Processes)
 			select {
 			case <-ctx.Done():
 				return
@@ -735,6 +610,58 @@ func verifyMockExecCommandAgentStatus(t *testing.T, client *sdkClient.Client, co
 	return pid
 }
 
+// Waits for /kill process to finish in the container.
+func waitForKillProcToFinish(t *testing.T, client *sdkClient.Client, containerId string) {
+	for i := 0; i < 10; i++ {
+		seelog.Infof("Checking if kill process is running in container %s", containerId)
+		pid, _, err := findContainerProcess(client, containerId, testExecCommandAgentKillBin)
+		require.NoError(t, err, "error when finding kill process in container")
+		if pid == "" {
+			seelog.Info("Kill process is not running in the container")
+			return
+		}
+		seelog.Infof("Kill process is running with pid %s in container %s", pid, containerId)
+		time.Sleep(1 * time.Second)
+	}
+	t.Fatalf("Timed out waiting for kill process to finish in container %s", containerId)
+}
+
+// Finds a process whose start command matches the provided regex in the container.
+// Returns the process's pid and command.
+func findContainerProcess(client *sdkClient.Client, containerId, matching string) (string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+	top, err := client.ContainerTop(ctx, containerId, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to run container top: %w", err)
+	}
+	cmdPos := -1
+	pidPos := -1
+	for i, t := range top.Titles {
+		if strings.ToUpper(t) == "CMD" {
+			cmdPos = i
+		}
+		if strings.ToUpper(t) == "PID" {
+			pidPos = i
+		}
+
+	}
+	if cmdPos == -1 {
+		return "", "", fmt.Errorf("CMD title not found in the container top response")
+	}
+	if pidPos == -1 {
+		return "", "", fmt.Errorf("PID title not found in the container top response")
+	}
+	seelog.Infof("Processes running in container %s: %s", containerId, top.Processes)
+	for _, proc := range top.Processes {
+		matched, _ := regexp.MatchString(matching, proc[cmdPos])
+		if matched {
+			return proc[pidPos], proc[cmdPos], nil
+		}
+	}
+	return "", "", nil
+}
+
 func killMockExecCommandAgent(t *testing.T, client *sdkClient.Client, containerId, pid string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
@@ -750,9 +677,372 @@ func killMockExecCommandAgent(t *testing.T, client *sdkClient.Client, containerI
 	require.NoError(t, err)
 }
 
-func verifyTaskRunningStateChange(t *testing.T, taskEngine TaskEngine) {
+func TestGMSATaskFile(t *testing.T) {
+	t.Setenv("ECS_GMSA_SUPPORTED", "True")
+	t.Setenv("ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+	t.Setenv("ZZZ_SKIP_CREDENTIALS_FETCHER_INVOCATION_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+
+	cfg := DefaultTestConfigIntegTest()
+	cfg.TaskCPUMemLimit.Value = config.ExplicitlyDisabled
+	cfg.TaskCleanupWaitDuration = 3 * time.Second
+	cfg.GMSACapable = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
+	cfg.AWSRegion = "us-west-2"
+
+	taskEngine, done, _ := setupGMSALinux(cfg, nil, t)
+	defer done()
+
 	stateChangeEvents := taskEngine.StateChangeEvents()
-	event := <-stateChangeEvents
-	assert.Equal(t, event.(api.TaskStateChange).Status, apitaskstatus.TaskRunning,
-		"Expected task to be RUNNING")
+
+	// Setup test gmsa file
+	credentialSpecDataDir := "/tmp"
+	testFileName := "test-gmsa.json"
+	testCredSpecFilePath := filepath.Join(credentialSpecDataDir, testFileName)
+	_, err := os.Create(testCredSpecFilePath)
+	require.NoError(t, err)
+
+	// add local credentialspec file
+	testCredSpecData := []byte(`{
+    "CmsPlugins":  [
+                       "ActiveDirectory"
+                   ],
+    "DomainJoinConfig":  {
+                             "Sid":  "S-1-5-21-975084816-3050680612-2826754290",
+                             "MachineAccountName":  "gmsa-acct-test",
+                             "Guid":  "92a07e28-bd9f-4bf3-b1f7-0894815a5257",
+                             "DnsTreeName":  "gmsa.test.com",
+                             "DnsName":  "gmsa.test.com",
+                             "NetBiosName":  "gmsa"
+                         },
+    "ActiveDirectoryConfig":  {
+                                  "GroupManagedServiceAccounts":  [
+                                                                      {
+                                                                          "Name":  "gmsa-acct-test",
+                                                                          "Scope":  "gmsa.test.com"
+                                                                      }
+                                                                  ]
+                              }
+}`)
+
+	err = ioutil.WriteFile(testCredSpecFilePath, testCredSpecData, 0755)
+	require.NoError(t, err)
+
+	defer os.RemoveAll(testCredSpecFilePath)
+
+	testContainer := CreateTestContainer()
+	testContainer.Name = "testGMSATaskFile"
+
+	hostConfig := "{\"SecurityOpt\": [\"credentialspec:file:///tmp/test-gmsa.json\"]}"
+	testContainer.DockerConfig.HostConfig = &hostConfig
+
+	testTask := &apitask.Task{
+		Arn:                 "testGMSAFileTaskARN",
+		Family:              "family",
+		Version:             "1",
+		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
+		Containers:          []*apicontainer.Container{testContainer},
+	}
+	testTask.Containers[0].TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
+	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
+	testTask.Containers[0].Command = GetLongRunningCommand()
+
+	go taskEngine.AddTask(testTask)
+
+	VerifyTaskIsRunning(stateChangeEvents, testTask)
+
+	client, _ := sdkClient.NewClientWithOpts(sdkClient.WithHost(endpoint), sdkClient.WithVersion(sdkclientfactory.GetDefaultVersion().String()))
+	containerMap, _ := taskEngine.(*DockerTaskEngine).state.ContainerMapByArn(testTask.Arn)
+	cid := containerMap[testTask.Containers[0].Name].DockerID
+
+	expectedBind := "/tmp/tgt:/var/credentials-fetcher/krbdir:ro"
+	err = verifyContainerBindMount(client, cid, expectedBind)
+	assert.NoError(t, err)
+
+	// Kill the existing container now
+	err = client.ContainerKill(context.TODO(), cid, "SIGKILL")
+	assert.NoError(t, err, "Could not kill container")
+
+	VerifyTaskIsStopped(stateChangeEvents, testTask)
+}
+
+func TestGMSADomainlessTaskFile(t *testing.T) {
+	t.Setenv("ECS_GMSA_SUPPORTED", "True")
+	t.Setenv("ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+	t.Setenv("ZZZ_SKIP_CREDENTIALS_FETCHER_INVOCATION_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+
+	cfg := DefaultTestConfigIntegTest()
+	cfg.TaskCPUMemLimit.Value = config.ExplicitlyDisabled
+	cfg.TaskCleanupWaitDuration = 3 * time.Second
+	cfg.GMSACapable = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
+	cfg.AWSRegion = "us-west-2"
+
+	taskEngine, done, _ := setupGMSALinux(cfg, nil, t)
+	defer done()
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	// Setup test gmsa file
+	credentialSpecDataDir := "/tmp"
+	testFileName := "test-gmsa.json"
+	testCredSpecFilePath := filepath.Join(credentialSpecDataDir, testFileName)
+	_, err := os.Create(testCredSpecFilePath)
+	require.NoError(t, err)
+
+	// add local credentialspec file for domainless gmsa support
+	testCredSpecData := []byte(`{
+    "CmsPlugins":  [
+                       "ActiveDirectory"
+                   ],
+    "DomainJoinConfig":  {
+                             "Sid":  "S-1-5-21-975084816-3050680612-2826754290",
+                             "MachineAccountName":  "gmsa-acct-test",
+                             "Guid":  "92a07e28-bd9f-4bf3-b1f7-0894815a5257",
+                             "DnsTreeName":  "gmsa.test.com",
+                             "DnsName":  "gmsa.test.com",
+                             "NetBiosName":  "gmsa"
+                         },
+    "ActiveDirectoryConfig":  {
+                                  "GroupManagedServiceAccounts":  [
+                                                                      {
+                                                                          "Name":  "gmsa-acct-test",
+                                                                          "Scope":  "gmsa.test.com"
+                                                                      }
+                                                                  ],
+     "HostAccountConfig": {
+      "PortableCcgVersion": "1",
+      "PluginGUID": "{859E1386-BDB4-49E8-85C7-3070B13920E1}",
+      "PluginInput": {
+        "CredentialArn": "arn:aws:secretsmanager:us-west-2:123456789:secret:gmsausersecret-xb5Qev"
+      }
+    }
+                              }
+}`)
+
+	err = ioutil.WriteFile(testCredSpecFilePath, testCredSpecData, 0755)
+	require.NoError(t, err)
+
+	defer os.RemoveAll(testCredSpecFilePath)
+
+	testContainer := CreateTestContainer()
+	testContainer.Name = "testGMSADomainlessTaskFile"
+
+	testContainer.CredentialSpecs = []string{"credentialspecdomainless:file:///tmp/test-gmsa.json"}
+
+	testTask := &apitask.Task{
+		Arn:                 "testGMSAFileTaskARN",
+		Family:              "family",
+		Version:             "1",
+		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
+		Containers:          []*apicontainer.Container{testContainer},
+	}
+	testTask.Containers[0].TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
+	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
+	testTask.Containers[0].Command = GetLongRunningCommand()
+
+	go taskEngine.AddTask(testTask)
+
+	VerifyTaskIsRunning(stateChangeEvents, testTask)
+
+	client, _ := sdkClient.NewClientWithOpts(sdkClient.WithHost(endpoint), sdkClient.WithVersion(sdkclientfactory.GetDefaultVersion().String()))
+	containerMap, _ := taskEngine.(*DockerTaskEngine).state.ContainerMapByArn(testTask.Arn)
+	cid := containerMap[testTask.Containers[0].Name].DockerID
+
+	expectedBind := "/tmp/tgt:/var/credentials-fetcher/krbdir:ro"
+	err = verifyContainerBindMount(client, cid, expectedBind)
+	assert.NoError(t, err)
+
+	// Kill the existing container now
+	err = client.ContainerKill(context.TODO(), cid, "SIGKILL")
+	assert.NoError(t, err, "Could not kill container")
+
+	VerifyTaskIsStopped(stateChangeEvents, testTask)
+}
+
+func TestGMSATaskFileS3Err(t *testing.T) {
+	t.Setenv("ECS_GMSA_SUPPORTED", "True")
+	t.Setenv("ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+	t.Setenv("ZZZ_SKIP_CREDENTIALS_FETCHER_INVOCATION_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+
+	cfg := DefaultTestConfigIntegTest()
+	cfg.TaskCPUMemLimit.Value = config.ExplicitlyDisabled
+	cfg.TaskCleanupWaitDuration = 3 * time.Second
+	cfg.GMSACapable = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
+	cfg.AWSRegion = "us-west-2"
+
+	taskEngine, done, credentialsManager := setupGMSALinux(cfg, nil, t)
+	defer done()
+
+	// mock execution role credentials
+	mockCreds := &credentials.TaskIAMRoleCredentials{
+		ARN: "testGMSAFileTaskARN",
+		IAMRoleCredentials: credentials.IAMRoleCredentials{
+			RoleArn:       "arn:aws:iam::123456789012:role/execution-role",
+			CredentialsID: "exec-creds-id",
+		},
+	}
+	credentialsManager.SetTaskCredentials(mockCreds)
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	testContainer := CreateTestContainer()
+	testContainer.Name = "testGMSATaskFile"
+
+	hostConfig := "{\"SecurityOpt\": [\"credentialspec:arn:aws:::s3:testbucket/test-gmsa.json\"]}"
+	testContainer.DockerConfig.HostConfig = &hostConfig
+
+	testTask := &apitask.Task{
+		Arn:                    "testGMSAFileTaskARN",
+		Family:                 "family",
+		Version:                "1",
+		DesiredStatusUnsafe:    apitaskstatus.TaskRunning,
+		Containers:             []*apicontainer.Container{testContainer},
+		ExecutionCredentialsID: "exec-creds-id",
+	}
+	testTask.Containers[0].TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
+	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
+	testTask.Containers[0].Command = GetLongRunningCommand()
+
+	go taskEngine.AddTask(testTask)
+
+	err := VerifyTaskIsRunning(stateChangeEvents, testTask)
+	assert.Error(t, err)
+	assert.Error(t, err, "Task went straight to STOPPED without running, task: testGMSAFileTaskARN")
+}
+
+func TestGMSATaskFileSSMErr(t *testing.T) {
+	t.Setenv("ECS_GMSA_SUPPORTED", "True")
+	t.Setenv("ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+	t.Setenv("ZZZ_SKIP_CREDENTIALS_FETCHER_INVOCATION_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+
+	cfg := DefaultTestConfigIntegTest()
+	cfg.TaskCPUMemLimit.Value = config.ExplicitlyDisabled
+	cfg.TaskCleanupWaitDuration = 3 * time.Second
+	cfg.GMSACapable = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
+	cfg.AWSRegion = "us-west-2"
+
+	taskEngine, done, credentialsManager := setupGMSALinux(cfg, nil, t)
+	defer done()
+
+	// mock execution role credentials
+	mockCreds := &credentials.TaskIAMRoleCredentials{
+		ARN: "testGMSAFileTaskARN",
+		IAMRoleCredentials: credentials.IAMRoleCredentials{
+			RoleArn:       "arn:aws:iam::123456789012:role/execution-role",
+			CredentialsID: "exec-creds-id",
+		},
+	}
+	credentialsManager.SetTaskCredentials(mockCreds)
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	testContainer := CreateTestContainer()
+	testContainer.Name = "testGMSATaskFile"
+
+	hostConfig := "{\"SecurityOpt\": [\"credentialspec:aws:arn:ssm:us-west-2:123456789012:document/test-gmsa.json\"]}"
+	testContainer.DockerConfig.HostConfig = &hostConfig
+
+	testTask := &apitask.Task{
+		Arn:                    "testGMSAFileTaskARN",
+		Family:                 "family",
+		Version:                "1",
+		DesiredStatusUnsafe:    apitaskstatus.TaskRunning,
+		Containers:             []*apicontainer.Container{testContainer},
+		ExecutionCredentialsID: "exec-creds-id",
+	}
+	testTask.Containers[0].TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
+	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
+	testTask.Containers[0].Command = GetLongRunningCommand()
+
+	go taskEngine.AddTask(testTask)
+
+	err := VerifyTaskIsRunning(stateChangeEvents, testTask)
+	assert.Error(t, err)
+	assert.Error(t, err, "Task went straight to STOPPED without running, task: testGMSAFileTaskARN")
+}
+
+func TestGMSANotRunningErr(t *testing.T) {
+	t.Setenv("ECS_GMSA_SUPPORTED", "True")
+	t.Setenv("ZZZ_SKIP_DOMAIN_JOIN_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "True")
+	t.Setenv("ZZZ_SKIP_CREDENTIALS_FETCHER_INVOCATION_CHECK_NOT_SUPPORTED_IN_PRODUCTION", "False")
+
+	cfg := DefaultTestConfigIntegTest()
+	cfg.TaskCPUMemLimit.Value = config.ExplicitlyDisabled
+	cfg.TaskCleanupWaitDuration = 3 * time.Second
+	cfg.GMSACapable = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
+	cfg.AWSRegion = "us-west-2"
+
+	taskEngine, done, _ := setupGMSALinux(cfg, nil, t)
+	defer done()
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	// Setup test gmsa file
+	credentialSpecDataDir := "/tmp"
+	testFileName := "test-gmsa.json"
+	testCredSpecFilePath := filepath.Join(credentialSpecDataDir, testFileName)
+	_, err := os.Create(testCredSpecFilePath)
+	require.NoError(t, err)
+
+	// add local credentialspec file
+	testCredSpecData := []byte(`{
+    "CmsPlugins":  [
+                       "ActiveDirectory"
+                   ],
+    "DomainJoinConfig":  {
+                             "Sid":  "S-1-5-21-975084816-3050680612-2826754290",
+                             "MachineAccountName":  "gmsa-acct-test",
+                             "Guid":  "92a07e28-bd9f-4bf3-b1f7-0894815a5257",
+                             "DnsTreeName":  "gmsa.test.com",
+                             "DnsName":  "gmsa.test.com",
+                             "NetBiosName":  "gmsa"
+                         },
+    "ActiveDirectoryConfig":  {
+                                  "GroupManagedServiceAccounts":  [
+                                                                      {
+                                                                          "Name":  "gmsa-acct-test",
+                                                                          "Scope":  "gmsa.test.com"
+                                                                      }
+                                                                  ]
+                              }
+}`)
+
+	err = ioutil.WriteFile(testCredSpecFilePath, testCredSpecData, 0755)
+	require.NoError(t, err)
+
+	testContainer := CreateTestContainer()
+	testContainer.Name = "testGMSATaskFile"
+
+	hostConfig := "{\"SecurityOpt\": [\"credentialspec:file:///tmp/test-gmsa.json\"]}"
+	testContainer.DockerConfig.HostConfig = &hostConfig
+
+	testTask := &apitask.Task{
+		Arn:                 "testGMSAFileTaskARN",
+		Family:              "family",
+		Version:             "1",
+		DesiredStatusUnsafe: apitaskstatus.TaskRunning,
+		Containers:          []*apicontainer.Container{testContainer},
+	}
+	testTask.Containers[0].TransitionDependenciesMap = make(map[apicontainerstatus.ContainerStatus]apicontainer.TransitionDependencySet)
+	testTask.ResourcesMapUnsafe = make(map[string][]taskresource.TaskResource)
+	testTask.Containers[0].Command = GetLongRunningCommand()
+
+	go taskEngine.AddTask(testTask)
+
+	err = VerifyTaskIsRunning(stateChangeEvents, testTask)
+	assert.Error(t, err)
+	assert.Error(t, err, "Task went straight to STOPPED without running, task: testGMSAFileTaskARN")
+}
+
+func verifyContainerBindMount(client *sdkClient.Client, id, expectedBind string) error {
+	dockerContainer, err := client.ContainerInspect(context.TODO(), id)
+	if err != nil {
+		return err
+	}
+
+	for _, opt := range dockerContainer.HostConfig.Binds {
+		if opt == expectedBind {
+			return nil
+		}
+	}
+
+	return errors.New("unable to validate the bind mount")
 }

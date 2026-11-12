@@ -18,18 +18,17 @@ package eventhandler
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/data"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +61,16 @@ func TestShouldTaskEventBeSent(t *testing.T) {
 		event        *sendableEvent
 		shouldBeSent bool
 	}{
+		{
+			// We don't send a task event to backend if it is an internal task
+			event: newSendableTaskEvent(api.TaskStateChange{
+				Status: apitaskstatus.TaskRunning,
+				Task: &apitask.Task{
+					IsInternal: true,
+				},
+			}),
+			shouldBeSent: false,
+		},
 		{
 			// We don't send a task event to backend if task status == NONE
 			event: newSendableTaskEvent(api.TaskStateChange{
@@ -259,7 +268,7 @@ func TestShouldTaskEventBeSent(t *testing.T) {
 			shouldBeSent: false,
 		},
 	} {
-		t.Run(fmt.Sprintf("Event[%s] should be sent[%t]", tc.event.toString(), tc.shouldBeSent), func(t *testing.T) {
+		t.Run(fmt.Sprintf("Event[%v] should be sent[%t]", tc.event.toFields(), tc.shouldBeSent), func(t *testing.T) {
 			assert.Equal(t, tc.shouldBeSent, tc.event.taskShouldBeSent())
 			assert.Equal(t, false, tc.event.containerShouldBeSent())
 			assert.Equal(t, false, tc.event.taskAttachmentShouldBeSent())
@@ -297,9 +306,11 @@ func TestShouldTaskAttachmentEventBeSent(t *testing.T) {
 			// ack timeout is set for future
 			event: newSendableTaskEvent(api.TaskStateChange{
 				Status: apitaskstatus.TaskStatusNone,
-				Attachment: &apieni.ENIAttachment{
-					ExpiresAt:        time.Unix(time.Now().Unix()-1, 0),
-					AttachStatusSent: false,
+				Attachment: &ni.ENIAttachment{
+					AttachmentInfo: attachment.AttachmentInfo{
+						ExpiresAt:        time.Unix(time.Now().Unix()-1, 0),
+						AttachStatusSent: false,
+					},
 				},
 			}),
 			attachmentShouldBeSent: false,
@@ -312,9 +323,11 @@ func TestShouldTaskAttachmentEventBeSent(t *testing.T) {
 			// already been sent
 			event: newSendableTaskEvent(api.TaskStateChange{
 				Status: apitaskstatus.TaskStatusNone,
-				Attachment: &apieni.ENIAttachment{
-					ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
-					AttachStatusSent: true,
+				Attachment: &ni.ENIAttachment{
+					AttachmentInfo: attachment.AttachmentInfo{
+						ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+						AttachStatusSent: true,
+					},
 				},
 			}),
 			attachmentShouldBeSent: false,
@@ -324,17 +337,19 @@ func TestShouldTaskAttachmentEventBeSent(t *testing.T) {
 			// Valid attachment event, ensure that its sent
 			event: newSendableTaskEvent(api.TaskStateChange{
 				Status: apitaskstatus.TaskStatusNone,
-				Attachment: &apieni.ENIAttachment{
-					ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
-					AttachStatusSent: false,
+				Attachment: &ni.ENIAttachment{
+					AttachmentInfo: attachment.AttachmentInfo{
+						ExpiresAt:        time.Unix(time.Now().Unix()+10, 0),
+						AttachStatusSent: false,
+					},
 				},
 			}),
 			attachmentShouldBeSent: true,
 			taskShouldBeSent:       false,
 		},
 	} {
-		t.Run(fmt.Sprintf("Event[%s] should be sent[attachment=%t;task=%t]",
-			tc.event.toString(), tc.attachmentShouldBeSent, tc.taskShouldBeSent), func(t *testing.T) {
+		t.Run(fmt.Sprintf("Event[%v] should be sent[attachment=%t;task=%t]",
+			tc.event.toFields(), tc.attachmentShouldBeSent, tc.taskShouldBeSent), func(t *testing.T) {
 			assert.Equal(t, tc.attachmentShouldBeSent, tc.event.taskAttachmentShouldBeSent())
 			assert.Equal(t, tc.taskShouldBeSent, tc.event.taskShouldBeSent())
 			assert.Equal(t, false, tc.event.containerShouldBeSent())
@@ -343,8 +358,7 @@ func TestShouldTaskAttachmentEventBeSent(t *testing.T) {
 }
 
 func TestSetTaskSentStatus(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	testManagedAgent := apicontainer.ManagedAgent{
 		ManagedAgentState: apicontainer.ManagedAgentState{},
@@ -425,8 +439,7 @@ func TestSetTaskSentStatus(t *testing.T) {
 }
 
 func TestSetContainerSentStatus(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	testContainer := &apicontainer.Container{
 		Name:          testConainerName,
@@ -454,13 +467,14 @@ func TestSetContainerSentStatus(t *testing.T) {
 }
 
 func TestSetAttachmentSentStatus(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
-	testAttachment := &apieni.ENIAttachment{
-		AttachStatusSent: true,
-		ExpiresAt:        time.Unix(time.Now().Unix()+100, 0),
-		AttachmentARN:    testAttachmentARN,
+	testAttachment := &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			AttachStatusSent: true,
+			ExpiresAt:        time.Unix(time.Now().Unix()+100, 0),
+			AttachmentARN:    testAttachmentARN,
+		},
 	}
 	require.NoError(t, testAttachment.StartTimer(func() {}))
 	event := newSendableTaskEvent(api.TaskStateChange{
@@ -474,15 +488,14 @@ func TestSetAttachmentSentStatus(t *testing.T) {
 	assert.True(t, atts[0].IsSent())
 }
 
-func newTestDataClient(t *testing.T) (data.Client, func()) {
-	testDir, err := ioutil.TempDir("", "agent_eventhandler_unit_test")
-	require.NoError(t, err)
+func newTestDataClient(t *testing.T) data.Client {
+	testDir := t.TempDir()
 
 	testClient, err := data.NewWithSetup(testDir)
+	require.NoError(t, err)
 
-	cleanup := func() {
+	t.Cleanup(func() {
 		require.NoError(t, testClient.Close())
-		require.NoError(t, os.RemoveAll(testDir))
-	}
-	return testClient, cleanup
+	})
+	return testClient
 }

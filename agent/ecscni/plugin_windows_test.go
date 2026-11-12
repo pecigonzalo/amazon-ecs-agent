@@ -24,19 +24,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/api/eni"
-	mock_libcni "github.com/aws/amazon-ecs-agent/agent/ecscni/mocks_libcni"
-	"github.com/containernetworking/cni/libcni"
-	"github.com/containernetworking/cni/pkg/types/current"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+
 	"github.com/golang/mock/gomock"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/containernetworking/cni/libcni"
+	cniTypesCurrent "github.com/containernetworking/cni/pkg/types/100"
+
+	mock_libcni "github.com/aws/amazon-ecs-agent/agent/ecscni/mocks_libcni"
 )
 
 const (
 	eniID                       = "eni-12345678"
-	eniIPV4Address              = "172.31.21.40"
+	ipv4Address                 = "172.31.21.40"
 	eniMACAddress               = "02:7b:64:49:b1:40"
 	eniSubnetGatewayIPV4Address = "172.31.1.1/20"
 )
@@ -64,12 +67,12 @@ func getNetworkConfig() *Config {
 }
 
 // getTestENI returns a sample ENI for the task.
-func getTestENI() *eni.ENI {
-	return &eni.ENI{
+func getTestENI() *ni.NetworkInterface {
+	return &ni.NetworkInterface{
 		ID:       eniID,
 		LinkName: eniID,
-		IPV4Addresses: []*eni.ENIIPV4Address{
-			{Address: eniIPV4Address, Primary: true},
+		IPV4Addresses: []*ni.IPV4Address{
+			{Address: ipv4Address, Primary: true},
 		},
 		MacAddress:               eniMACAddress,
 		SubnetGatewayIPV4Address: eniSubnetGatewayIPV4Address,
@@ -87,7 +90,7 @@ func TestSetupNS(t *testing.T) {
 
 	gomock.InOrder(
 		// vpc-eni plugin called to setup task namespace.
-		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&current.Result{}, nil).Do(
+		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&cniTypesCurrent.Result{}, nil).Do(
 			func(ctx context.Context, net *libcni.NetworkConfig, rt *libcni.RuntimeConf) {
 				assert.Equal(t, ECSVPCENIPluginExecutable, net.Network.Type, "plugin should be vpc-eni")
 			}).Times(2),
@@ -113,7 +116,7 @@ func TestSetupNSTimeout(t *testing.T) {
 
 	gomock.InOrder(
 		// vpc-eni plugin will be called.
-		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&current.Result{}, errors.New("timeout")).Do(
+		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&cniTypesCurrent.Result{}, errors.New("timeout")).Do(
 			func(ctx context.Context, net *libcni.NetworkConfig, rt *libcni.RuntimeConf) {
 			}).MaxTimes(setupNSMaxRetryCount),
 	)
@@ -135,10 +138,10 @@ func TestSetupNSWithRetry(t *testing.T) {
 
 	gomock.InOrder(
 		// First invocation of the plugin for setupNS will fail and the same will succeed in retry.
-		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&current.Result{}, errors.New("timeout")).Do(
+		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&cniTypesCurrent.Result{}, errors.New("timeout")).Do(
 			func(ctx context.Context, net *libcni.NetworkConfig, rt *libcni.RuntimeConf) {
 			}),
-		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&current.Result{}, nil).Do(
+		libcniClient.EXPECT().AddNetwork(gomock.Any(), gomock.Any(), gomock.Any()).Return(&cniTypesCurrent.Result{}, nil).Do(
 			func(ctx context.Context, net *libcni.NetworkConfig, rt *libcni.RuntimeConf) {
 				assert.Equal(t, ECSVPCENIPluginExecutable, net.Network.Type, "first plugin should be vpc-eni")
 			}).Times(2),
@@ -202,7 +205,7 @@ func TestConstructNetworkConfig(t *testing.T) {
 
 	subnet := strings.Split(eniSubnetGatewayIPV4Address, "/")
 	ipv4Addr := fmt.Sprintf("%s/%s", taskENI.GetPrimaryIPv4Address(), subnet[1])
-	assert.Equal(t, ECSVPCENIPluginName, taskENIConfig.Type)
+	assert.Equal(t, VPCENIPluginName, taskENIConfig.Type)
 	assert.Equal(t, TaskHNSNetworkNamePrefix, config.NetworkConfigs[0].CNINetworkConfig.Network.Name)
 	assert.Equal(t, eniID, taskENIConfig.ENIName)
 	assert.EqualValues(t, []string{ipv4Addr}, taskENIConfig.ENIIPAddresses)
@@ -214,7 +217,7 @@ func TestConstructNetworkConfig(t *testing.T) {
 	ecsBridgeConfig := &VPCENIPluginConfig{}
 	err = json.Unmarshal(config.NetworkConfigs[1].CNINetworkConfig.Bytes, ecsBridgeConfig)
 	require.NoError(t, err, "unmarshal ecs-bridge config from bytes failed")
-	assert.Equal(t, ECSVPCENIPluginName, ecsBridgeConfig.Type)
+	assert.Equal(t, VPCENIPluginName, ecsBridgeConfig.Type)
 	assert.Equal(t, ECSBridgeNetworkName, config.NetworkConfigs[1].CNINetworkConfig.Network.Name)
 	assert.True(t, ecsBridgeConfig.UseExistingNetwork)
 }

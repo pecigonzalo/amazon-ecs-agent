@@ -17,13 +17,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
+	dm "github.com/aws/amazon-ecs-agent/agent/engine/daemonmanager"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/execcmd"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
+	"github.com/aws/amazon-ecs-agent/agent/engine/serviceconnect"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
 
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/pkg/errors"
 )
 
@@ -46,29 +49,34 @@ type savedData struct {
 // load from boltdb, and if it doesn't get anything, it tries to load from state file and then save data it loaded to
 // boltdb. Behavior of three cases are considered:
 //
-// 1. Agent starts from fresh instance (no previous state):
-//    (1) Try to load from boltdb, get nothing;
-//    (2) Try to load from state file, get nothing;
-//    (3) Return empty data.
+//  1. Agent starts from fresh instance (no previous state):
+//     (1) Try to load from boltdb, get nothing;
+//     (2) Try to load from state file, get nothing;
+//     (3) Return empty data.
 //
-// 2. Agent starts with previous state stored in boltdb:
-//    (1) Try to load from boltdb, get the data;
-//    (2) Return loaded data.
+//  2. Agent starts with previous state stored in boltdb:
+//     (1) Try to load from boltdb, get the data;
+//     (2) Return loaded data.
 //
-// 3. Agent starts with previous state stored in state file (i.e. it was just upgraded from an old agent that uses state file):
-//    (1) Try to load from boltdb, get nothing;
-//    (2) Try to load from state file, get something;
-//    (3) Save loaded data to boltdb;
-//    (4) Return loaded data.
+//  3. Agent starts with previous state stored in state file (i.e. it was just upgraded from an old agent that uses state file):
+//     (1) Try to load from boltdb, get nothing;
+//     (2) Try to load from state file, get something;
+//     (3) Save loaded data to boltdb;
+//     (4) Return loaded data.
 func (agent *ecsAgent) loadData(containerChangeEventStream *eventstream.EventStream,
 	credentialsManager credentials.Manager,
 	state dockerstate.TaskEngineState,
 	imageManager engine.ImageManager,
-	execCmdMgr execcmd.Manager) (*savedData, error) {
+	hostResources map[string]types.Resource,
+	execCmdMgr execcmd.Manager,
+	serviceConnectManager serviceconnect.Manager,
+	daemonManagers map[string]dm.DaemonManager) (*savedData, error) {
+
 	s := &savedData{
 		taskEngine: engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
-			containerChangeEventStream, imageManager, state,
-			agent.metadataManager, agent.resourceFields, execCmdMgr),
+			containerChangeEventStream, imageManager, hostResources, state,
+			agent.metadataManager, agent.resourceFields, execCmdMgr,
+			serviceConnectManager, daemonManagers),
 	}
 	s.taskEngine.SetDataClient(agent.dataClient)
 

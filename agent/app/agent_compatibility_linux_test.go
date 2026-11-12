@@ -23,10 +23,10 @@ import (
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/data"
-	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	mock_statemanager "github.com/aws/amazon-ecs-agent/agent/statemanager/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ec2"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/eventstream"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -38,7 +38,7 @@ func init() {
 }
 
 func TestCompatibilityEnabledSuccess(t *testing.T) {
-	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr := setup(t)
+	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 	stateManager := mock_statemanager.NewMockStateManager(ctrl)
 
@@ -65,14 +65,16 @@ func TestCompatibilityEnabledSuccess(t *testing.T) {
 	defer cancel()
 
 	containerChangeEventStream := eventstream.NewEventStream("events", ctx)
-	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, execCmdMgr)
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
+	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 
 	assert.NoError(t, err)
 	assert.True(t, cfg.TaskCPUMemLimit.Enabled())
 }
 
 func TestCompatibilityNotSetFail(t *testing.T) {
-	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr := setup(t)
+	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 	stateManager := mock_statemanager.NewMockStateManager(ctrl)
 
@@ -80,8 +82,7 @@ func TestCompatibilityNotSetFail(t *testing.T) {
 	cfg.Checkpoint = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
 	cfg.TaskCPUMemLimit = config.BooleanDefaultTrue{Value: config.NotSet}
 
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 	populateBoltDB(dataClient, t)
 
 	// Put a bad task in previously saved state.
@@ -89,6 +90,7 @@ func TestCompatibilityNotSetFail(t *testing.T) {
 		require.NoError(t, dataClient.SaveTask(task))
 	}
 
+	cfg.Cluster = "test-cluster"
 	agent := &ecsAgent{
 		cfg:                   &cfg,
 		dataClient:            dataClient,
@@ -106,14 +108,16 @@ func TestCompatibilityNotSetFail(t *testing.T) {
 	defer cancel()
 
 	containerChangeEventStream := eventstream.NewEventStream("events", ctx)
-	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, execCmdMgr)
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
+	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 
 	assert.NoError(t, err)
 	assert.False(t, cfg.TaskCPUMemLimit.Enabled())
 }
 
 func TestCompatibilityExplicitlyEnabledFail(t *testing.T) {
-	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr := setup(t)
+	ctrl, creds, _, images, _, _, stateManagerFactory, saveableOptionFactory, execCmdMgr, serviceConnectManager := setup(t)
 	defer ctrl.Finish()
 	stateManager := mock_statemanager.NewMockStateManager(ctrl)
 
@@ -121,8 +125,7 @@ func TestCompatibilityExplicitlyEnabledFail(t *testing.T) {
 	cfg.Checkpoint = config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled}
 	cfg.TaskCPUMemLimit = config.BooleanDefaultTrue{Value: config.ExplicitlyEnabled}
 
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 	populateBoltDB(dataClient, t)
 
 	// Put a bad task in previously saved state.
@@ -147,7 +150,9 @@ func TestCompatibilityExplicitlyEnabledFail(t *testing.T) {
 	defer cancel()
 
 	containerChangeEventStream := eventstream.NewEventStream("events", ctx)
-	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, execCmdMgr)
+	hostResources := getTestHostResources()
+	daemonManagers := getTestDaemonManagers()
+	_, _, err := agent.newTaskEngine(containerChangeEventStream, creds, dockerstate.NewTaskEngineState(), images, hostResources, execCmdMgr, serviceConnectManager, daemonManagers)
 
 	assert.Error(t, err)
 }

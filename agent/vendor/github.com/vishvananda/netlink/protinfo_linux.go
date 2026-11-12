@@ -1,26 +1,32 @@
 package netlink
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 
 	"github.com/vishvananda/netlink/nl"
+	"golang.org/x/sys/unix"
 )
 
+// If the returned error is [ErrDumpInterrupted], results may be inconsistent
+// or incomplete.
 func LinkGetProtinfo(link Link) (Protinfo, error) {
 	return pkgHandle.LinkGetProtinfo(link)
 }
 
+// If the returned error is [ErrDumpInterrupted], results may be inconsistent
+// or incomplete.
 func (h *Handle) LinkGetProtinfo(link Link) (Protinfo, error) {
 	base := link.Attrs()
 	h.ensureIndex(base)
 	var pi Protinfo
-	req := h.newNetlinkRequest(syscall.RTM_GETLINK, syscall.NLM_F_DUMP)
-	msg := nl.NewIfInfomsg(syscall.AF_BRIDGE)
+	req := h.newNetlinkRequest(unix.RTM_GETLINK, unix.NLM_F_DUMP)
+	msg := nl.NewIfInfomsg(unix.AF_BRIDGE)
 	req.AddData(msg)
-	msgs, err := req.Execute(syscall.NETLINK_ROUTE, 0)
-	if err != nil {
-		return pi, err
+	msgs, executeErr := req.Execute(unix.NETLINK_ROUTE, 0)
+	if executeErr != nil && !errors.Is(executeErr, ErrDumpInterrupted) {
+		return pi, executeErr
 	}
 
 	for _, m := range msgs {
@@ -33,23 +39,22 @@ func (h *Handle) LinkGetProtinfo(link Link) (Protinfo, error) {
 			return pi, err
 		}
 		for _, attr := range attrs {
-			if attr.Attr.Type != syscall.IFLA_PROTINFO|syscall.NLA_F_NESTED {
+			if attr.Attr.Type != unix.IFLA_PROTINFO|unix.NLA_F_NESTED {
 				continue
 			}
 			infos, err := nl.ParseRouteAttr(attr.Value)
 			if err != nil {
 				return pi, err
 			}
-			pi = *parseProtinfo(infos)
+			pi = parseProtinfo(infos)
 
-			return pi, nil
+			return pi, executeErr
 		}
 	}
 	return pi, fmt.Errorf("Device with index %d not found", base.Index)
 }
 
-func parseProtinfo(infos []syscall.NetlinkRouteAttr) *Protinfo {
-	var pi Protinfo
+func parseProtinfo(infos []syscall.NetlinkRouteAttr) (pi Protinfo) {
 	for _, info := range infos {
 		switch info.Attr.Type {
 		case nl.IFLA_BRPORT_MODE:
@@ -64,7 +69,18 @@ func parseProtinfo(infos []syscall.NetlinkRouteAttr) *Protinfo {
 			pi.Learning = byteToBool(info.Value[0])
 		case nl.IFLA_BRPORT_UNICAST_FLOOD:
 			pi.Flood = byteToBool(info.Value[0])
+		case nl.IFLA_BRPORT_PROXYARP:
+			pi.ProxyArp = byteToBool(info.Value[0])
+		case nl.IFLA_BRPORT_PROXYARP_WIFI:
+			pi.ProxyArpWiFi = byteToBool(info.Value[0])
+		case nl.IFLA_BRPORT_ISOLATED:
+			pi.Isolated = byteToBool(info.Value[0])
+		case nl.IFLA_BRPORT_NEIGH_SUPPRESS:
+			pi.NeighSuppress = byteToBool(info.Value[0])
+		case nl.IFLA_BRPORT_VLAN_TUNNEL:
+			pi.VlanTunnel = byteToBool(info.Value[0])
 		}
+
 	}
-	return &pi
+	return
 }

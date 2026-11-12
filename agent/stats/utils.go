@@ -15,12 +15,16 @@ package stats
 
 import (
 	"math"
-	"runtime"
 
+	eautils "github.com/aws/amazon-ecs-agent/ecs-agent/utils"
 	"github.com/docker/docker/api/types"
 )
 
-var numCores = uint64(runtime.NumCPU())
+const (
+	invalidStatZeroValueReadTimeMsg = "read time of stat is 0001-01-01T00:00:00Z"
+)
+
+var numCores = uint64(eautils.GetNumCPU())
 
 // nan32 returns a 32bit NaN.
 func nan32() float32 {

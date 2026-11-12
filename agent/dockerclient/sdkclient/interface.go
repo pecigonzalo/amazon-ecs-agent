@@ -18,14 +18,15 @@ package sdkclient
 import (
 	"context"
 	"io"
-	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/volume"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Client is an interface specifying the subset of
@@ -33,17 +34,18 @@ import (
 type Client interface {
 	ClientVersion() string
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig,
-		networkingConfig *network.NetworkingConfig, containerName string) (container.ContainerCreateCreatedBody, error)
+		networkingConfig *network.NetworkingConfig, platform *v1.Platform, containerName string) (container.CreateResponse, error)
 	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
 	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
 	ContainerTop(ctx context.Context, containerID string, arguments []string) (container.ContainerTopOKBody, error)
 	ContainerRemove(ctx context.Context, containerID string, options types.ContainerRemoveOptions) error
 	ContainerStart(ctx context.Context, containerID string, options types.ContainerStartOptions) error
 	ContainerStats(ctx context.Context, containerID string, stream bool) (types.ContainerStats, error)
-	ContainerStop(ctx context.Context, containerID string, timeout *time.Duration) error
+	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
 	ContainerExecCreate(ctx context.Context, container string, config types.ExecConfig) (types.IDResponse, error)
 	ContainerExecStart(ctx context.Context, execID string, config types.ExecStartCheck) error
 	ContainerExecInspect(ctx context.Context, execID string) (types.ContainerExecInspect, error)
+	DistributionInspect(ctx context.Context, imageRef, encodedRegistryAuth string) (registry.DistributionInspect, error)
 	Events(ctx context.Context, options types.EventsOptions) (<-chan events.Message, <-chan error)
 	ImageImport(ctx context.Context, source types.ImageImportSource, ref string,
 		options types.ImageImportOptions) (io.ReadCloser, error)
@@ -53,10 +55,11 @@ type Client interface {
 	ImagePull(ctx context.Context, refStr string, options types.ImagePullOptions) (io.ReadCloser, error)
 	ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDeleteResponseItem,
 		error)
+	ImageTag(ctx context.Context, source, target string) error
 	Ping(ctx context.Context) (types.Ping, error)
 	PluginList(ctx context.Context, filter filters.Args) (types.PluginsListResponse, error)
-	VolumeCreate(ctx context.Context, options volume.VolumeCreateBody) (types.Volume, error)
-	VolumeInspect(ctx context.Context, volumeID string) (types.Volume, error)
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+	VolumeInspect(ctx context.Context, volumeID string) (volume.Volume, error)
 	VolumeRemove(ctx context.Context, volumeID string, force bool) error
 	ServerVersion(ctx context.Context) (types.Version, error)
 	Info(ctx context.Context) (types.Info, error)

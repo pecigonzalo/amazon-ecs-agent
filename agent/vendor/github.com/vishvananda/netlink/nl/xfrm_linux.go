@@ -50,33 +50,47 @@ const (
 // Attribute types
 const (
 	/* Netlink message attributes.  */
-	XFRMA_UNSPEC         = 0x00
-	XFRMA_ALG_AUTH       = 0x01 /* struct xfrm_algo */
-	XFRMA_ALG_CRYPT      = 0x02 /* struct xfrm_algo */
-	XFRMA_ALG_COMP       = 0x03 /* struct xfrm_algo */
-	XFRMA_ENCAP          = 0x04 /* struct xfrm_algo + struct xfrm_encap_tmpl */
-	XFRMA_TMPL           = 0x05 /* 1 or more struct xfrm_user_tmpl */
-	XFRMA_SA             = 0x06 /* struct xfrm_usersa_info  */
-	XFRMA_POLICY         = 0x07 /* struct xfrm_userpolicy_info */
-	XFRMA_SEC_CTX        = 0x08 /* struct xfrm_sec_ctx */
-	XFRMA_LTIME_VAL      = 0x09
-	XFRMA_REPLAY_VAL     = 0x0a
-	XFRMA_REPLAY_THRESH  = 0x0b
-	XFRMA_ETIMER_THRESH  = 0x0c
-	XFRMA_SRCADDR        = 0x0d /* xfrm_address_t */
-	XFRMA_COADDR         = 0x0e /* xfrm_address_t */
-	XFRMA_LASTUSED       = 0x0f /* unsigned long  */
-	XFRMA_POLICY_TYPE    = 0x10 /* struct xfrm_userpolicy_type */
-	XFRMA_MIGRATE        = 0x11
-	XFRMA_ALG_AEAD       = 0x12 /* struct xfrm_algo_aead */
-	XFRMA_KMADDRESS      = 0x13 /* struct xfrm_user_kmaddress */
-	XFRMA_ALG_AUTH_TRUNC = 0x14 /* struct xfrm_algo_auth */
-	XFRMA_MARK           = 0x15 /* struct xfrm_mark */
-	XFRMA_TFCPAD         = 0x16 /* __u32 */
-	XFRMA_REPLAY_ESN_VAL = 0x17 /* struct xfrm_replay_esn */
-	XFRMA_SA_EXTRA_FLAGS = 0x18 /* __u32 */
-	XFRMA_MAX            = 0x18
+	XFRMA_UNSPEC    = iota
+	XFRMA_ALG_AUTH  /* struct xfrm_algo */
+	XFRMA_ALG_CRYPT /* struct xfrm_algo */
+	XFRMA_ALG_COMP  /* struct xfrm_algo */
+	XFRMA_ENCAP     /* struct xfrm_algo + struct xfrm_encap_tmpl */
+	XFRMA_TMPL      /* 1 or more struct xfrm_user_tmpl */
+	XFRMA_SA        /* struct xfrm_usersa_info  */
+	XFRMA_POLICY    /* struct xfrm_userpolicy_info */
+	XFRMA_SEC_CTX   /* struct xfrm_sec_ctx */
+	XFRMA_LTIME_VAL
+	XFRMA_REPLAY_VAL
+	XFRMA_REPLAY_THRESH
+	XFRMA_ETIMER_THRESH
+	XFRMA_SRCADDR     /* xfrm_address_t */
+	XFRMA_COADDR      /* xfrm_address_t */
+	XFRMA_LASTUSED    /* unsigned long  */
+	XFRMA_POLICY_TYPE /* struct xfrm_userpolicy_type */
+	XFRMA_MIGRATE
+	XFRMA_ALG_AEAD       /* struct xfrm_algo_aead */
+	XFRMA_KMADDRESS      /* struct xfrm_user_kmaddress */
+	XFRMA_ALG_AUTH_TRUNC /* struct xfrm_algo_auth */
+	XFRMA_MARK           /* struct xfrm_mark */
+	XFRMA_TFCPAD         /* __u32 */
+	XFRMA_REPLAY_ESN_VAL /* struct xfrm_replay_esn */
+	XFRMA_SA_EXTRA_FLAGS /* __u32 */
+	XFRMA_PROTO          /* __u8 */
+	XFRMA_ADDRESS_FILTER /* struct xfrm_address_filter */
+	XFRMA_PAD
+	XFRMA_OFFLOAD_DEV            /* struct xfrm_state_offload */
+	XFRMA_SET_MARK               /* __u32 */
+	XFRMA_SET_MARK_MASK          /* __u32 */
+	XFRMA_IF_ID                  /* __u32 */
+	XFRMA_MTIMER_THRESH          /* __u32 in seconds for input SA */
+	XFRMA_SA_DIR                 /* __u8 */
+	XFRMA_NAT_KEEPALIVE_INTERVAL /* __u32 in seconds for NAT keepalive */
+	XFRMA_SA_PCPU                /* __u32 */
+
+	XFRMA_MAX = iota - 1
 )
+
+const XFRMA_OUTPUT_MARK = XFRMA_SET_MARK
 
 const (
 	SizeofXfrmAddress     = 0x10
@@ -121,7 +135,15 @@ func (x *XfrmAddress) ToIP() net.IP {
 	return ip
 }
 
-func (x *XfrmAddress) ToIPNet(prefixlen uint8) *net.IPNet {
+// family is only used when x and prefixlen are both 0
+func (x *XfrmAddress) ToIPNet(prefixlen uint8, family uint16) *net.IPNet {
+	empty := [SizeofXfrmAddress]byte{}
+	if bytes.Equal(x[:], empty[:]) && prefixlen == 0 {
+		if family == FAMILY_V6 {
+			return &net.IPNet{IP: net.ParseIP("::"), Mask: net.CIDRMask(int(prefixlen), 128)}
+		}
+		return &net.IPNet{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(int(prefixlen), 32)}
+	}
 	ip := x.ToIP()
 	if GetIPFamily(ip) == FAMILY_V4 {
 		return &net.IPNet{IP: ip, Mask: net.CIDRMask(int(prefixlen), 32)}

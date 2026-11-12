@@ -17,18 +17,17 @@
 package sighandlers
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,12 +40,11 @@ var (
 )
 
 func TestFinalSave(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	state := dockerstate.NewTaskEngineState()
 	taskEngine := engine.NewTaskEngine(&config.Config{}, nil, nil,
-		nil, nil, state, nil, nil, nil)
+		nil, nil, nil, state, nil, nil, nil, nil, nil)
 
 	task := &apitask.Task{
 		Arn:     taskARN,
@@ -63,10 +61,12 @@ func TestFinalSave(t *testing.T) {
 		},
 	}
 
-	eniAttachment := &apieni.ENIAttachment{
-		TaskARN:          taskARN,
-		AttachmentARN:    eniAttachmentArn,
-		AttachStatusSent: false,
+	eniAttachment := &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          taskARN,
+			AttachmentARN:    eniAttachmentArn,
+			AttachStatusSent: false,
+		},
 	}
 	imageState := &image.ImageState{
 		Image: &image.Image{
@@ -100,15 +100,14 @@ func TestFinalSave(t *testing.T) {
 	assert.Len(t, imageStates, 1)
 }
 
-func newTestDataClient(t *testing.T) (data.Client, func()) {
-	testDir, err := ioutil.TempDir("", "termination_handler_unit_test")
-	require.NoError(t, err)
+func newTestDataClient(t *testing.T) data.Client {
+	testDir := t.TempDir()
 
 	testClient, err := data.NewWithSetup(testDir)
+	require.NoError(t, err)
 
-	cleanup := func() {
+	t.Cleanup(func() {
 		require.NoError(t, testClient.Close())
-		require.NoError(t, os.RemoveAll(testDir))
-	}
-	return testClient, cleanup
+	})
+	return testClient
 }

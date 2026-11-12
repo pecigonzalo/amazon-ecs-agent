@@ -20,11 +20,23 @@ import (
 	"testing"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
-
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	apiresource "github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment/resource"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 	"github.com/stretchr/testify/assert"
+)
+
+var (
+	testAttachmentProperties = map[string]string{
+		apiresource.VolumeNameKey:           "myCoolVolume",
+		apiresource.SourceVolumeHostPathKey: "/testpath",
+		apiresource.VolumeSizeGibKey:        "7",
+		apiresource.DeviceNameKey:           "/dev/nvme0n0",
+		apiresource.VolumeIdKey:             "vol-123",
+		apiresource.FileSystemKey:           "testXFS",
+	}
 )
 
 func TestCreateDockerTaskEngineState(t *testing.T) {
@@ -59,6 +71,7 @@ func TestCreateDockerTaskEngineState(t *testing.T) {
 	}
 
 	assert.Len(t, state.(*DockerTaskEngineState).AllENIAttachments(), 0)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllEBSAttachments(), 0)
 	task, ok := state.TaskByShortID("test")
 	if assert.Empty(t, ok, "Empty state should have no tasks") {
 		assert.Empty(t, task, "Empty state should have no tasks")
@@ -89,10 +102,12 @@ func TestAddTask(t *testing.T) {
 func TestAddRemoveENIAttachment(t *testing.T) {
 	state := NewTaskEngineState()
 
-	attachment := &apieni.ENIAttachment{
-		TaskARN:       "taskarn",
-		AttachmentARN: "eni1",
-		MACAddress:    "mac1",
+	attachment := &ni.ENIAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:       "taskarn",
+			AttachmentARN: "eni1",
+		},
+		MACAddress: "mac1",
 	}
 
 	state.AddENIAttachment(attachment)
@@ -111,6 +126,126 @@ func TestAddRemoveENIAttachment(t *testing.T) {
 	eni, ok = state.ENIByMac("mac1")
 	assert.False(t, ok)
 	assert.Nil(t, eni)
+}
+
+func TestAddRemoveEBSAttachment(t *testing.T) {
+	state := NewTaskEngineState()
+
+	attachment := &apiresource.ResourceAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:       "taskarn",
+			AttachmentARN: "ebs1",
+		},
+		AttachmentProperties: testAttachmentProperties,
+		AttachmentType:       apiresource.EBSTaskAttach,
+	}
+
+	state.AddEBSAttachment(attachment)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllEBSAttachments(), 1)
+	ebs, ok := state.GetEBSByVolumeId("vol-123")
+	assert.True(t, ok)
+	assert.Equal(t, ebs.TaskARN, attachment.TaskARN)
+
+	ebs, ok = state.GetEBSByVolumeId("vol-abc")
+	assert.False(t, ok)
+	assert.Nil(t, ebs)
+
+	state.RemoveEBSAttachment(attachment.AttachmentProperties[apiresource.VolumeIdKey])
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllEBSAttachments(), 0)
+	ebs, ok = state.GetEBSByVolumeId("vol-123")
+	assert.False(t, ok)
+	assert.Nil(t, ebs)
+}
+
+func TestAddPendingEBSAttachment(t *testing.T) {
+	state := NewTaskEngineState()
+
+	pendingAttachment := &apiresource.ResourceAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          "taskarn1",
+			AttachmentARN:    "ebs1",
+			AttachStatusSent: false,
+			Status:           attachment.AttachmentNone,
+		},
+		AttachmentProperties: testAttachmentProperties,
+		AttachmentType:       apiresource.EBSTaskAttach,
+	}
+
+	testSentAttachmentProperties := map[string]string{
+		apiresource.VolumeNameKey:           "myCoolVolume",
+		apiresource.SourceVolumeHostPathKey: "/testpath2",
+		apiresource.VolumeSizeGibKey:        "7",
+		apiresource.DeviceNameKey:           "/dev/nvme1n0",
+		apiresource.VolumeIdKey:             "vol-456",
+		apiresource.FileSystemKey:           "testXFS",
+	}
+
+	foundAttachment := &apiresource.ResourceAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          "taskarn2",
+			AttachmentARN:    "ebs2",
+			AttachStatusSent: true,
+			Status:           attachment.AttachmentAttached,
+		},
+		AttachmentProperties: testSentAttachmentProperties,
+		AttachmentType:       apiresource.EBSTaskAttach,
+	}
+
+	state.AddEBSAttachment(pendingAttachment)
+	state.AddEBSAttachment(foundAttachment)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllPendingEBSAttachments(), 1)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllPendingEBSAttachmentsWithKey(), 1)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllEBSAttachments(), 2)
+
+	_, ok := state.(*DockerTaskEngineState).GetAllPendingEBSAttachmentsWithKey()["vol-123"]
+	assert.True(t, ok)
+
+}
+
+func TestAddPendingEBSAttachmentExclusion(t *testing.T) {
+	state := NewTaskEngineState()
+
+	testSentAttachmentProperties := map[string]string{
+		apiresource.VolumeNameKey:           "myCoolVolume",
+		apiresource.SourceVolumeHostPathKey: "/testpath2",
+		apiresource.VolumeSizeGibKey:        "7",
+		apiresource.DeviceNameKey:           "/dev/nvme1n0",
+		apiresource.VolumeIdKey:             "vol-456",
+		apiresource.FileSystemKey:           "testXFS",
+	}
+
+	// not attached but sent should be included (||)
+	sentAttachment := &apiresource.ResourceAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          "taskarn1",
+			AttachmentARN:    "ebs1",
+			AttachStatusSent: true,
+			Status:           attachment.AttachmentNone,
+		},
+		AttachmentProperties: testAttachmentProperties,
+		AttachmentType:       apiresource.EBSTaskAttach,
+	}
+
+	// attached and sent attachment should be excluded (&&)
+	foundAttachment := &apiresource.ResourceAttachment{
+		AttachmentInfo: attachment.AttachmentInfo{
+			TaskARN:          "taskarn2",
+			AttachmentARN:    "ebs2",
+			AttachStatusSent: true,
+			Status:           attachment.AttachmentAttached,
+		},
+		AttachmentProperties: testSentAttachmentProperties,
+		AttachmentType:       apiresource.EBSTaskAttach,
+	}
+
+	state.AddEBSAttachment(foundAttachment)
+	state.AddEBSAttachment(sentAttachment)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllPendingEBSAttachments(), 1)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllPendingEBSAttachmentsWithKey(), 1)
+	assert.Len(t, state.(*DockerTaskEngineState).GetAllEBSAttachments(), 2)
+
+	_, ok := state.(*DockerTaskEngineState).GetAllPendingEBSAttachmentsWithKey()["vol-123"]
+	assert.True(t, ok)
 }
 
 func TestTwophaseAddContainer(t *testing.T) {
@@ -530,4 +665,51 @@ func TestRemoveTaskRemoveV3EndpointID(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = state.v3EndpointIDToDockerID["new-uuid-2"]
 	assert.False(t, ok)
+}
+
+// TestContainerNameByV3EndpointID tests that ContainerNameByV3EndpointID returns the correct container name
+func TestContainerNameByV3EndpointID(t *testing.T) {
+	state := newDockerTaskEngineState()
+	container1 := &apicontainer.Container{
+		Name:         "web-server",
+		V3EndpointID: "endpoint-uuid-1",
+	}
+	dockerContainer1 := &apicontainer.DockerContainer{
+		DockerID:  "docker-id-1",
+		Container: container1,
+	}
+
+	container2 := &apicontainer.Container{
+		Name:         "sidecar-proxy",
+		V3EndpointID: "endpoint-uuid-2",
+	}
+	dockerContainer2 := &apicontainer.DockerContainer{
+		DockerID:  "docker-id-2",
+		Container: container2,
+	}
+
+	task := &apitask.Task{
+		Arn: "task-arn",
+		Containers: []*apicontainer.Container{
+			container1,
+			container2,
+		},
+	}
+
+	state.AddTask(task)
+	state.AddContainer(dockerContainer1, task)
+	state.AddContainer(dockerContainer2, task)
+
+	// Test successful lookups
+	containerName1, found1 := state.ContainerNameByV3EndpointID("endpoint-uuid-1")
+	assert.True(t, found1)
+	assert.Equal(t, "web-server", containerName1)
+
+	containerName2, found2 := state.ContainerNameByV3EndpointID("endpoint-uuid-2")
+	assert.True(t, found2)
+	assert.Equal(t, "sidecar-proxy", containerName2)
+
+	// Test lookup with non-existent endpoint ID
+	_, found3 := state.ContainerNameByV3EndpointID("non-existent-uuid")
+	assert.False(t, found3)
 }

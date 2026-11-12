@@ -16,10 +16,12 @@ package volumes
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/aws/amazon-ecs-agent/ecs-init/config"
+	"github.com/aws/amazon-ecs-agent/ecs-init/volumes/types"
 
 	"github.com/cihub/seelog"
 )
@@ -51,6 +53,7 @@ type VolumeInfo struct {
 	Path      string            `json:"path,omitempty"`
 	Options   map[string]string `json:"options,omitempty"`
 	CreatedAt string            `json:"createdAt,omitempty"`
+	Mounts    map[string]int    `json:"mounts,omitempty"`
 }
 
 // NewStateManager initializes the state manager of volume plugin
@@ -62,12 +65,19 @@ func NewStateManager() *StateManager {
 	}
 }
 
-func (s *StateManager) recordVolume(volName string, vol *Volume) error {
+func (s *StateManager) recordVolume(volName string, vol *types.Volume) error {
+	// Copy the mounts so that the map is not shared
+	mountsCopy := map[string]int{}
+	for k, v := range vol.Mounts {
+		mountsCopy[k] = v
+	}
+
 	s.VolState.Volumes[volName] = &VolumeInfo{
 		Type:      vol.Type,
 		Path:      vol.Path,
 		Options:   vol.Options,
 		CreatedAt: vol.CreatedAt,
+		Mounts:    mountsCopy,
 	}
 	return s.save()
 }
@@ -94,7 +104,7 @@ var saveStateToDisk = saveState
 func saveState(b []byte) error {
 	// Make our temp-file on the same volume as our data-file to ensure we can
 	// actually move it atomically; cross-device renaming will error out
-	tmpfile, err := ioutil.TempFile(PluginStatePath, "tmp_ecs_volume_plugin")
+	tmpfile, err := os.CreateTemp(PluginStatePath, "tmp_ecs_volume_plugin")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %v", err)
 	}
@@ -130,7 +140,7 @@ func saveState(b []byte) error {
 var fileExists = checkFile
 
 func checkFile(filename string) bool {
-	_, err := os.Stat(filename)
+	_, err := config.OsStat(filename)
 	return !os.IsNotExist(err)
 }
 
@@ -154,5 +164,5 @@ func (s *StateManager) load(a interface{}) error {
 var readStateFile = readFile
 
 func readFile() ([]byte, error) {
-	return ioutil.ReadFile(PluginStateFileAbsPath)
+	return os.ReadFile(PluginStateFileAbsPath)
 }

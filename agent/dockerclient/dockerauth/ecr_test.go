@@ -24,13 +24,14 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	"github.com/aws/amazon-ecs-agent/agent/async"
-	mock_async "github.com/aws/amazon-ecs-agent/agent/async/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	mock_ecr "github.com/aws/amazon-ecs-agent/agent/ecr/mocks"
-	ecrapi "github.com/aws/amazon-ecs-agent/agent/ecr/model/ecr"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/docker/docker/api/types"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/async"
+	mock_async "github.com/aws/amazon-ecs-agent/ecs-agent/async/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecr/types"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,7 +79,7 @@ func TestGetAuthConfigSuccess(t *testing.T) {
 	}
 
 	factory.EXPECT().GetClient(authData).Return(client, nil)
-	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&ecrapi.AuthorizationData{
+	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}, nil)
@@ -90,7 +91,7 @@ func TestGetAuthConfigSuccess(t *testing.T) {
 	assert.Equal(t, password, authconfig.Password, "Expected password to be %s, but was %s", password, authconfig.Password)
 }
 
-func TestGetAuthConfigNoMatchAuthorizationToken(t *testing.T) {
+func TestGetAuthConfigNoMatchEndpointToImageUri(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	factory := mock_ecr.NewMockECRFactory(ctrl)
@@ -115,14 +116,48 @@ func TestGetAuthConfigNoMatchAuthorizationToken(t *testing.T) {
 	}
 
 	factory.EXPECT().GetClient(authData).Return(client, nil)
-	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&ecrapi.AuthorizationData{
+	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}, nil)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint+"/myimage", registryAuthData)
-	require.Error(t, err, "Expected error if the proxy does not match")
-	assert.Equal(t, types.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
+	assert.NoError(t, err)
+	assert.Equal(t, username, authconfig.Username, "Expected username to be %s, but was %s", username, authconfig.Username)
+	assert.Equal(t, password, authconfig.Password, "Expected password to be %s, but was %s", password, authconfig.Password)
+}
+
+func TestGetAuthConfigNilAuthorizationToken(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	factory := mock_ecr.NewMockECRFactory(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
+
+	authData := &apicontainer.ECRAuthData{
+		Region:           "us-west-2",
+		RegistryID:       "0123456789012",
+		EndpointOverride: "my.endpoint",
+	}
+	proxyEndpoint := "proxy"
+
+	provider := ecrAuthProvider{
+		factory:    factory,
+		tokenCache: async.NewLRUCache(tokenCacheSize, tokenCacheTTL),
+	}
+
+	registryAuthData := &apicontainer.RegistryAuthenticationData{
+		ECRAuthData: authData,
+	}
+
+	factory.EXPECT().GetClient(authData).Return(client, nil)
+	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&types.AuthorizationData{
+		ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
+		AuthorizationToken: nil,
+	}, nil)
+
+	authconfig, err := provider.GetAuthconfig(proxyEndpoint+"/myimage", registryAuthData)
+	require.Error(t, err, "Expected error to be present, but was nil", err)
+	assert.Equal(t, registry.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
 }
 
 func TestGetAuthConfigBadBase64(t *testing.T) {
@@ -150,14 +185,14 @@ func TestGetAuthConfigBadBase64(t *testing.T) {
 	}
 
 	factory.EXPECT().GetClient(authData).Return(client, nil)
-	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&ecrapi.AuthorizationData{
+	client.EXPECT().GetAuthorizationToken(authData.RegistryID).Return(&types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
 		AuthorizationToken: aws.String((username + ":" + password)),
 	}, nil)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint+"/myimage", registryAuthData)
 	require.Error(t, err, "Expected error to be present, but was nil", err)
-	assert.Equal(t, types.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
+	assert.Equal(t, registry.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
 }
 
 func TestGetAuthConfigMissingResponse(t *testing.T) {
@@ -190,7 +225,7 @@ func TestGetAuthConfigMissingResponse(t *testing.T) {
 		t.Fatal("Expected error to be present, but was nil", err)
 	}
 	require.Error(t, err, "Expected error to be present, but was nil", err)
-	assert.Equal(t, types.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
+	assert.Equal(t, registry.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
 }
 
 func TestGetAuthConfigECRError(t *testing.T) {
@@ -220,7 +255,7 @@ func TestGetAuthConfigECRError(t *testing.T) {
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint+"/myimage", registryAuthData)
 	require.Error(t, err, "Expected error to be present, but was nil", err)
-	assert.Equal(t, types.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
+	assert.Equal(t, registry.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
 }
 
 func TestGetAuthConfigNoAuthData(t *testing.T) {
@@ -235,7 +270,7 @@ func TestGetAuthConfigNoAuthData(t *testing.T) {
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint+"/myimage", nil)
 	require.Error(t, err, "Expected error to be present, but was nil", err)
-	assert.Equal(t, types.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
+	assert.Equal(t, registry.AuthConfig{}, authconfig, "Expected Authconfig to be empty, but was %v", authconfig)
 }
 
 func TestIsTokenValid(t *testing.T) {
@@ -253,7 +288,7 @@ func TestIsTokenValid(t *testing.T) {
 	}
 
 	for _, testCase := range testAuthTimes {
-		testAuthData := &ecrapi.AuthorizationData{
+		testAuthData := &types.AuthorizationData{
 			ProxyEndpoint:      aws.String(testProxyEndpoint),
 			AuthorizationToken: aws.String(testToken),
 			ExpiresAt:          aws.Time(time.Now().Add(testCase.expireIn)),
@@ -300,7 +335,7 @@ func TestAuthorizationTokenCacheMiss(t *testing.T) {
 		endpointOverride: authData.EndpointOverride,
 	}
 
-	dockerAuthData := &ecrapi.AuthorizationData{
+	dockerAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}
@@ -330,7 +365,7 @@ func TestAuthorizationTokenCacheHit(t *testing.T) {
 	password := "test_passwd"
 
 	proxyEndpoint := "proxy"
-	testAuthData := &ecrapi.AuthorizationData{
+	testAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 		ExpiresAt:          aws.Time(time.Now().Add(12 * time.Hour)),
@@ -372,7 +407,7 @@ func TestAuthorizationTokenCacheWithCredentialsHit(t *testing.T) {
 	password := "test_passwd"
 
 	proxyEndpoint := "proxy"
-	testAuthData := &ecrapi.AuthorizationData{
+	testAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 		ExpiresAt:          aws.Time(time.Now().Add(12 * time.Hour)),
@@ -419,7 +454,7 @@ func TestAuthorizationTokenCacheHitExpired(t *testing.T) {
 	password := "test_passwd"
 
 	proxyEndpoint := "proxy"
-	testAuthData := &ecrapi.AuthorizationData{
+	testAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 		ExpiresAt:          aws.Time(time.Now()),
@@ -444,7 +479,7 @@ func TestAuthorizationTokenCacheHitExpired(t *testing.T) {
 		endpointOverride: authData.EndpointOverride,
 	}
 
-	dockerAuthData := &ecrapi.AuthorizationData{
+	dockerAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}
@@ -476,7 +511,7 @@ func TestExtractECRTokenError(t *testing.T) {
 	password := "test_passwd"
 
 	proxyEndpoint := "proxy"
-	testAuthData := &ecrapi.AuthorizationData{
+	testAuthData := &types.AuthorizationData{
 		ProxyEndpoint: aws.String(proxyEndpointScheme + proxyEndpoint),
 		// This will makes the extract fail
 		AuthorizationToken: aws.String("-"),
@@ -502,7 +537,7 @@ func TestExtractECRTokenError(t *testing.T) {
 		endpointOverride: authData.EndpointOverride,
 	}
 
-	dockerAuthData := &ecrapi.AuthorizationData{
+	dockerAuthData := &types.AuthorizationData{
 		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}

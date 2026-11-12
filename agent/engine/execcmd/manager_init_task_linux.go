@@ -16,10 +16,14 @@
 package execcmd
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
 	dockercontainer "github.com/docker/docker/api/types/container"
 )
 
@@ -114,25 +118,59 @@ func validConfigExists(configFilePath, expectedHash string) bool {
 
 var GetExecAgentConfigFileName = getAgentConfigFileName
 
-func getAgentConfigFileName(sessionLimit int) (string, error) {
-	config := fmt.Sprintf(execAgentConfigTemplate, sessionLimit)
+// formatSSMAgentConfig creates the SSM agent configuration, determining
+// whether to use dualstack endpoints based on IPv6-only environment detection.
+func formatSSMAgentConfig(sessionLimit int, cfg *config.Config, task *apitask.Task) (string, error) {
+	// SSM Agent needs to use dualstack endpoints for its dependencies
+	// if the network only supports IPv6.
+	useDualStackEndpoints := false
+	if task.IsNetworkModeAWSVPC() {
+		// For awsvpc tasks, the task network is used by the SSM Agent
+		primaryENI := task.GetPrimaryENI()
+		if primaryENI == nil {
+			return "", errors.New("awsvpc mode task does not have a primary ENI")
+		}
+		useDualStackEndpoints = primaryENI.IPv6Only()
+	} else {
+		useDualStackEndpoints = cfg.InstanceIPCompatibility.IsIPv6Only()
+	}
+
+	if useDualStackEndpoints {
+		logger.Info("Using dualstack endpoints for SSM Agent in IPv6-only environment")
+	}
+
+	return fmt.Sprintf(execAgentConfigTemplate, sessionLimit, useDualStackEndpoints), nil
+}
+
+func getAgentConfigFileName(sessionLimit int, cfg *config.Config, task *apitask.Task) (string, error) {
+	// Format the SSM agent config with appropriate endpoints
+	config, err := formatSSMAgentConfig(sessionLimit, cfg, task)
+	if err != nil {
+		return "", err
+	}
+
+	// Generate a hash of the config to use in the filename
 	hash := getExecAgentConfigHash(config)
 	configFileName := fmt.Sprintf(execAgentConfigFileNameTemplate, hash)
-	// check if config file exists already
+
+	// Check if config file exists already
 	configFilePath := filepath.Join(ECSAgentExecConfigDir, configFileName)
 	if fileExists(configFilePath) && validConfigExists(configFilePath, hash) {
 		return configFileName, nil
 	}
-	// check if config file is a dir; if true, remove it
+
+	// Check if config file is a dir; if true, remove it
 	if isDir(configFilePath) {
 		if err := removeAll(configFilePath); err != nil {
 			return "", err
 		}
 	}
-	// config doesn't exist; create a new one
+
+	// Config doesn't exist; create a new one
 	if err := createNewExecAgentConfigFile(config, configFilePath); err != nil {
 		return "", err
 	}
+
 	return configFileName, nil
 }
 
@@ -142,8 +180,11 @@ func certsExist() bool {
 
 // This function creates any necessary config directories/files and ensures that
 // the ssm-agent binaries, configs, logs, and plugin is bind mounted
-func addRequiredBindMounts(taskId, cn, latestBinVersionDir, uuid string, sessionWorkersLimit int, hostConfig *dockercontainer.HostConfig) error {
-	configFile, rErr := GetExecAgentConfigFileName(sessionWorkersLimit)
+func addRequiredBindMounts(
+	task *apitask.Task, cn, latestBinVersionDir, uuid string, sessionWorkersLimit int,
+	hostConfig *dockercontainer.HostConfig, cfg *config.Config,
+) error {
+	configFile, rErr := GetExecAgentConfigFileName(sessionWorkersLimit, cfg, task)
 	if rErr != nil {
 		rErr = fmt.Errorf("could not generate ExecAgent Config File: %v", rErr)
 		return rErr
@@ -191,7 +232,7 @@ func addRequiredBindMounts(taskId, cn, latestBinVersionDir, uuid string, session
 
 	// Add ssm log bind mount
 	hostConfig.Binds = append(hostConfig.Binds, getBindMountMapping(
-		filepath.Join(HostLogDir, taskId, cn),
+		filepath.Join(HostLogDir, task.GetID(), cn),
 		ContainerLogDir))
 	return nil
 }

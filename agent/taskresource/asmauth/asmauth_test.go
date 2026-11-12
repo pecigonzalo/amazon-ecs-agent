@@ -17,21 +17,25 @@
 package asmauth
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/asm"
 	mock_factory "github.com/aws/amazon-ecs-agent/agent/asm/factory/mocks"
 	mock_secretsmanageriface "github.com/aws/amazon-ecs-agent/agent/asm/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	mock_credentials "github.com/aws/amazon-ecs-agent/agent/credentials/mocks"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	mock_credentials "github.com/aws/amazon-ecs-agent/ecs-agent/credentials/mocks"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -82,9 +86,13 @@ func TestCreateAndGet(t *testing.T) {
 	}
 	gomock.InOrder(
 		credentialsManager.EXPECT().GetTaskCredentials(executionCredentialsID).Return(creds, true),
-		asmClientCreator.EXPECT().NewASMClient(region, iamRoleCreds).Return(mockASMClient),
-		mockASMClient.EXPECT().GetSecretValue(gomock.Any()).Do(func(in *secretsmanager.GetSecretValueInput) {
-			assert.Equal(t, aws.StringValue(in.SecretId), secretID)
+		asmClientCreator.EXPECT().NewASMClient(region, iamRoleCreds).Return(mockASMClient, nil),
+		mockASMClient.EXPECT().GetSecretValue(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+		).Do(func(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) {
+			assert.Equal(t, aws.ToString(in.SecretId), secretID)
 		}).Return(asmSecretValue, nil),
 	)
 	asmRes := &ASMAuthResource{
@@ -126,22 +134,44 @@ func TestMarshalUnmarshalJSON(t *testing.T) {
 }
 
 func TestInitialize(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	credentialsManager := mock_credentials.NewMockManager(ctrl)
-	asmClientCreator := mock_factory.NewMockClientCreator(ctrl)
-	asmRes := &ASMAuthResource{
-		knownStatusUnsafe:   resourcestatus.ResourceCreated,
-		desiredStatusUnsafe: resourcestatus.ResourceCreated,
+	tcs := []struct {
+		taskKnownStatus   apitaskstatus.TaskStatus
+		taskDesiredStatus apitaskstatus.TaskStatus
+		expectReset       bool
+	}{
+		{apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning, true},
+		{apitaskstatus.TaskManifestPulled, apitaskstatus.TaskRunning, true},
+		{apitaskstatus.TaskPulled, apitaskstatus.TaskRunning, false},
+		{apitaskstatus.TaskStatusNone, apitaskstatus.TaskStopped, false},
+		{apitaskstatus.TaskManifestPulled, apitaskstatus.TaskStopped, false},
 	}
-	asmRes.Initialize(&taskresource.ResourceFields{
-		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
-			ASMClientCreator:   asmClientCreator,
-			CredentialsManager: credentialsManager,
-		},
-	}, apitaskstatus.TaskStatusNone, apitaskstatus.TaskRunning)
-	assert.Equal(t, resourcestatus.ResourceStatusNone, asmRes.GetKnownStatus())
-	assert.Equal(t, resourcestatus.ResourceCreated, asmRes.GetDesiredStatus())
+	for _, tc := range tcs {
+		t.Run(
+			fmt.Sprintf("Known: %s; Desired: %s", tc.taskKnownStatus, tc.taskDesiredStatus),
+			func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				defer ctrl.Finish()
 
+				credentialsManager := mock_credentials.NewMockManager(ctrl)
+				asmClientCreator := mock_factory.NewMockClientCreator(ctrl)
+				asmRes := &ASMAuthResource{
+					knownStatusUnsafe:   resourcestatus.ResourceCreated,
+					desiredStatusUnsafe: resourcestatus.ResourceCreated,
+				}
+				asmRes.Initialize(
+					&config.Config{},
+					&taskresource.ResourceFields{
+						ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+							ASMClientCreator:   asmClientCreator,
+							CredentialsManager: credentialsManager,
+						},
+					}, tc.taskKnownStatus, tc.taskDesiredStatus)
+				if tc.expectReset {
+					assert.Equal(t, resourcestatus.ResourceStatusNone, asmRes.GetKnownStatus())
+				} else {
+					assert.Equal(t, resourcestatus.ResourceCreated, asmRes.GetKnownStatus())
+				}
+				assert.Equal(t, resourcestatus.ResourceCreated, asmRes.GetDesiredStatus())
+			})
+	}
 }

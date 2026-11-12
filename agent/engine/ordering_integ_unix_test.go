@@ -32,13 +32,13 @@ var (
 )
 
 func TestGranularStopTimeout(t *testing.T) {
-	taskEngine, done, _ := setupWithDefaultConfig(t)
+	taskEngine, done, _, _ := setupWithDefaultConfig(t)
 	defer done()
 
 	stateChangeEvents := taskEngine.StateChangeEvents()
 
 	taskArn := "TestGranularStopTimeout"
-	testTask := createTestTask(taskArn)
+	testTask := CreateTestTask(taskArn)
 
 	parent := createTestContainerWithImageAndName(baseImageForOS, "parent")
 	dependency1 := createTestContainerWithImageAndName(baseImageForOS, "dependency1")
@@ -77,17 +77,22 @@ func TestGranularStopTimeout(t *testing.T) {
 	finished := make(chan interface{})
 	go func() {
 
-		verifyContainerRunningStateChange(t, taskEngine)
-		verifyContainerRunningStateChange(t, taskEngine)
-		verifyContainerRunningStateChange(t, taskEngine)
+		VerifyContainerManifestPulledStateChange(t, taskEngine)
+		VerifyContainerManifestPulledStateChange(t, taskEngine)
+		VerifyContainerManifestPulledStateChange(t, taskEngine)
+		VerifyTaskManifestPulledStateChange(t, taskEngine)
 
-		verifyTaskIsRunning(stateChangeEvents, testTask)
+		VerifyContainerRunningStateChange(t, taskEngine)
+		VerifyContainerRunningStateChange(t, taskEngine)
+		VerifyContainerRunningStateChange(t, taskEngine)
 
-		verifyContainerStoppedStateChange(t, taskEngine)
-		verifyContainerStoppedStateChange(t, taskEngine)
-		verifyContainerStoppedStateChange(t, taskEngine)
+		VerifyTaskIsRunning(stateChangeEvents, testTask)
 
-		verifyTaskIsStopped(stateChangeEvents, testTask)
+		VerifyContainerStoppedStateChange(t, taskEngine)
+		VerifyContainerStoppedStateChange(t, taskEngine)
+		VerifyContainerStoppedStateChange(t, taskEngine)
+
+		VerifyTaskIsStopped(stateChangeEvents, testTask)
 
 		assert.Equal(t, 137, *testTask.Containers[0].GetKnownExitCode(), "Dependency1 should exit with code 137")
 		assert.Equal(t, 0, *testTask.Containers[1].GetKnownExitCode(), "Dependency2 should exit with code 0")

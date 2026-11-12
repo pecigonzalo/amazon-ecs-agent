@@ -1,7 +1,13 @@
 package nl
 
 import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"net"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // LinkLayer
@@ -41,7 +47,14 @@ const (
 	TCA_FCNT
 	TCA_STATS2
 	TCA_STAB
-	TCA_MAX = TCA_STAB
+	TCA_PAD
+	TCA_DUMP_INVISIBLE
+	TCA_CHAIN
+	TCA_HW_OFFLOAD
+	TCA_INGRESS_BLOCK
+	TCA_EGRESS_BLOCK
+	TCA_DUMP_FLAGS
+	TCA_MAX = TCA_DUMP_FLAGS
 )
 
 const (
@@ -55,13 +68,43 @@ const (
 	TCA_ACT_OPTIONS
 	TCA_ACT_INDEX
 	TCA_ACT_STATS
+	TCA_ACT_PAD
+	TCA_ACT_COOKIE
+	TCA_ACT_FLAGS
+	TCA_ACT_HW_STATS
+	TCA_ACT_USED_HW_STATS
+	TCA_ACT_IN_HW_COUNT
 	TCA_ACT_MAX
+)
+
+const (
+	TCA_ACT_SAMPLE_UNSPEC = iota
+	TCA_ACT_SAMPLE_TM
+	TCA_ACT_SAMPLE_PARMS
+	TCA_ACT_SAMPLE_RATE
+	TCA_ACT_SAMPLE_TRUNC_SIZE
+	TCA_ACT_SAMPLE_PSAMPLE_GROUP
+	TCA_ACT_SAMPLE_PAD
+	TCA_ACT_SAMPLE_MAX
 )
 
 const (
 	TCA_PRIO_UNSPEC = iota
 	TCA_PRIO_MQ
 	TCA_PRIO_MAX = TCA_PRIO_MQ
+)
+
+const (
+	TCA_STATS_UNSPEC = iota
+	TCA_STATS_BASIC
+	TCA_STATS_RATE_EST
+	TCA_STATS_QUEUE
+	TCA_STATS_APP
+	TCA_STATS_RATE_EST64
+	TCA_STATS_PAD
+	TCA_STATS_BASIC_HW
+	TCA_STATS_PKT64
+	TCA_STATS_MAX = TCA_STATS_PKT64
 )
 
 const (
@@ -73,14 +116,24 @@ const (
 	SizeofTcNetemCorr    = 0x0c
 	SizeofTcNetemReorder = 0x08
 	SizeofTcNetemCorrupt = 0x08
+	SizeOfTcNetemRate    = 0x10
 	SizeofTcTbfQopt      = 2*SizeofTcRateSpec + 0x0c
 	SizeofTcHtbCopt      = 2*SizeofTcRateSpec + 0x14
 	SizeofTcHtbGlob      = 0x14
 	SizeofTcU32Key       = 0x10
 	SizeofTcU32Sel       = 0x10 // without keys
-	SizeofTcGen          = 0x14
+	SizeofTcGen          = 0x16
+	SizeofTcConnmark     = SizeofTcGen + 0x04
+	SizeofTcCsum         = SizeofTcGen + 0x04
 	SizeofTcMirred       = SizeofTcGen + 0x08
+	SizeofTcVlan         = SizeofTcGen + 0x04
+	SizeofTcTunnelKey    = SizeofTcGen + 0x04
+	SizeofTcSkbEdit      = SizeofTcGen
 	SizeofTcPolice       = 2*SizeofTcRateSpec + 0x20
+	SizeofTcSfqQopt      = 0x0b
+	SizeofTcSfqRedStats  = 0x18
+	SizeofTcSfqQoptV1    = SizeofTcSfqQopt + SizeofTcSfqRedStats + 0x1c
+	SizeofUint32Bitfield = 0x8
 )
 
 // struct tcmsg {
@@ -112,6 +165,18 @@ func DeserializeTcMsg(b []byte) *TcMsg {
 
 func (x *TcMsg) Serialize() []byte {
 	return (*(*[SizeofTcMsg]byte)(unsafe.Pointer(x)))[:]
+}
+
+type Tcf struct {
+	Install  uint64
+	LastUse  uint64
+	Expires  uint64
+	FirstUse uint64
+}
+
+func DeserializeTcf(b []byte) *Tcf {
+	const size = int(unsafe.Sizeof(Tcf{}))
+	return (*Tcf)(unsafe.Pointer(&b[0:size][0]))
 }
 
 // struct tcamsg {
@@ -320,6 +385,26 @@ func (x *TcNetemCorrupt) Serialize() []byte {
 	return (*(*[SizeofTcNetemCorrupt]byte)(unsafe.Pointer(x)))[:]
 }
 
+// TcNetemRate is a struct that represents the rate of a netem qdisc
+type TcNetemRate struct {
+	Rate           uint32
+	PacketOverhead int32
+	CellSize       uint32
+	CellOverhead   int32
+}
+
+func (msg *TcNetemRate) Len() int {
+	return SizeofTcRateSpec
+}
+
+func DeserializeTcNetemRate(b []byte) *TcNetemRate {
+	return (*TcNetemRate)(unsafe.Pointer(&b[0:SizeofTcRateSpec][0]))
+}
+
+func (msg *TcNetemRate) Serialize() []byte {
+	return (*(*[SizeOfTcNetemRate]byte)(unsafe.Pointer(msg)))[:]
+}
+
 // struct tc_tbf_qopt {
 //   struct tc_ratespec rate;
 //   struct tc_ratespec peakrate;
@@ -410,6 +495,57 @@ func DeserializeTcHtbGlob(b []byte) *TcHtbGlob {
 
 func (x *TcHtbGlob) Serialize() []byte {
 	return (*(*[SizeofTcHtbGlob]byte)(unsafe.Pointer(x)))[:]
+}
+
+// HFSC
+
+type Curve struct {
+	m1 uint32
+	d  uint32
+	m2 uint32
+}
+
+type HfscCopt struct {
+	Rsc Curve
+	Fsc Curve
+	Usc Curve
+}
+
+func (c *Curve) Attrs() (uint32, uint32, uint32) {
+	return c.m1, c.d, c.m2
+}
+
+func (c *Curve) Set(m1 uint32, d uint32, m2 uint32) {
+	c.m1 = m1
+	c.d = d
+	c.m2 = m2
+}
+
+func DeserializeHfscCurve(b []byte) *Curve {
+	return &Curve{
+		m1: binary.LittleEndian.Uint32(b[0:4]),
+		d:  binary.LittleEndian.Uint32(b[4:8]),
+		m2: binary.LittleEndian.Uint32(b[8:12]),
+	}
+}
+
+func SerializeHfscCurve(c *Curve) (b []byte) {
+	t := make([]byte, binary.MaxVarintLen32)
+	binary.LittleEndian.PutUint32(t, c.m1)
+	b = append(b, t[:4]...)
+	binary.LittleEndian.PutUint32(t, c.d)
+	b = append(b, t[:4]...)
+	binary.LittleEndian.PutUint32(t, c.m2)
+	b = append(b, t[:4]...)
+	return b
+}
+
+type TcHfscOpt struct {
+	Defcls uint16
+}
+
+func (x *TcHfscOpt) Serialize() []byte {
+	return (*(*[2]byte)(unsafe.Pointer(x)))[:]
 }
 
 const (
@@ -586,10 +722,76 @@ const (
 	TCA_BPF_FD
 	TCA_BPF_NAME
 	TCA_BPF_FLAGS
-	TCA_BPF_MAX = TCA_BPF_FLAGS
+	TCA_BPF_FLAGS_GEN
+	TCA_BPF_TAG
+	TCA_BPF_ID
+	TCA_BPF_MAX = TCA_BPF_ID
 )
 
 type TcBpf TcGen
+
+const (
+	TCA_ACT_CONNMARK = 14
+)
+
+const (
+	TCA_CONNMARK_UNSPEC = iota
+	TCA_CONNMARK_PARMS
+	TCA_CONNMARK_TM
+	TCA_CONNMARK_MAX = TCA_CONNMARK_TM
+)
+
+// struct tc_connmark {
+//   tc_gen;
+//   __u16 zone;
+// };
+
+type TcConnmark struct {
+	TcGen
+	Zone uint16
+}
+
+func (msg *TcConnmark) Len() int {
+	return SizeofTcConnmark
+}
+
+func DeserializeTcConnmark(b []byte) *TcConnmark {
+	return (*TcConnmark)(unsafe.Pointer(&b[0:SizeofTcConnmark][0]))
+}
+
+func (x *TcConnmark) Serialize() []byte {
+	return (*(*[SizeofTcConnmark]byte)(unsafe.Pointer(x)))[:]
+}
+
+const (
+	TCA_CSUM_UNSPEC = iota
+	TCA_CSUM_PARMS
+	TCA_CSUM_TM
+	TCA_CSUM_PAD
+	TCA_CSUM_MAX = TCA_CSUM_PAD
+)
+
+// struct tc_csum {
+//   tc_gen;
+//   __u32 update_flags;
+// }
+
+type TcCsum struct {
+	TcGen
+	UpdateFlags uint32
+}
+
+func (msg *TcCsum) Len() int {
+	return SizeofTcCsum
+}
+
+func DeserializeTcCsum(b []byte) *TcCsum {
+	return (*TcCsum)(unsafe.Pointer(&b[0:SizeofTcCsum][0]))
+}
+
+func (x *TcCsum) Serialize() []byte {
+	return (*(*[SizeofTcCsum]byte)(unsafe.Pointer(x)))[:]
+}
 
 const (
 	TCA_ACT_MIRRED = 8
@@ -624,6 +826,105 @@ func DeserializeTcMirred(b []byte) *TcMirred {
 
 func (x *TcMirred) Serialize() []byte {
 	return (*(*[SizeofTcMirred]byte)(unsafe.Pointer(x)))[:]
+}
+
+const (
+	TCA_VLAN_UNSPEC = iota
+	TCA_VLAN_TM
+	TCA_VLAN_PARMS
+	TCA_VLAN_PUSH_VLAN_ID
+	TCA_VLAN_PUSH_VLAN_PROTOCOL
+	TCA_VLAN_PAD
+	TCA_VLAN_PUSH_VLAN_PRIORITY
+	TCA_VLAN_PUSH_ETH_DST
+	TCA_VLAN_PUSH_ETH_SRC
+	TCA_VLAN_MAX
+)
+
+//struct tc_vlan {
+//	tc_gen;
+//	int v_action;
+//};
+
+type TcVlan struct {
+	TcGen
+	Action int32
+}
+
+func (msg *TcVlan) Len() int {
+	return SizeofTcVlan
+}
+
+func DeserializeTcVlan(b []byte) *TcVlan {
+	return (*TcVlan)(unsafe.Pointer(&b[0:SizeofTcVlan][0]))
+}
+
+func (x *TcVlan) Serialize() []byte {
+	return (*(*[SizeofTcVlan]byte)(unsafe.Pointer(x)))[:]
+}
+
+const (
+	TCA_TUNNEL_KEY_UNSPEC = iota
+	TCA_TUNNEL_KEY_TM
+	TCA_TUNNEL_KEY_PARMS
+	TCA_TUNNEL_KEY_ENC_IPV4_SRC
+	TCA_TUNNEL_KEY_ENC_IPV4_DST
+	TCA_TUNNEL_KEY_ENC_IPV6_SRC
+	TCA_TUNNEL_KEY_ENC_IPV6_DST
+	TCA_TUNNEL_KEY_ENC_KEY_ID
+	TCA_TUNNEL_KEY_PAD
+	TCA_TUNNEL_KEY_ENC_DST_PORT
+	TCA_TUNNEL_KEY_NO_CSUM
+	TCA_TUNNEL_KEY_ENC_OPTS
+	TCA_TUNNEL_KEY_ENC_TOS
+	TCA_TUNNEL_KEY_ENC_TTL
+	TCA_TUNNEL_KEY_MAX
+)
+
+type TcTunnelKey struct {
+	TcGen
+	Action int32
+}
+
+func (x *TcTunnelKey) Len() int {
+	return SizeofTcTunnelKey
+}
+
+func DeserializeTunnelKey(b []byte) *TcTunnelKey {
+	return (*TcTunnelKey)(unsafe.Pointer(&b[0:SizeofTcTunnelKey][0]))
+}
+
+func (x *TcTunnelKey) Serialize() []byte {
+	return (*(*[SizeofTcTunnelKey]byte)(unsafe.Pointer(x)))[:]
+}
+
+const (
+	TCA_SKBEDIT_UNSPEC = iota
+	TCA_SKBEDIT_TM
+	TCA_SKBEDIT_PARMS
+	TCA_SKBEDIT_PRIORITY
+	TCA_SKBEDIT_QUEUE_MAPPING
+	TCA_SKBEDIT_MARK
+	TCA_SKBEDIT_PAD
+	TCA_SKBEDIT_PTYPE
+	TCA_SKBEDIT_MASK
+	TCA_SKBEDIT_MAX
+)
+
+type TcSkbEdit struct {
+	TcGen
+}
+
+func (x *TcSkbEdit) Len() int {
+	return SizeofTcSkbEdit
+}
+
+func DeserializeSkbEdit(b []byte) *TcSkbEdit {
+	return (*TcSkbEdit)(unsafe.Pointer(&b[0:SizeofTcSkbEdit][0]))
+}
+
+func (x *TcSkbEdit) Serialize() []byte {
+	return (*(*[SizeofTcSkbEdit]byte)(unsafe.Pointer(x)))[:]
 }
 
 // struct tc_police {
@@ -673,3 +974,692 @@ const (
 	TCA_FW_MASK
 	TCA_FW_MAX = TCA_FW_MASK
 )
+
+const (
+	TCA_MATCHALL_UNSPEC = iota
+	TCA_MATCHALL_CLASSID
+	TCA_MATCHALL_ACT
+	TCA_MATCHALL_FLAGS
+)
+
+const (
+	TCA_FQ_UNSPEC             = iota
+	TCA_FQ_PLIMIT             // limit of total number of packets in queue
+	TCA_FQ_FLOW_PLIMIT        // limit of packets per flow
+	TCA_FQ_QUANTUM            // RR quantum
+	TCA_FQ_INITIAL_QUANTUM    // RR quantum for new flow
+	TCA_FQ_RATE_ENABLE        // enable/disable rate limiting
+	TCA_FQ_FLOW_DEFAULT_RATE  // obsolete do not use
+	TCA_FQ_FLOW_MAX_RATE      // per flow max rate
+	TCA_FQ_BUCKETS_LOG        // log2(number of buckets)
+	TCA_FQ_FLOW_REFILL_DELAY  // flow credit refill delay in usec
+	TCA_FQ_ORPHAN_MASK        // mask applied to orphaned skb hashes
+	TCA_FQ_LOW_RATE_THRESHOLD // per packet delay under this rate
+	TCA_FQ_CE_THRESHOLD       // DCTCP-like CE-marking threshold
+	TCA_FQ_TIMER_SLACK        // timer slack
+	TCA_FQ_HORIZON            // time horizon in us
+	TCA_FQ_HORIZON_DROP       // drop packets beyond horizon, or cap their EDT
+)
+
+const (
+	TCA_FQ_CODEL_UNSPEC = iota
+	TCA_FQ_CODEL_TARGET
+	TCA_FQ_CODEL_LIMIT
+	TCA_FQ_CODEL_INTERVAL
+	TCA_FQ_CODEL_ECN
+	TCA_FQ_CODEL_FLOWS
+	TCA_FQ_CODEL_QUANTUM
+	TCA_FQ_CODEL_CE_THRESHOLD
+	TCA_FQ_CODEL_DROP_BATCH_SIZE
+	TCA_FQ_CODEL_MEMORY_LIMIT
+)
+
+const (
+	TCA_HFSC_UNSPEC = iota
+	TCA_HFSC_RSC
+	TCA_HFSC_FSC
+	TCA_HFSC_USC
+)
+
+const (
+	TCA_FLOWER_UNSPEC = iota
+	TCA_FLOWER_CLASSID
+	TCA_FLOWER_INDEV
+	TCA_FLOWER_ACT
+	TCA_FLOWER_KEY_ETH_DST       /* ETH_ALEN */
+	TCA_FLOWER_KEY_ETH_DST_MASK  /* ETH_ALEN */
+	TCA_FLOWER_KEY_ETH_SRC       /* ETH_ALEN */
+	TCA_FLOWER_KEY_ETH_SRC_MASK  /* ETH_ALEN */
+	TCA_FLOWER_KEY_ETH_TYPE      /* be16 */
+	TCA_FLOWER_KEY_IP_PROTO      /* u8 */
+	TCA_FLOWER_KEY_IPV4_SRC      /* be32 */
+	TCA_FLOWER_KEY_IPV4_SRC_MASK /* be32 */
+	TCA_FLOWER_KEY_IPV4_DST      /* be32 */
+	TCA_FLOWER_KEY_IPV4_DST_MASK /* be32 */
+	TCA_FLOWER_KEY_IPV6_SRC      /* struct in6_addr */
+	TCA_FLOWER_KEY_IPV6_SRC_MASK /* struct in6_addr */
+	TCA_FLOWER_KEY_IPV6_DST      /* struct in6_addr */
+	TCA_FLOWER_KEY_IPV6_DST_MASK /* struct in6_addr */
+	TCA_FLOWER_KEY_TCP_SRC       /* be16 */
+	TCA_FLOWER_KEY_TCP_DST       /* be16 */
+	TCA_FLOWER_KEY_UDP_SRC       /* be16 */
+	TCA_FLOWER_KEY_UDP_DST       /* be16 */
+
+	TCA_FLOWER_FLAGS
+	TCA_FLOWER_KEY_VLAN_ID       /* be16 */
+	TCA_FLOWER_KEY_VLAN_PRIO     /* u8   */
+	TCA_FLOWER_KEY_VLAN_ETH_TYPE /* be16 */
+
+	TCA_FLOWER_KEY_ENC_KEY_ID        /* be32 */
+	TCA_FLOWER_KEY_ENC_IPV4_SRC      /* be32 */
+	TCA_FLOWER_KEY_ENC_IPV4_SRC_MASK /* be32 */
+	TCA_FLOWER_KEY_ENC_IPV4_DST      /* be32 */
+	TCA_FLOWER_KEY_ENC_IPV4_DST_MASK /* be32 */
+	TCA_FLOWER_KEY_ENC_IPV6_SRC      /* struct in6_addr */
+	TCA_FLOWER_KEY_ENC_IPV6_SRC_MASK /* struct in6_addr */
+	TCA_FLOWER_KEY_ENC_IPV6_DST      /* struct in6_addr */
+	TCA_FLOWER_KEY_ENC_IPV6_DST_MASK /* struct in6_addr */
+
+	TCA_FLOWER_KEY_TCP_SRC_MASK  /* be16 */
+	TCA_FLOWER_KEY_TCP_DST_MASK  /* be16 */
+	TCA_FLOWER_KEY_UDP_SRC_MASK  /* be16 */
+	TCA_FLOWER_KEY_UDP_DST_MASK  /* be16 */
+	TCA_FLOWER_KEY_SCTP_SRC_MASK /* be16 */
+	TCA_FLOWER_KEY_SCTP_DST_MASK /* be16 */
+
+	TCA_FLOWER_KEY_SCTP_SRC /* be16 */
+	TCA_FLOWER_KEY_SCTP_DST /* be16 */
+
+	TCA_FLOWER_KEY_ENC_UDP_SRC_PORT      /* be16 */
+	TCA_FLOWER_KEY_ENC_UDP_SRC_PORT_MASK /* be16 */
+	TCA_FLOWER_KEY_ENC_UDP_DST_PORT      /* be16 */
+	TCA_FLOWER_KEY_ENC_UDP_DST_PORT_MASK /* be16 */
+
+	TCA_FLOWER_KEY_FLAGS      /* be32 */
+	TCA_FLOWER_KEY_FLAGS_MASK /* be32 */
+
+	TCA_FLOWER_KEY_ICMPV4_CODE      /* u8 */
+	TCA_FLOWER_KEY_ICMPV4_CODE_MASK /* u8 */
+	TCA_FLOWER_KEY_ICMPV4_TYPE      /* u8 */
+	TCA_FLOWER_KEY_ICMPV4_TYPE_MASK /* u8 */
+	TCA_FLOWER_KEY_ICMPV6_CODE      /* u8 */
+	TCA_FLOWER_KEY_ICMPV6_CODE_MASK /* u8 */
+	TCA_FLOWER_KEY_ICMPV6_TYPE      /* u8 */
+	TCA_FLOWER_KEY_ICMPV6_TYPE_MASK /* u8 */
+
+	TCA_FLOWER_KEY_ARP_SIP      /* be32 */
+	TCA_FLOWER_KEY_ARP_SIP_MASK /* be32 */
+	TCA_FLOWER_KEY_ARP_TIP      /* be32 */
+	TCA_FLOWER_KEY_ARP_TIP_MASK /* be32 */
+	TCA_FLOWER_KEY_ARP_OP       /* u8 */
+	TCA_FLOWER_KEY_ARP_OP_MASK  /* u8 */
+	TCA_FLOWER_KEY_ARP_SHA      /* ETH_ALEN */
+	TCA_FLOWER_KEY_ARP_SHA_MASK /* ETH_ALEN */
+	TCA_FLOWER_KEY_ARP_THA      /* ETH_ALEN */
+	TCA_FLOWER_KEY_ARP_THA_MASK /* ETH_ALEN */
+
+	TCA_FLOWER_KEY_MPLS_TTL   /* u8 - 8 bits */
+	TCA_FLOWER_KEY_MPLS_BOS   /* u8 - 1 bit */
+	TCA_FLOWER_KEY_MPLS_TC    /* u8 - 3 bits */
+	TCA_FLOWER_KEY_MPLS_LABEL /* be32 - 20 bits */
+
+	TCA_FLOWER_KEY_TCP_FLAGS      /* be16 */
+	TCA_FLOWER_KEY_TCP_FLAGS_MASK /* be16 */
+
+	TCA_FLOWER_KEY_IP_TOS      /* u8 */
+	TCA_FLOWER_KEY_IP_TOS_MASK /* u8 */
+	TCA_FLOWER_KEY_IP_TTL      /* u8 */
+	TCA_FLOWER_KEY_IP_TTL_MASK /* u8 */
+
+	TCA_FLOWER_KEY_CVLAN_ID       /* be16 */
+	TCA_FLOWER_KEY_CVLAN_PRIO     /* u8   */
+	TCA_FLOWER_KEY_CVLAN_ETH_TYPE /* be16 */
+
+	TCA_FLOWER_KEY_ENC_IP_TOS      /* u8 */
+	TCA_FLOWER_KEY_ENC_IP_TOS_MASK /* u8 */
+	TCA_FLOWER_KEY_ENC_IP_TTL      /* u8 */
+	TCA_FLOWER_KEY_ENC_IP_TTL_MASK /* u8 */
+
+	TCA_FLOWER_KEY_ENC_OPTS
+	TCA_FLOWER_KEY_ENC_OPTS_MASK
+
+	TCA_FLOWER_IN_HW_COUNT
+
+	TCA_FLOWER_KEY_PORT_SRC_MIN /* be16 */
+	TCA_FLOWER_KEY_PORT_SRC_MAX /* be16 */
+	TCA_FLOWER_KEY_PORT_DST_MIN /* be16 */
+	TCA_FLOWER_KEY_PORT_DST_MAX /* be16 */
+
+	__TCA_FLOWER_MAX
+)
+
+const TCA_CLS_FLAGS_SKIP_HW = 1 << 0 /* don't offload filter to HW */
+const TCA_CLS_FLAGS_SKIP_SW = 1 << 1 /* don't use filter in SW */
+
+// struct tc_sfq_qopt {
+// 	unsigned	quantum;	/* Bytes per round allocated to flow */
+// 	int		perturb_period;	/* Period of hash perturbation */
+// 	__u32		limit;		/* Maximal packets in queue */
+// 	unsigned	divisor;	/* Hash divisor  */
+// 	unsigned	flows;		/* Maximal number of flows  */
+// };
+
+type TcSfqQopt struct {
+	Quantum uint32
+	Perturb int32
+	Limit   uint32
+	Divisor uint32
+	Flows   uint32
+}
+
+func (x *TcSfqQopt) Len() int {
+	return SizeofTcSfqQopt
+}
+
+func DeserializeTcSfqQopt(b []byte) *TcSfqQopt {
+	return (*TcSfqQopt)(unsafe.Pointer(&b[0:SizeofTcSfqQopt][0]))
+}
+
+func (x *TcSfqQopt) Serialize() []byte {
+	return (*(*[SizeofTcSfqQopt]byte)(unsafe.Pointer(x)))[:]
+}
+
+//	struct tc_sfqred_stats {
+//		__u32           prob_drop;      /* Early drops, below max threshold */
+//		__u32           forced_drop;	/* Early drops, after max threshold */
+//		__u32           prob_mark;      /* Marked packets, below max threshold */
+//		__u32           forced_mark;    /* Marked packets, after max threshold */
+//		__u32           prob_mark_head; /* Marked packets, below max threshold */
+//		__u32           forced_mark_head;/* Marked packets, after max threshold */
+//	};
+type TcSfqRedStats struct {
+	ProbDrop       uint32
+	ForcedDrop     uint32
+	ProbMark       uint32
+	ForcedMark     uint32
+	ProbMarkHead   uint32
+	ForcedMarkHead uint32
+}
+
+func (x *TcSfqRedStats) Len() int {
+	return SizeofTcSfqRedStats
+}
+
+func DeserializeTcSfqRedStats(b []byte) *TcSfqRedStats {
+	return (*TcSfqRedStats)(unsafe.Pointer(&b[0:SizeofTcSfqRedStats][0]))
+}
+
+func (x *TcSfqRedStats) Serialize() []byte {
+	return (*(*[SizeofTcSfqRedStats]byte)(unsafe.Pointer(x)))[:]
+}
+
+//	struct tc_sfq_qopt_v1 {
+//		struct tc_sfq_qopt v0;
+//		unsigned int	depth;		/* max number of packets per flow */
+//		unsigned int	headdrop;
+//
+// /* SFQRED parameters */
+//
+//	__u32		limit;		/* HARD maximal flow queue length (bytes) */
+//	__u32		qth_min;	/* Min average length threshold (bytes) */
+//	__u32		qth_max;	/* Max average length threshold (bytes) */
+//	unsigned char   Wlog;		/* log(W)		*/
+//	unsigned char   Plog;		/* log(P_max/(qth_max-qth_min))	*/
+//	unsigned char   Scell_log;	/* cell size for idle damping */
+//	unsigned char	flags;
+//	__u32		max_P;		/* probability, high resolution */
+//
+// /* SFQRED stats */
+//
+//		struct tc_sfqred_stats stats;
+//	};
+type TcSfqQoptV1 struct {
+	TcSfqQopt
+	Depth    uint32
+	HeadDrop uint32
+	Limit    uint32
+	QthMin   uint32
+	QthMax   uint32
+	Wlog     byte
+	Plog     byte
+	ScellLog byte
+	Flags    byte
+	MaxP     uint32
+	TcSfqRedStats
+}
+
+func (x *TcSfqQoptV1) Len() int {
+	return SizeofTcSfqQoptV1
+}
+
+func DeserializeTcSfqQoptV1(b []byte) *TcSfqQoptV1 {
+	return (*TcSfqQoptV1)(unsafe.Pointer(&b[0:SizeofTcSfqQoptV1][0]))
+}
+
+func (x *TcSfqQoptV1) Serialize() []byte {
+	return (*(*[SizeofTcSfqQoptV1]byte)(unsafe.Pointer(x)))[:]
+}
+
+// IPProto represents Flower ip_proto attribute
+type IPProto uint8
+
+const (
+	IPPROTO_TCP    IPProto = unix.IPPROTO_TCP
+	IPPROTO_UDP    IPProto = unix.IPPROTO_UDP
+	IPPROTO_SCTP   IPProto = unix.IPPROTO_SCTP
+	IPPROTO_ICMP   IPProto = unix.IPPROTO_ICMP
+	IPPROTO_ICMPV6 IPProto = unix.IPPROTO_ICMPV6
+)
+
+func (i IPProto) Serialize() []byte {
+	arr := make([]byte, 1)
+	arr[0] = byte(i)
+	return arr
+}
+
+func (i IPProto) String() string {
+	switch i {
+	case IPPROTO_TCP:
+		return "tcp"
+	case IPPROTO_UDP:
+		return "udp"
+	case IPPROTO_SCTP:
+		return "sctp"
+	case IPPROTO_ICMP:
+		return "icmp"
+	case IPPROTO_ICMPV6:
+		return "icmpv6"
+	}
+	return fmt.Sprintf("%d", i)
+}
+
+const (
+	MaxOffs        = 128
+	SizeOfPeditSel = 24
+	SizeOfPeditKey = 24
+
+	TCA_PEDIT_KEY_EX_HTYPE = 1
+	TCA_PEDIT_KEY_EX_CMD   = 2
+)
+
+const (
+	TCA_PEDIT_UNSPEC = iota
+	TCA_PEDIT_TM
+	TCA_PEDIT_PARMS
+	TCA_PEDIT_PAD
+	TCA_PEDIT_PARMS_EX
+	TCA_PEDIT_KEYS_EX
+	TCA_PEDIT_KEY_EX
+)
+
+// /* TCA_PEDIT_KEY_EX_HDR_TYPE_NETWROK is a special case for legacy users. It
+//   - means no specific header type - offset is relative to the network layer
+//     */
+type PeditHeaderType uint16
+
+const (
+	TCA_PEDIT_KEY_EX_HDR_TYPE_NETWORK = iota
+	TCA_PEDIT_KEY_EX_HDR_TYPE_ETH
+	TCA_PEDIT_KEY_EX_HDR_TYPE_IP4
+	TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	TCA_PEDIT_KEY_EX_HDR_TYPE_TCP
+	TCA_PEDIT_KEY_EX_HDR_TYPE_UDP
+	__PEDIT_HDR_TYPE_MAX
+)
+
+type PeditCmd uint16
+
+const (
+	TCA_PEDIT_KEY_EX_CMD_SET = 0
+	TCA_PEDIT_KEY_EX_CMD_ADD = 1
+)
+
+type TcPeditSel struct {
+	TcGen
+	NKeys uint8
+	Flags uint8
+}
+
+func DeserializeTcPeditKey(b []byte) *TcPeditKey {
+	return (*TcPeditKey)(unsafe.Pointer(&b[0:SizeOfPeditKey][0]))
+}
+
+func DeserializeTcPedit(b []byte) (*TcPeditSel, []TcPeditKey) {
+	x := &TcPeditSel{}
+	copy((*(*[SizeOfPeditSel]byte)(unsafe.Pointer(x)))[:SizeOfPeditSel], b)
+
+	var keys []TcPeditKey
+
+	next := SizeOfPeditKey
+	var i uint8
+	for i = 0; i < x.NKeys; i++ {
+		keys = append(keys, *DeserializeTcPeditKey(b[next:]))
+		next += SizeOfPeditKey
+	}
+
+	return x, keys
+}
+
+type TcPeditKey struct {
+	Mask    uint32
+	Val     uint32
+	Off     uint32
+	At      uint32
+	OffMask uint32
+	Shift   uint32
+}
+
+type TcPeditKeyEx struct {
+	HeaderType PeditHeaderType
+	Cmd        PeditCmd
+}
+
+type TcPedit struct {
+	Sel    TcPeditSel
+	Keys   []TcPeditKey
+	KeysEx []TcPeditKeyEx
+	Extend uint8
+}
+
+func (p *TcPedit) Encode(parent *RtAttr) {
+	parent.AddRtAttr(TCA_ACT_KIND, ZeroTerminated("pedit"))
+	actOpts := parent.AddRtAttr(TCA_ACT_OPTIONS, nil)
+
+	bbuf := bytes.NewBuffer(make([]byte, 0, int(unsafe.Sizeof(p.Sel)+unsafe.Sizeof(p.Keys))))
+
+	bbuf.Write((*(*[SizeOfPeditSel]byte)(unsafe.Pointer(&p.Sel)))[:])
+
+	for i := uint8(0); i < p.Sel.NKeys; i++ {
+		bbuf.Write((*(*[SizeOfPeditKey]byte)(unsafe.Pointer(&p.Keys[i])))[:])
+	}
+	actOpts.AddRtAttr(TCA_PEDIT_PARMS_EX, bbuf.Bytes())
+
+	exAttrs := actOpts.AddRtAttr(int(TCA_PEDIT_KEYS_EX|NLA_F_NESTED), nil)
+	for i := uint8(0); i < p.Sel.NKeys; i++ {
+		keyAttr := exAttrs.AddRtAttr(int(TCA_PEDIT_KEY_EX|NLA_F_NESTED), nil)
+
+		htypeBuf := make([]byte, 2)
+		cmdBuf := make([]byte, 2)
+
+		NativeEndian().PutUint16(htypeBuf, uint16(p.KeysEx[i].HeaderType))
+		NativeEndian().PutUint16(cmdBuf, uint16(p.KeysEx[i].Cmd))
+
+		keyAttr.AddRtAttr(TCA_PEDIT_KEY_EX_HTYPE, htypeBuf)
+		keyAttr.AddRtAttr(TCA_PEDIT_KEY_EX_CMD, cmdBuf)
+	}
+}
+
+func (p *TcPedit) SetEthDst(mac net.HardwareAddr) {
+	u32 := NativeEndian().Uint32(mac)
+	u16 := NativeEndian().Uint16(mac[4:])
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = u32
+
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = uint32(u16)
+	tKey.Mask = 0xffff0000
+	tKey.Off = 4
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+}
+
+func (p *TcPedit) SetEthSrc(mac net.HardwareAddr) {
+	u16 := NativeEndian().Uint16(mac)
+	u32 := NativeEndian().Uint32(mac[2:])
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = uint32(u16) << 16
+	tKey.Mask = 0x0000ffff
+	tKey.Off = 4
+
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Mask = 0
+	tKey.Off = 8
+
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+}
+
+func (p *TcPedit) SetIPv6Src(ip6 net.IP) {
+	u32 := NativeEndian().Uint32(ip6[:4])
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 8
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[4:8])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 12
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[8:12])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 16
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[12:16])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 20
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+}
+
+func (p *TcPedit) SetDstIP(ip net.IP) {
+	if ip.To4() != nil {
+		p.SetIPv4Dst(ip)
+	} else {
+		p.SetIPv6Dst(ip)
+	}
+}
+
+func (p *TcPedit) SetSrcIP(ip net.IP) {
+	if ip.To4() != nil {
+		p.SetIPv4Src(ip)
+	} else {
+		p.SetIPv6Src(ip)
+	}
+}
+
+func (p *TcPedit) SetIPv6Dst(ip6 net.IP) {
+	u32 := NativeEndian().Uint32(ip6[:4])
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 24
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[4:8])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 28
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[8:12])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 32
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+
+	u32 = NativeEndian().Uint32(ip6[12:16])
+	tKey = TcPeditKey{}
+	tKeyEx = TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 36
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP6
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+
+	p.Sel.NKeys++
+}
+
+func (p *TcPedit) SetIPv4Src(ip net.IP) {
+	u32 := NativeEndian().Uint32(ip.To4())
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 12
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP4
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+}
+
+func (p *TcPedit) SetIPv4Dst(ip net.IP) {
+	u32 := NativeEndian().Uint32(ip.To4())
+
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	tKey.Val = u32
+	tKey.Off = 16
+	tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_IP4
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+}
+
+// SetDstPort only tcp and udp are supported to set port
+func (p *TcPedit) SetDstPort(dstPort uint16, protocol uint8) {
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	switch protocol {
+	case unix.IPPROTO_TCP:
+		tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_TCP
+	case unix.IPPROTO_UDP:
+		tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_UDP
+	default:
+		return
+	}
+
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	tKey.Val = uint32(Swap16(dstPort)) << 16
+	tKey.Mask = 0x0000ffff
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+}
+
+// SetSrcPort only tcp and udp are supported to set port
+func (p *TcPedit) SetSrcPort(srcPort uint16, protocol uint8) {
+	tKey := TcPeditKey{}
+	tKeyEx := TcPeditKeyEx{}
+
+	switch protocol {
+	case unix.IPPROTO_TCP:
+		tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_TCP
+	case unix.IPPROTO_UDP:
+		tKeyEx.HeaderType = TCA_PEDIT_KEY_EX_HDR_TYPE_UDP
+	default:
+		return
+	}
+
+	tKeyEx.Cmd = TCA_PEDIT_KEY_EX_CMD_SET
+
+	tKey.Val = uint32(Swap16(srcPort))
+	tKey.Mask = 0xffff0000
+	p.Keys = append(p.Keys, tKey)
+	p.KeysEx = append(p.KeysEx, tKeyEx)
+	p.Sel.NKeys++
+}

@@ -18,19 +18,21 @@ package ecscni
 
 import (
 	"time"
-
-	"github.com/containernetworking/cni/pkg/types"
 )
 
 const (
-	// ECSVPCENIPluginName is the name of the vpc-eni plugin.
-	ECSVPCENIPluginName = "vpc-eni"
 	// ECSVPCENIPluginExecutable is the name of vpc-eni executable.
 	ECSVPCENIPluginExecutable = "vpc-eni.exe"
 	// TaskHNSNetworkNamePrefix is the prefix of the HNS network used for task ENI.
 	TaskHNSNetworkNamePrefix = "task"
 	// ECSBridgeNetworkName is the name of the HNS network used as ecs-bridge.
 	ECSBridgeNetworkName = "nat"
+	// Starting with CNI plugin v0.8.0 (this PR https://github.com/containernetworking/cni/pull/698)
+	// NetworkName has to be non-empty field for network config.
+	// We do not actually make use of the field, hence passing in a placeholder string to fulfill the API spec
+	defaultNetworkName = "network-name"
+	// DefaultENIName is the name of eni interface name in the container namespace
+	DefaultENIName = "eth0"
 )
 
 var (
@@ -42,26 +44,3 @@ var (
 	setupNSBackoffMultiple = 2.0
 	setupNSMaxRetryCount   = 5
 )
-
-// VPCENIPluginConfig contains all the information required to invoke the vpc-eni plugin.
-type VPCENIPluginConfig struct {
-	// Type is the cni plugin name.
-	Type string `json:"type,omitempty"`
-	// CNIVersion is the cni spec version to use.
-	CNIVersion string `json:"cniVersion,omitempty"`
-	// DNS is used to pass DNS information to the plugin.
-	DNS types.DNS `json:"dns"`
-
-	// ENIName is the name of the eni on the instance.
-	ENIName string `json:"eniName"`
-	// ENIMACAddress is the MAC address of the eni.
-	ENIMACAddress string `json:"eniMACAddress"`
-	// ENIIPAddresses is the is the ipv4 of eni.
-	ENIIPAddresses []string `json:"eniIPAddresses"`
-	// GatewayIPAddresses specifies the IPv4 address of the subnet gateway for the eni.
-	GatewayIPAddresses []string `json:"gatewayIPAddresses"`
-	// UseExistingNetwork specifies if existing network should be used instead of creating a new one.
-	UseExistingNetwork bool `json:"useExistingNetwork"`
-	// BlockIMDS specifies if the IMDS should be blocked for the created endpoint.
-	BlockIMDS bool `json:"blockInstanceMetadata"`
-}

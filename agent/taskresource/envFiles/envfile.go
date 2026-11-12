@@ -23,9 +23,7 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/s3"
 	"github.com/aws/amazon-ecs-agent/agent/s3/factory"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
@@ -33,7 +31,11 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/utils/bufiowrapper"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
 	"github.com/aws/amazon-ecs-agent/agent/utils/oswrapper"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
 
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
@@ -73,6 +75,7 @@ type EnvironmentFileResource struct {
 	s3ClientCreator        factory.S3ClientCreator
 	ioutil                 ioutilwrapper.IOUtil
 	bufio                  bufiowrapper.Bufio
+	ipCompatibility        ipcompatibility.IPCompatibility
 
 	// Fields for the common functionality of task resource. Access to these fields are protected by lock.
 	createdAtUnsafe      time.Time
@@ -87,7 +90,7 @@ type EnvironmentFileResource struct {
 
 // NewEnvironmentFileResource creates a new EnvironmentFileResource object
 func NewEnvironmentFileResource(cluster, taskARN, region, dataDir, containerName string, envfiles []apicontainer.EnvironmentFile,
-	credentialsManager credentials.Manager, executionCredentialsID string) (*EnvironmentFileResource, error) {
+	credentialsManager credentials.Manager, executionCredentialsID string, ipCompatibility ipcompatibility.IPCompatibility) (*EnvironmentFileResource, error) {
 	envfileResource := &EnvironmentFileResource{
 		cluster:                cluster,
 		taskARN:                taskARN,
@@ -99,6 +102,7 @@ func NewEnvironmentFileResource(cluster, taskARN, region, dataDir, containerName
 		s3ClientCreator:        factory.NewS3ClientCreator(),
 		executionCredentialsID: executionCredentialsID,
 		credentialsManager:     credentialsManager,
+		ipCompatibility:        ipCompatibility,
 	}
 
 	taskARNFields := strings.Split(taskARN, "/")
@@ -111,7 +115,9 @@ func NewEnvironmentFileResource(cluster, taskARN, region, dataDir, containerName
 }
 
 // Initialize initializes the EnvironmentFileResource
-func (envfile *EnvironmentFileResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (envfile *EnvironmentFileResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 	envfile.lock.Lock()
@@ -121,6 +127,7 @@ func (envfile *EnvironmentFileResource) Initialize(resourceFields *taskresource.
 	envfile.s3ClientCreator = factory.NewS3ClientCreator()
 	envfile.ioutil = ioutilwrapper.NewIOUtil()
 	envfile.bufio = bufiowrapper.NewBufio()
+	envfile.ipCompatibility = config.InstanceIPCompatibility
 	envfile.lock.Unlock()
 
 	// if task isn't in 'created' status and desired status is 'running',
@@ -202,9 +209,9 @@ func (envfile *EnvironmentFileResource) GetCreatedAt() time.Time {
 	return envfile.createdAtUnsafe
 }
 
-// GetName returns the name fo the resource
+// GetName returns the name of the environment file resource
 func (envfile *EnvironmentFileResource) GetName() string {
-	return ResourceName
+	return ResourceName + "_" + envfile.GetContainerName()
 }
 
 // DesiredTerminal returns true if the resource's desired status is REMOVED
@@ -330,9 +337,38 @@ func (envfile *EnvironmentFileResource) Create() error {
 
 var mkdirAll = os.MkdirAll
 
+// verifyEnvfileKeyLocal ensures that the S3 bucket and object key, once joined
+// onto the task's envfile resource directory, resolve to a location inside that
+// directory. The bucket/key comes from the task definition, so filepath.IsLocal
+// is evaluated on the relative subpath that gets appended to resourceDir.
+// filepath.IsLocal reports whether a path after resolving "..", ".", and
+// separators stays within the directory it is evaluated from, is not absolute,
+// and is not empty. This rejects keys that would resolve outside resourceDir
+// while allowing legitimate nested keys.
+func verifyEnvfileKeyLocal(bucket, key string) error {
+	if !filepath.IsLocal(filepath.Join(bucket, key)) {
+		return errors.Errorf("invalid path: bucket %q key %q escapes envfile resource directory", bucket, key)
+	}
+	return nil
+}
+
+// getEnvfileDownloadPath joins resourceDir, bucket and the S3 key into the local
+// download path after verifying the bucket/key stays confined within resourceDir.
+func (envfile *EnvironmentFileResource) getEnvfileDownloadPath(bucket, key string) (string, error) {
+	if err := verifyEnvfileKeyLocal(bucket, key); err != nil {
+		return "", err
+	}
+	return filepath.Join(envfile.resourceDir, bucket, key), nil
+}
+
 // createEnvfileDirectory creates the directory that we will be writing the
 // envfile to - needs to be called for each different envfile
 func (envfile *EnvironmentFileResource) createEnvfileDirectory(bucket, key string) error {
+	// Ensure the bucket/key stays within the task's resource directory before
+	// creating the directory.
+	if err := verifyEnvfileKeyLocal(bucket, key); err != nil {
+		return err
+	}
 	// create directories to include bucket and key but not the actual resulting file
 	keyDir := filepath.Dir(key)
 	envfileDir := filepath.Join(envfile.resourceDir, bucket, keyDir)
@@ -354,7 +390,7 @@ func (envfile *EnvironmentFileResource) downloadEnvfileFromS3(envFilePath string
 		return
 	}
 
-	s3Client, err := envfile.s3ClientCreator.NewS3ClientForBucket(bucket, envfile.region, iamCredentials)
+	s3Client, err := envfile.s3ClientCreator.NewS3ManagerClient(bucket, envfile.region, iamCredentials, envfile.ipCompatibility)
 	if err != nil {
 		errorEvents <- fmt.Errorf("unable to initialize s3 client for bucket %s, error: %v", bucket, err)
 		return
@@ -368,7 +404,11 @@ func (envfile *EnvironmentFileResource) downloadEnvfileFromS3(envFilePath string
 
 	seelog.Debugf("Downloading envfile with bucket name %v and key name %v", bucket, key)
 	// we save envfiles to path: /var/lib/ecs/data/envfiles/cluster_name/task_id/${s3bucketname}/${s3filename.env}
-	downloadPath := filepath.Join(envfile.resourceDir, bucket, key)
+	downloadPath, err := envfile.getEnvfileDownloadPath(bucket, key)
+	if err != nil {
+		errorEvents <- fmt.Errorf("unable to download env file with key %s from bucket %s, error: %v", key, bucket, err)
+		return
+	}
 	err = envfile.writeEnvFile(func(file oswrapper.File) error {
 		return s3.DownloadFile(bucket, key, s3DownloadTimeout, file, s3Client)
 	}, downloadPath)
@@ -518,7 +558,12 @@ func (envfile *EnvironmentFileResource) convertEnvfileToPath() ([]string, error)
 			return nil, err
 		}
 
-		downloadPath := filepath.Join(envfile.resourceDir, bucket, key)
+		// Ensure the resolved read path stays within resourceDir before opening it.
+		downloadPath, err := envfile.getEnvfileDownloadPath(bucket, key)
+		if err != nil {
+			seelog.Errorf("invalid path in environmentFile %s: %v", envfileObj.Value, err)
+			return nil, err
+		}
 		envfileLocations = append(envfileLocations, downloadPath)
 	}
 
@@ -570,11 +615,11 @@ func (envfile *EnvironmentFileResource) readEnvVarsFromFile(envfilePath string) 
 		// only read the line that has "="
 		if strings.Contains(line, envVariableDelimiter) {
 			variables := strings.SplitN(line, envVariableDelimiter, 2)
-			// verify that there is at least a character on each side
-			if len(variables[0]) > 0 && len(variables[1]) > 0 {
+			// verify that the key is non-empty, the value can be empty
+			if len(variables[0]) > 0 {
 				envVars[variables[0]] = variables[1]
 			} else {
-				seelog.Infof("Not applying line %d of environment file %s, key or value is empty.", lineNum, envfilePath)
+				seelog.Infof("Not applying line %d of environment file %s, key is empty.", lineNum, envfilePath)
 			}
 		}
 	}
@@ -608,4 +653,10 @@ func (envfile *EnvironmentFileResource) BuildContainerDependency(containerName s
 // GetContainerDependencies returns dependent containers for a status
 func (envfile *EnvironmentFileResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// Envfile resource always requires the task execution role credentials, since the only resource type we support is S3.
+func (envfile *EnvironmentFileResource) RequiresExecutionRoleCredentials() bool {
+	return true
 }

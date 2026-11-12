@@ -20,10 +20,12 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
 
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 	"github.com/cihub/seelog"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/pkg/errors"
@@ -42,7 +44,17 @@ func (task *Task) adjustForPlatform(cfg *config.Config) {
 	task.MemoryCPULimitsEnabled = cfg.TaskCPUMemLimit.Enabled()
 }
 
-func (task *Task) initializeCgroupResourceSpec(cgroupPath string, cGroupCPUPeriod time.Duration, resourceFields *taskresource.ResourceFields) error {
+func (task *Task) initializeCgroupResourceSpec(cgroupPath string, cGroupCPUPeriod time.Duration, taskPidsLimit int, resourceFields *taskresource.ResourceFields) error {
+	if !task.MemoryCPULimitsEnabled {
+		if task.CPU > 0 || task.Memory > 0 {
+			// Client-side validation/warning if a task with task-level CPU/memory limits specified somehow lands on an instance
+			// where agent does not support it. These limits will be ignored.
+			logger.Warn("Ignoring task-level CPU/memory limits since agent does not support the TaskCPUMemLimits capability", logger.Fields{
+				field.TaskID: task.GetID(),
+			})
+		}
+		return nil
+	}
 	return nil
 }
 
@@ -61,9 +73,9 @@ func (task *Task) dockerCPUShares(containerCPU uint) int64 {
 	return int64(containerCPU)
 }
 
-// requiresCredentialSpecResource returns true if at least one container in the task
+// requiresAnyCredentialSpecResource returns true if at least one container in the task
 // needs a valid credentialspec resource
-func (task *Task) requiresCredentialSpecResource() bool {
+func (task *Task) requiresAnyCredentialSpecResource() bool {
 	return false
 }
 
@@ -94,8 +106,13 @@ func (task *Task) initializeFSxWindowsFileServerResource(cfg *config.Config, cre
 	return errors.New("task with FSx for Windows File Server volumes is only supported on Windows container instance")
 }
 
-// BuildCNIConfig builds the configuration for the CNI plugins
+// BuildCNIConfigAwsvpc builds the configuration for the CNI plugins
 // On unsupported platforms, we will not support this functionality
-func (task *Task) BuildCNIConfig(includeIPAMConfig bool, cniConfig *ecscni.Config) (*ecscni.Config, error) {
+func (task *Task) BuildCNIConfigAwsvpc(includeIPAMConfig bool, cniConfig *ecscni.Config) (*ecscni.Config, error) {
+	return nil, errors.New("unsupported platform")
+}
+
+// BuildCNIConfigBridgeMode builds a list of CNI network configurations for a task in docker bridge mode.
+func (task *Task) BuildCNIConfigBridgeMode(cniConfig *ecscni.Config, containerName string) (*ecscni.Config, error) {
 	return nil, errors.New("unsupported platform")
 }

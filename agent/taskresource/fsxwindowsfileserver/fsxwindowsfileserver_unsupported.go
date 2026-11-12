@@ -20,14 +20,15 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	asmfactory "github.com/aws/amazon-ecs-agent/agent/asm/factory"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	fsxfactory "github.com/aws/amazon-ecs-agent/agent/fsx/factory"
 	ssmfactory "github.com/aws/amazon-ecs-agent/agent/ssm/factory"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 	"github.com/pkg/errors"
 )
 
@@ -55,7 +56,9 @@ func NewFSxWindowsFileServerResource(
 	return nil, errors.New("not supported")
 }
 
-func (fv *FSxWindowsFileServerResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (fv *FSxWindowsFileServerResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 }
@@ -140,6 +143,20 @@ func (cfg *FSxWindowsFileServerVolumeConfig) Source() string {
 	return "undefined"
 }
 
+func (cfg *FSxWindowsFileServerVolumeConfig) GetType() string {
+	return "undefined"
+}
+
+// Currently not meant for use
+func (cfg *FSxWindowsFileServerVolumeConfig) GetVolumeId() string {
+	return ""
+}
+
+// Currently not meant for use
+func (cfg *FSxWindowsFileServerVolumeConfig) GetVolumeName() string {
+	return ""
+}
+
 // GetName safely returns the name of the resource
 func (fv *FSxWindowsFileServerResource) GetName() string {
 	return "undefined"
@@ -180,4 +197,9 @@ func (fv *FSxWindowsFileServerResource) BuildContainerDependency(containerName s
 
 func (fv *FSxWindowsFileServerResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials
+func (fv *FSxWindowsFileServerResource) RequiresExecutionRoleCredentials() bool {
+	return true
 }

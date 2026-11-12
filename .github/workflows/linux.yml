@@ -1,30 +1,37 @@
 name: Linux
 
-on: [pull_request]
+on: [push, pull_request]
 
+permissions: read-all
 jobs:
   unit-tests:
     name: Linux unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-        with:
-          path: src/github.com/aws/amazon-ecs-agent
-      - name: get GO_VERSION
-        run:  |
-          cd $GITHUB_WORKSPACE/src/github.com/aws/amazon-ecs-agent
-          echo "GO_VERSION=$(cat GO_VERSION)" >> $GITHUB_ENV
-      - uses: actions/setup-go@v2
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           submodules: true
           path: src/github.com/aws/amazon-ecs-agent
+      - name: get GO_VERSION
+        id: get-go-version
+        run:  |
+          cd $GITHUB_WORKSPACE/src/github.com/aws/amazon-ecs-agent
+          set -eou pipefail
+          go_version=$(cat GO_VERSION | tr -d '\n')
+          go_version_length=${#go_version}
+          go_version_re="^([0-9]+\.){1,2}([0-9]+)$"
+          if ! [[ $go_version_length -le 10 && $go_version =~ $go_version_re ]] ; then
+            echo "invalid GO version"
+            exit 1
+          fi
+          echo "GO_VERSION=$go_version" >> $GITHUB_OUTPUT
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.get-go-version.outputs.GO_VERSION }}
       - name: make test
         run: |
+          set -eoux pipefail
           export GOPATH=$GITHUB_WORKSPACE
-          export GO111MODULE=auto
           cd $GITHUB_WORKSPACE/src/github.com/aws/amazon-ecs-agent
           make test-silent
           make analyze-cover-profile

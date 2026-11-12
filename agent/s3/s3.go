@@ -19,8 +19,8 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/pkg/errors"
 )
 
@@ -29,7 +29,7 @@ const (
 )
 
 // DownloadFile downloads a file from s3 and writes it with the writer.
-func DownloadFile(bucket, key string, timeout time.Duration, w io.WriterAt, client S3Client) error {
+func DownloadFile(bucket, key string, timeout time.Duration, w io.WriterAt, client S3ManagerClient) error {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -37,7 +37,7 @@ func DownloadFile(bucket, key string, timeout time.Duration, w io.WriterAt, clie
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	_, err := client.DownloadWithContext(ctx, w, input)
+	_, err := client.Download(ctx, w, input)
 	return err
 }
 
@@ -49,4 +49,25 @@ func ParseS3ARN(s3ARN string) (bucket string, key string, err error) {
 		return "", "", errors.Errorf("invalid s3 arn: %s", s3ARN)
 	}
 	return match[2], match[3], nil
+}
+
+func GetObject(bucket string, key string, client S3Client) (string, error) {
+	requestInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+
+	result, err := client.GetObject(context.TODO(), requestInput)
+	if err != nil {
+		return "", err
+	}
+
+	defer result.Body.Close()
+	resultBody, err := io.ReadAll(result.Body)
+	if err != nil {
+		return "", err
+	}
+	credSpecData := string(resultBody)
+
+	return credSpecData, nil
 }

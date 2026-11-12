@@ -16,37 +16,37 @@ package data
 import (
 	"encoding/json"
 
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
 
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
 )
 
-func (c *client) SaveENIAttachment(eni *apieni.ENIAttachment) error {
-	id, err := utils.GetENIAttachmentId(eni.AttachmentARN)
+func (c *client) SaveENIAttachment(eni *ni.ENIAttachment) error {
+	id, err := utils.GetAttachmentId(eni.AttachmentARN)
 	if err != nil {
 		return errors.Wrap(err, "failed to generate database id")
 	}
-	return c.db.Batch(func(tx *bolt.Tx) error {
+	return c.DB.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(eniAttachmentsBucketName))
-		return putObject(b, id, eni)
+		return c.Accessor.PutObject(b, id, eni)
 	})
 }
 
 func (c *client) DeleteENIAttachment(id string) error {
-	return c.db.Batch(func(tx *bolt.Tx) error {
+	return c.DB.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(eniAttachmentsBucketName))
 		return b.Delete([]byte(id))
 	})
 }
 
-func (c *client) GetENIAttachments() ([]*apieni.ENIAttachment, error) {
-	var eniAttachments []*apieni.ENIAttachment
-	err := c.db.View(func(tx *bolt.Tx) error {
+func (c *client) GetENIAttachments() ([]*ni.ENIAttachment, error) {
+	var eniAttachments []*ni.ENIAttachment
+	err := c.DB.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(eniAttachmentsBucketName))
-		return walk(bucket, func(id string, data []byte) error {
-			eniAttachment := apieni.ENIAttachment{}
+		return c.Accessor.Walk(bucket, func(id string, data []byte) error {
+			eniAttachment := ni.ENIAttachment{}
 			if err := json.Unmarshal(data, &eniAttachment); err != nil {
 				return err
 			}

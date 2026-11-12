@@ -18,7 +18,7 @@ package data
 
 import (
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
 
 	"testing"
 
@@ -34,8 +34,7 @@ const (
 )
 
 func TestManageContainers(t *testing.T) {
-	testClient, cleanup := newTestClient(t)
-	defer cleanup()
+	testClient := newTestClient(t)
 
 	// Test saving a container with SaveDockerContainer and updating it with SaveContainer.
 	testDockerContainer := &apicontainer.DockerContainer{
@@ -43,7 +42,7 @@ func TestManageContainers(t *testing.T) {
 		DockerName: testDockerName,
 		Container: &apicontainer.Container{
 			Name:          testContainerName,
-			TaskARNUnsafe: testTaskArn,
+			TaskARNUnsafe: testTaskArn1,
 		},
 	}
 	require.NoError(t, testClient.SaveDockerContainer(testDockerContainer))
@@ -59,7 +58,7 @@ func TestManageContainers(t *testing.T) {
 	// Test saving a container with SaveContainer.
 	testContainer := &apicontainer.Container{
 		Name:          testContainerName2,
-		TaskARNUnsafe: testTaskArn,
+		TaskARNUnsafe: testTaskArn1,
 	}
 	require.NoError(t, testClient.SaveContainer(testContainer))
 	res, err = testClient.GetContainers()
@@ -75,8 +74,7 @@ func TestManageContainers(t *testing.T) {
 }
 
 func TestSaveContainerInvalidID(t *testing.T) {
-	testClient, cleanup := newTestClient(t)
-	defer cleanup()
+	testClient := newTestClient(t)
 
 	testDockerContainer := &apicontainer.DockerContainer{
 		DockerID:   testDockerID,
@@ -92,7 +90,7 @@ func TestSaveContainerInvalidID(t *testing.T) {
 
 func TestGetContainerID(t *testing.T) {
 	c := &apicontainer.Container{
-		TaskARNUnsafe: testTaskArn,
+		TaskARNUnsafe: testTaskArn1,
 		Name:          testContainerName,
 	}
 	id, err := GetContainerID(c)

@@ -1,0 +1,4171 @@
+//go:build unit
+// +build unit
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"). You may
+// not use this file except in compliance with the License. A copy of the
+// License is located at
+//
+//	http://aws.amazon.com/apache2.0/
+//
+// or in the "license" file accompanying this file. This file is distributed
+// on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+// express or implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	mock_metrics "github.com/aws/amazon-ecs-agent/ecs-agent/metrics/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/fault/v1/types"
+	v2 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v2"
+	state "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v4/state"
+	mock_state "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v4/state/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds/utils/netconfig"
+	mock_execwrapper "github.com/aws/amazon-ecs-agent/ecs-agent/utils/execwrapper/mocks"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/golang/mock/gomock"
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	endpointId         = "endpointId"
+	port               = 1234
+	protocol           = "tcp"
+	trafficType        = "ingress"
+	delayMilliseconds  = 123456789
+	jitterMilliseconds = 4567
+	lossPercent        = 6
+	flowsPercent       = 100
+	taskARN            = "taskArn"
+	awsvpcNetworkMode  = "awsvpc"
+	hostNetworkMode    = "host"
+	deviceName         = "eth0"
+	deviceName2        = "eth1"
+	ipv4Addr           = "10.0.0.1"
+	ipv6Addr           = "2600:1f13:4d9:e602:6aea:cdb1:2b2b:8d62"
+	invalidNetworkMode = "invalid"
+	nspath             = "/some/path"
+	nspathHost         = "host"
+	noNsenterPrefix    = ""
+	// Fault injection tooling errors output
+	iptablesChainNotFoundError                     = "iptables: Bad rule (does a matching rule exist in that chain?)."
+	tcLatencyFaultExistsCommandOutput              = `[{"kind":"netem","handle":"10:","parent":"1:1","options":{"limit":1000,"delay":{"delay":123456789,"jitter":4567,"correlation":0},"ecn":false,"gap":0}}]`
+	tcLatencyFaultWithZeroDelayExistsCommandOutput = `[{"kind":"netem","handle":"10:","parent":"1:1","options":{"limit":1000,"ecn":false,"gap":0}}]`
+	tcLossFaultExistsCommandOutput                 = `[{"kind":"netem","handle":"10:","dev":"eth0","parent":"1:1","options":{"limit":1000,"loss-random":{"loss":0.06,"correlation":0},"ecn":false,"gap":0}}]`
+	tcCommandEmptyOutput                           = `[]`
+	// Common Fault injection JSON responses
+	happyFaultRunningResponse    = `{"Status":"running"}`
+	happyFaultStoppedResponse    = `{"Status":"stopped"}`
+	happyFaultNotRunningResponse = `{"Status":"not-running"}`
+	errorResponse                = `{"Error":"%s"}`
+	taskLookupFailError          = "task lookup failed"
+	missingHostInterfaceError    = "unable to obtain default network interface name on host"
+	jsonStringMarshalError       = "json: cannot unmarshal string into Go struct field %s of type %s"
+	jsonIntMarshalError          = "json: cannot unmarshal number %s into Go struct field %s of type %s"
+	defaultIfaceResolveErr       = "failed to resolve default host network interface"
+)
+
+var (
+	noDeviceNameInNetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName: "",
+		},
+	}
+
+	happyNetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName: deviceName,
+		},
+	}
+
+	happyV4OnlyNetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName:    deviceName,
+			IPV4Addresses: []string{ipv4Addr},
+		},
+	}
+
+	happyV6OnlyNetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName:    deviceName,
+			IPV6Addresses: []string{ipv6Addr},
+		},
+	}
+
+	happyV4V6NetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName:    deviceName,
+			IPV4Addresses: []string{ipv4Addr},
+			IPV6Addresses: []string{ipv6Addr},
+		},
+	}
+
+	happyTwoNetworkInterfaces = []*state.NetworkInterface{
+		{
+			DeviceName:    deviceName,
+			IPV4Addresses: []string{ipv4Addr},
+		},
+		{
+			DeviceName:    deviceName2,
+			IPV6Addresses: []string{ipv6Addr},
+		},
+	}
+
+	happyNetworkNamespaces = []*state.NetworkNamespace{
+		{
+			Path:              nspath,
+			NetworkInterfaces: happyNetworkInterfaces,
+		},
+	}
+
+	happyV4OnlyNetworkNamespaces = []*state.NetworkNamespace{
+		{
+			Path:              nspath,
+			NetworkInterfaces: happyV4OnlyNetworkInterfaces,
+		},
+	}
+
+	happyV6OnlyNetworkNamespaces = []*state.NetworkNamespace{
+		{
+			Path:              nspath,
+			NetworkInterfaces: happyV6OnlyNetworkInterfaces,
+		},
+	}
+
+	happyV4V6NetworkNamespaces = []*state.NetworkNamespace{
+		{
+			Path:              nspath,
+			NetworkInterfaces: happyV4V6NetworkInterfaces,
+		},
+	}
+
+	happyNetworkNamespacesTwoInterfaces = []*state.NetworkNamespace{
+		{
+			Path:              nspathHost,
+			NetworkInterfaces: happyTwoNetworkInterfaces,
+		},
+	}
+
+	noPathInNetworkNamespaces = []*state.NetworkNamespace{
+		{
+			Path:              "",
+			NetworkInterfaces: happyNetworkInterfaces,
+		},
+	}
+
+	happyTaskNetworkConfig = state.TaskNetworkConfig{
+		NetworkMode:       awsvpcNetworkMode,
+		NetworkNamespaces: happyNetworkNamespaces,
+	}
+
+	happyV4OnlyTaskNetworkConfig = state.TaskNetworkConfig{
+		NetworkMode:       awsvpcNetworkMode,
+		NetworkNamespaces: happyV4OnlyNetworkNamespaces,
+	}
+
+	happyV6OnlyTaskNetworkConfig = state.TaskNetworkConfig{
+		NetworkMode:       awsvpcNetworkMode,
+		NetworkNamespaces: happyV6OnlyNetworkNamespaces,
+	}
+
+	happyV4V6TaskNetworkConfig = state.TaskNetworkConfig{
+		NetworkMode:       awsvpcNetworkMode,
+		NetworkNamespaces: happyV4V6NetworkNamespaces,
+	}
+
+	happyTaskNetworkConfigTwoInterfaces = state.TaskNetworkConfig{
+		NetworkMode:       hostNetworkMode,
+		NetworkNamespaces: happyNetworkNamespacesTwoInterfaces,
+	}
+
+	happyTaskResponse = state.TaskResponse{
+		TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+		TaskNetworkConfig:     &happyTaskNetworkConfig,
+		FaultInjectionEnabled: true,
+	}
+
+	happyV4OnlyTaskResponse = state.TaskResponse{
+		TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+		TaskNetworkConfig:     &happyV4OnlyTaskNetworkConfig,
+		FaultInjectionEnabled: true,
+	}
+
+	happyV6OnlyTaskResponse = state.TaskResponse{
+		TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+		TaskNetworkConfig:     &happyV6OnlyTaskNetworkConfig,
+		FaultInjectionEnabled: true,
+	}
+
+	happyV4V6TaskResponse = state.TaskResponse{
+		TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+		TaskNetworkConfig:     &happyV4V6TaskNetworkConfig,
+		FaultInjectionEnabled: true,
+	}
+
+	happyTaskResponseTwoInterfaces = state.TaskResponse{
+		TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+		TaskNetworkConfig:     &happyTaskNetworkConfigTwoInterfaces,
+		FaultInjectionEnabled: true,
+	}
+
+	happyBlackHolePortReqBody = map[string]interface{}{
+		"Port":        port,
+		"Protocol":    protocol,
+		"TrafficType": trafficType,
+	}
+
+	happyNetworkLatencyReqBody = map[string]interface{}{
+		"DelayMilliseconds":  delayMilliseconds,
+		"JitterMilliseconds": jitterMilliseconds,
+		"Sources":            ipSources,
+		"SourcesToFilter":    ipSourcesToFilter,
+	}
+
+	happyNetworkLatencyReqBodyWithZeroDelay = map[string]interface{}{
+		"DelayMilliseconds":  0,
+		"JitterMilliseconds": jitterMilliseconds,
+		"Sources":            ipSources,
+		"SourcesToFilter":    ipSourcesToFilter,
+	}
+
+	happyNetworkPacketLossReqBody = map[string]interface{}{
+		"LossPercent":     lossPercent,
+		"Sources":         ipSources,
+		"SourcesToFilter": ipSourcesToFilter,
+	}
+
+	ipSources = []string{"52.95.154.1", "52.95.154.2", "1:2:3:4::"}
+
+	ipSourcesToFilter = []string{"8.8.8.8", "5:5:5:5::"}
+
+	startNetworkBlackHolePortTestPrefix = fmt.Sprintf(startFaultRequestType, types.BlackHolePortFaultType)
+	stopNetworkBlackHolePortTestPrefix  = fmt.Sprintf(stopFaultRequestType, types.BlackHolePortFaultType)
+	checkNetworkBlackHolePortTestPrefix = fmt.Sprintf(checkStatusFaultRequestType, types.BlackHolePortFaultType)
+	startNetworkLatencyTestPrefix       = fmt.Sprintf(startFaultRequestType, types.LatencyFaultType)
+	stopNetworkLatencyTestPrefix        = fmt.Sprintf(stopFaultRequestType, types.LatencyFaultType)
+	checkNetworkLatencyTestPrefix       = fmt.Sprintf(checkStatusFaultRequestType, types.LatencyFaultType)
+	startNetworkPacketLossTestPrefix    = fmt.Sprintf(startFaultRequestType, types.PacketLossFaultType)
+	stopNetworkPacketLossTestPrefix     = fmt.Sprintf(stopFaultRequestType, types.PacketLossFaultType)
+	checkNetworkPacketLossTestPrefix    = fmt.Sprintf(checkStatusFaultRequestType, types.PacketLossFaultType)
+
+	ctxTimeoutDuration = requestTimeoutSeconds * time.Second
+
+	// Common Task metdata errors
+	taskMetdataFetchFailError      = fmt.Sprintf("Unable to generate metadata for v4 task: '%s'", taskARN)
+	taskMetdataUnknownFailureError = fmt.Sprintf("failed to get task metadata due to internal server error for container: %s", endpointId)
+)
+
+// setStartTCFaultExpectations sets up all mock expectations for start network latency fault
+func setStartTCFaultExpectations(
+	exec *mock_execwrapper.MockExec,
+	ctrl *gomock.Controller,
+	interfaces []string,
+	expectedNetemArguments string,
+	sourcesToFilter []string,
+	sources []string,
+	flowsPercent int,
+	nsenterPrefix string,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+	mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+
+	// Set up context expectations
+	expectations := []*gomock.Call{
+		exec.EXPECT().
+			NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).
+			Return(ctx, cancel),
+	}
+	expectedCommands := []string{}
+
+	// Check existing faults for each interface
+	for _, interfaceName := range interfaces {
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc -j q show dev %s parent 100:1", interfaceName))
+	}
+
+	expectations = addExpectedCommandsWithPrefix(exec, nsenterPrefix, expectedCommands, expectations, mockCMD)
+	expectedCommands = nil
+
+	// Apply netem fault to each interface
+	for _, interfaceName := range interfaces {
+		// root qdisc
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s root handle 1: prio priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+
+		// 2nd layer
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 1:1 handle 10: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+
+		// 3rd layer: need to add 10 qdiscs with 10 bands each, one for each 2nd layer
+		// childHandle = 100:, 101:, 102:, ... 109:
+		// parentHandle = 10:1, 10:2, ... 10:a
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:1 handle 100: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:2 handle 101: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:3 handle 102: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:4 handle 103: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:5 handle 104: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:6 handle 105: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:7 handle 106: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:8 handle 107: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:9 handle 108: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 10:a handle 109: prio bands 10 priomap 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2", interfaceName))
+
+		// Add netem to 3rd layer
+		// This is done at least once so we verify the first call
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc qdisc add dev %s parent 100:1 handle 200: netem %s", interfaceName, expectedNetemArguments))
+		expectations = addExpectedCommandsWithPrefix(exec, nsenterPrefix, expectedCommands, expectations, mockCMD)
+		expectedCommands = nil
+
+		// Then verify that we call exec {flowsPercent} times but with gomock.Any() to avoid repeating application logic
+		for range flowsPercent - 1 {
+			expectations = append(expectations,
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(mockCMD),
+				mockCMD.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil),
+			)
+		}
+
+		// Set up SourcesToFilter expectations
+		for _, source := range sourcesToFilter {
+			if isIPv4(source) {
+				expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 1:0 prio 1 u32 match ip dst %s flowid 1:3", interfaceName, source))
+			} else {
+				expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 1:0 prio 1 u32 match ip6 dst %s flowid 1:3", interfaceName, source))
+			}
+		}
+
+		// Set up Sources expectations
+		for _, source := range sources {
+			if isIPv4(source) {
+				expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 1:0 prio 2 u32 match ip dst %s flowid 1:1", interfaceName, source))
+			} else {
+				expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 1:0 prio 2 u32 match ip6 dst %s flowid 1:1", interfaceName, source))
+			}
+		}
+		// Add 2nd layer hash filter
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 10: handle 1 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 10:1", interfaceName))
+
+		// Add 3rd layer hash filter.
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 100: handle 1 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 100:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 101: handle 2 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 101:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 102: handle 3 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 102:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 103: handle 4 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 103:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 104: handle 5 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 104:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 105: handle 6 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 105:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 106: handle 7 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 106:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 107: handle 8 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 107:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 108: handle 9 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 108:1", interfaceName))
+		expectedCommands = append(expectedCommands, fmt.Sprintf("tc filter add dev %s protocol all parent 109: handle 10 prio 2 flow hash keys src,dst,proto,proto-src,proto-dst divisor 10 baseclass 109:1", interfaceName))
+		expectations = addExpectedCommandsWithPrefix(exec, nsenterPrefix, expectedCommands, expectations, mockCMD)
+		expectedCommands = nil
+	}
+	gomock.InOrder(expectations...)
+}
+
+// Adds exec expectations
+func addExpectedCommandsWithPrefix(exec *mock_execwrapper.MockExec, nsenterPrefix string, expectedCommands []string, expectations []*gomock.Call, mockCMD *mock_execwrapper.MockCmd) []*gomock.Call {
+	for _, expectedCommand := range expectedCommands {
+		if nsenterPrefix != "" {
+			expectedCommand = nsenterPrefix + expectedCommand
+		}
+		expectedCommandSplit := strings.Split(expectedCommand, " ")
+		expectations = append(expectations,
+			exec.EXPECT().CommandContext(gomock.Any(), expectedCommandSplit[0], expectedCommandSplit[1:]).Return(mockCMD),
+			mockCMD.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil),
+		)
+	}
+	return expectations
+}
+
+// setStopTCFaultExpectations sets up all mock expectations for stopping
+// tc based faults - latency and packet loss
+func setStopTCFaultExpectations(
+	exec *mock_execwrapper.MockExec,
+	ctrl *gomock.Controller,
+	interfaces []string,
+	lossExistsCommandOutput string,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+	mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+
+	// Set up context expectations
+	exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+
+	// Check existing fault on each interface
+	expectations := []*gomock.Call{}
+	for _, iface := range interfaces {
+		expectations = append(expectations,
+			exec.EXPECT().
+				CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", iface, "parent", "100:1"}).
+				Return(mockCMD),
+			mockCMD.EXPECT().CombinedOutput().Return([]byte(lossExistsCommandOutput), nil),
+		)
+	}
+	for _, iface := range interfaces {
+		expectations = append(expectations,
+			// Delete netem qdisc
+			exec.EXPECT().
+				CommandContext(gomock.Any(), "tc", []string{"qdisc", "del", "dev", iface, "parent", "1:1", "handle", "10:"}).
+				Return(mockCMD),
+			mockCMD.EXPECT().CombinedOutput().Return([]byte(""), nil),
+
+			// Delete root qdisc
+			exec.EXPECT().
+				CommandContext(gomock.Any(), "tc", []string{"qdisc", "del", "dev", iface, "root", "handle", "1:", "prio"}).
+				Return(mockCMD),
+			mockCMD.EXPECT().CombinedOutput().Return([]byte(""), nil),
+		)
+	}
+	gomock.InOrder(expectations...)
+}
+
+// Helper function to check if an IP address is IPv4
+func isIPv4(ip string) bool {
+	// Simple check - if it contains ':', it's IPv6
+	for i := 0; i < len(ip); i++ {
+		if ip[i] == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+type networkFaultInjectionTestCase struct {
+	name                      string
+	expectedStatusCode        int
+	requestBody               interface{}
+	expectedResponseBody      types.NetworkFaultInjectionResponse
+	setAgentStateExpectations func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient)
+	setExecExpectations       func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller)
+	expectedResponseJSON      string
+}
+
+// Tests the path for Fault Network Faults API
+func TestFaultBlackholeFaultPath(t *testing.T) {
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-blackhole-port/start", NetworkFaultPath(types.BlackHolePortFaultType, types.StartNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-blackhole-port/stop", NetworkFaultPath(types.BlackHolePortFaultType, types.StopNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-blackhole-port/status", NetworkFaultPath(types.BlackHolePortFaultType, types.CheckNetworkFaultPostfix))
+}
+
+func TestFaultLatencyFaultPath(t *testing.T) {
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-latency/start", NetworkFaultPath(types.LatencyFaultType, types.StartNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-latency/stop", NetworkFaultPath(types.LatencyFaultType, types.StopNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-latency/status", NetworkFaultPath(types.LatencyFaultType, types.CheckNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-latency/add-sources", NetworkFaultPath(types.LatencyFaultType, types.AddNetworkFaultPostfix))
+}
+
+func TestFaultPacketLossFaultPath(t *testing.T) {
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-packet-loss/start", NetworkFaultPath(types.PacketLossFaultType, types.StartNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-packet-loss/stop", NetworkFaultPath(types.PacketLossFaultType, types.StopNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-packet-loss/status", NetworkFaultPath(types.PacketLossFaultType, types.CheckNetworkFaultPostfix))
+	assert.Equal(t, "/api/{endpointContainerIDMuxName:[^/]*}/fault/v1/network-packet-loss/add-sources", NetworkFaultPath(types.PacketLossFaultType, types.AddNetworkFaultPostfix))
+}
+
+// testNetworkFaultInjectionCommon will be used by unit tests for all 9 fault injection Network Fault APIs.
+// Unit tests for all 9 APIs interact with the TMDS server and share similar logic.
+// Thus, use a shared base method to reduce duplicated code.
+func testNetworkFaultInjectionCommon(t *testing.T,
+	tcs []networkFaultInjectionTestCase, tmdsEndpoint string,
+) {
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			// Mocks
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			agentState := mock_state.NewMockAgentState(ctrl)
+			metricsFactory := mock_metrics.NewMockEntryFactory(ctrl)
+
+			router := mux.NewRouter()
+			mockExec := mock_execwrapper.NewMockExec(ctrl)
+			handler := New(agentState, metricsFactory, mockExec)
+			networkConfigClient := netconfig.NewNetworkConfigClient()
+
+			if tc.setAgentStateExpectations != nil {
+				tc.setAgentStateExpectations(agentState, networkConfigClient)
+			}
+			if tc.setExecExpectations != nil {
+				tc.setExecExpectations(mockExec, ctrl)
+			}
+
+			var handleMethod func(http.ResponseWriter, *http.Request)
+			var tmdsAPI string
+			switch tmdsEndpoint {
+			case NetworkFaultPath(types.BlackHolePortFaultType, types.StartNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-blackhole-port/start"
+				handleMethod = handler.StartNetworkBlackholePort()
+			case NetworkFaultPath(types.BlackHolePortFaultType, types.StopNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-blackhole-port/stop"
+				handleMethod = handler.StopNetworkBlackHolePort()
+			case NetworkFaultPath(types.BlackHolePortFaultType, types.CheckNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-blackhole-port/status"
+				handleMethod = handler.CheckNetworkBlackHolePort()
+			case NetworkFaultPath(types.LatencyFaultType, types.StartNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-latency/start"
+				handleMethod = handler.StartNetworkLatency()
+			case NetworkFaultPath(types.LatencyFaultType, types.StopNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-latency/stop"
+				handleMethod = handler.StopNetworkLatency()
+			case NetworkFaultPath(types.LatencyFaultType, types.CheckNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-latency/status"
+				handleMethod = handler.CheckNetworkLatency()
+			case NetworkFaultPath(types.PacketLossFaultType, types.StartNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-packet-loss/start"
+				handleMethod = handler.StartNetworkPacketLoss()
+			case NetworkFaultPath(types.PacketLossFaultType, types.StopNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-packet-loss/stop"
+				handleMethod = handler.StopNetworkPacketLoss()
+			case NetworkFaultPath(types.PacketLossFaultType, types.CheckNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-packet-loss/status"
+				handleMethod = handler.CheckNetworkPacketLoss()
+			case NetworkFaultPath(types.LatencyFaultType, types.AddNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-latency/add-sources"
+				handleMethod = handler.AddSourcesNetworkLatency()
+			case NetworkFaultPath(types.PacketLossFaultType, types.AddNetworkFaultPostfix):
+				tmdsAPI = "/api/%s/fault/v1/network-packet-loss/add-sources"
+				handleMethod = handler.AddSourcesNetworkPacketLoss()
+			default:
+				t.Error("Unrecognized TMDS Endpoint")
+			}
+
+			router.HandleFunc(
+				tmdsEndpoint,
+				handleMethod,
+			).Methods(http.MethodPost)
+
+			var requestBody io.Reader
+			if tc.requestBody != nil {
+				reqBodyBytes, err := json.Marshal(tc.requestBody)
+				require.NoError(t, err)
+				requestBody = bytes.NewReader(reqBodyBytes)
+			}
+			req, err := http.NewRequest(http.MethodPost, fmt.Sprintf(tmdsAPI, endpointId), requestBody)
+			require.NoError(t, err)
+
+			// Send the request and record the response
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+
+			// Assert that the response JSON string is as expected.
+			assert.Equal(t, tc.expectedResponseJSON, recorder.Body.String())
+
+			var actualResponseBody types.NetworkFaultInjectionResponse
+			err = json.Unmarshal(recorder.Body.Bytes(), &actualResponseBody)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.expectedStatusCode, recorder.Code)
+			assert.Equal(t, tc.expectedResponseBody, actualResponseBody)
+		})
+	}
+}
+
+func generateCommonNetworkBlackHolePortTestCases(name string) []networkFaultInjectionTestCase {
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s no request body", name),
+			expectedStatusCode:   400,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.MissingRequestBodyError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.MissingRequestBodyError),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":        "incorrect typing",
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkBlackholePortRequest.Port", "uint16")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkBlackholePortRequest.Port", "uint16")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":     port,
+				"Protocol": protocol,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "TrafficType")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "TrafficType")),
+		},
+		{
+			name:               fmt.Sprintf("%s empty value request body", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "TrafficType")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "TrafficType")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid protocol value request body", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    "invalid",
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "invalid", "Protocol")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "invalid", "Protocol")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid traffic type value request body", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": "invalid",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "invalid", "TrafficType")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "invalid", "TrafficType")),
+		},
+		{
+			name:                 fmt.Sprintf("%s task lookup fail", name),
+			expectedStatusCode:   404,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskLookupFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, state.NewErrorLookupFailure(taskLookupFailError)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskLookupFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata fetch fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataFetchFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorMetadataFetchFailure(
+					taskMetdataFetchFailError)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataFetchFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata unknown fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, errors.New("unknown error")).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fault injection disabled", name),
+			expectedStatusCode:   400,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: false,
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+		},
+		{
+			name:                 fmt.Sprintf("%s invalid network mode", name),
+			expectedStatusCode:   400,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode:       invalidNetworkMode,
+						NetworkNamespaces: happyNetworkNamespaces,
+					},
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+		},
+		{
+			name:               fmt.Sprintf("%s empty task network config", name),
+			expectedStatusCode: 500,
+			requestBody:        happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(
+				taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig:     nil,
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:               fmt.Sprintf("%s no task network namespace", name),
+			expectedStatusCode: 500,
+			requestBody:        happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(
+				taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode:       awsvpcNetworkMode,
+						NetworkNamespaces: nil,
+					},
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:               fmt.Sprintf("%s no path in task network config", name),
+			expectedStatusCode: 500,
+			requestBody:        happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(
+				taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode:       awsvpcNetworkMode,
+						NetworkNamespaces: noPathInNetworkNamespaces,
+					},
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:               fmt.Sprintf("%s no device name in task network config", name),
+			expectedStatusCode: 500,
+			requestBody:        happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(
+				taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode: awsvpcNetworkMode,
+						NetworkNamespaces: []*state.NetworkNamespace{
+							{
+								Path:              "/path",
+								NetworkInterfaces: noDeviceNameInNetworkInterfaces,
+							},
+						},
+					},
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:                 "Agent failed to resolve default host network interface",
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(defaultIfaceResolveErr),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterface(nil)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, defaultIfaceResolveErr),
+		},
+		{
+			name:                 fmt.Sprintf("%s request timed out", name),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(requestTimedOutError, name)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), -1*time.Second)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("signal: killed")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, false),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(requestTimedOutError, name)),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata obtain default network interface name fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(missingHostInterfaceError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterfaceName(
+					missingHostInterfaceError)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, missingHostInterfaceError),
+		},
+	}
+	return tcs
+}
+
+func generateStartBlackHolePortFaultTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkBlackHolePortTestCases(startNetworkBlackHolePortTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s success running", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success running v4 only task", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV4OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Fail the chain creation in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("fail the ipv6 table update")),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success running dual stack task", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV4V6TaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Fail the chain creation in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("fail the ipv6 table update")),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success running ipv6 only task", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV6OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s fail with ipv6 table update", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV6OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("fail the ipv6 table update")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:               fmt.Sprintf("%s unknown request body", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+				"Unknown":     "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success already running", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s fail append ACCEPT rule to chain", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fail append DROP rule to chain", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fail insert chain to table", startNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:               "SourcesToFilter validation failure with invalid IP",
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":            port,
+				"Protocol":        protocol,
+				"TrafficType":     trafficType,
+				"SourcesToFilter": aws.StringSlice([]string{"1.2.3.4", "bad"}),
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "bad", "SourcesToFilter")),
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "bad", "SourcesToFilter")),
+		},
+		{
+			name:               "SourcesToFilter validation failure with invalid IPv4",
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":            port,
+				"Protocol":        protocol,
+				"TrafficType":     trafficType,
+				"SourcesToFilter": aws.StringSlice([]string{"1.2.3.4", "1.2.333.3"}),
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "1.2.333.3", "SourcesToFilter")),
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "1.2.333.3", "SourcesToFilter")),
+		},
+		{
+			name:               "SourcesToFilter validation failure with invalid IPv6",
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Port":            port,
+				"Protocol":        protocol,
+				"TrafficType":     trafficType,
+				"SourcesToFilter": aws.StringSlice([]string{"1.2.3.4", "2001::db8::1"}),
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "2001::db8::1", "SourcesToFilter")),
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "2001::db8::1", "SourcesToFilter")),
+		},
+		{
+			name: "TMDS IP is added to SourcesToFilter if needed",
+			requestBody: map[string]interface{}{
+				"Port":        80,
+				"Protocol":    protocol,
+				"TrafficType": "egress",
+			},
+			expectedStatusCode:   200,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-C", "egress-tcp-80",
+						"-p", "tcp", "--dport", "80", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-N", "egress-tcp-80",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to protect TMDS
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "egress-tcp-80",
+						"-p", "tcp", "-d", "169.254.170.2", "--dport", "80", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "egress-tcp-80",
+						"-p", "tcp", "-d", "0.0.0.0/0", "--dport", "80", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-I", "OUTPUT", "-j", "egress-tcp-80",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-N", "egress-tcp-80",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-A", "egress-tcp-80",
+						"-p", "tcp", "-d", "::/0", "--dport", "80", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-I", "OUTPUT", "-j", "egress-tcp-80",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name: "Sources to filter are filtered",
+			requestBody: map[string]interface{}{
+				"Port":        443,
+				"Protocol":    "udp",
+				"TrafficType": "ingress",
+				"SourcesToFilter": []string{
+					"1.2.3.4/20",
+					"8.8.8.8",
+					"2600:1f13:4d9:e611::/64",
+					"2600:1f13:4d9:e611:9009:ac97:1ab4:17d9",
+				},
+			},
+			expectedStatusCode:   200,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// No existing chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-C", "ingress-udp-443",
+						"-p", "udp", "--dport", "443", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					// Create the chain in IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-N", "ingress-udp-443",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to allow packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "1.2.3.4/20", "--dport", "443", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to allow packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "8.8.8.8", "--dport", "443", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "0.0.0.0/0", "--dport", "443", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-I", "INPUT", "-j", "ingress-udp-443",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Create the chain in IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-N", "ingress-udp-443",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to allow packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "2600:1f13:4d9:e611::/64", "--dport", "443", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to allow packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "2600:1f13:4d9:e611:9009:ac97:1ab4:17d9", "--dport", "443", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the rule to drop packets
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "::/0", "--dport", "443", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Insert the chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-I", "INPUT", "-j", "ingress-udp-443",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               "Error when filtering a source",
+			expectedStatusCode: 500,
+			requestBody: map[string]interface{}{
+				"Port":            443,
+				"Protocol":        "udp",
+				"TrafficType":     "ingress",
+				"SourcesToFilter": []string{"1.2.3.4/20"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-A", "ingress-udp-443",
+						"-p", "udp", "-d", "1.2.3.4/20", "--dport", "443", "-j", "ACCEPT",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+	}
+
+	return append(tcs, commonTcs...)
+}
+
+func generateStopBlackHolePortFaultTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkBlackHolePortTestCases(stopNetworkBlackHolePortTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s success running", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// Found existing chain
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-C", "ingress-tcp-1234",
+						"-p", "tcp", "--dport", "1234", "-j", "DROP",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Clear rules in the chain of IPv4
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-F", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Remove the chain from the IPv4 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-D", "INPUT", "-j", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Delete the chain of IPv4
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "iptables", "-w", "5", "-X", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Clear rules in the chain of IPv6
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-F", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Remove the chain from the IPv6 table
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-D", "INPUT", "-j", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					// Delete the chain of IPv6
+					exec.EXPECT().CommandContext(gomock.Any(),
+						"nsenter", "--net=/some/path", "ip6tables", "-w", "5", "-X", "ingress-tcp-1234",
+					).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               fmt.Sprintf("%s success running v4 only task", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV4OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("fail the ipv6 table update")),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               fmt.Sprintf("%s success running v4v6 only task", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV4V6TaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("fail the ipv6 table update")),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               fmt.Sprintf("%s success running v6 only task", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV6OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               fmt.Sprintf("%s unknown request body", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+				"Unknown":     "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success already stopped", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s fail clear chain", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fail delete chain from table", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:               fmt.Sprintf("%s fail with ipv6 table update", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 500,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyV6OnlyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("fail the ipv6 table update")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fail delete chain", stopNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func generateCheckBlackHolePortFaultStatusTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkBlackHolePortTestCases(checkNetworkBlackHolePortTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s success running", checkNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               fmt.Sprintf("%s unknown request body", checkNetworkBlackHolePortTestPrefix),
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Port":        port,
+				"Protocol":    protocol,
+				"TrafficType": trafficType,
+				"Unknown":     "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte{}, nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s success not running", checkNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   200,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(iptablesChainNotFoundError), errors.New("exit status 1")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, true),
+					exec.EXPECT().GetExitCode(gomock.Any()).Times(1).Return(1),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s failure", checkNetworkBlackHolePortTestPrefix),
+			expectedStatusCode:   500,
+			requestBody:          happyBlackHolePortReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponse, nil).
+					Times(1)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				cmdExec := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(cmdExec),
+					cmdExec.EXPECT().CombinedOutput().Times(1).Return([]byte(internalError), errors.New("exit 2")),
+					exec.EXPECT().ConvertToExitError(gomock.Any()).Times(1).Return(nil, false),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+	}
+
+	return append(tcs, commonTcs...)
+}
+
+func TestStartNetworkBlackHolePort(t *testing.T) {
+	tcs := generateStartBlackHolePortFaultTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.BlackHolePortFaultType, types.StartNetworkFaultPostfix))
+}
+
+func TestStopNetworkBlackHolePort(t *testing.T) {
+	tcs := generateStopBlackHolePortFaultTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.BlackHolePortFaultType, types.StopNetworkFaultPostfix))
+}
+
+func TestCheckNetworkBlackHolePort(t *testing.T) {
+	tcs := generateCheckBlackHolePortFaultStatusTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.BlackHolePortFaultType, types.CheckNetworkFaultPostfix))
+}
+
+func generateCommonNetworkLatencyTestCases(name string) []networkFaultInjectionTestCase {
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s task lookup fail", name),
+			expectedStatusCode:   404,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskLookupFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorLookupFailure(taskLookupFailError))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskLookupFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata fetch fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataFetchFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorMetadataFetchFailure(
+					taskMetdataFetchFailError))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataFetchFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata unknown fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, errors.New("unknown error"))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fault injection disabled", name),
+			expectedStatusCode:   400,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: false,
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+		},
+		{
+			name:                 fmt.Sprintf("%s invalid network mode", name),
+			expectedStatusCode:   400,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode:       invalidNetworkMode,
+						NetworkNamespaces: happyNetworkNamespaces,
+					},
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+		},
+		{
+			name:                 fmt.Sprintf("%s empty task network config", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig:     nil,
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:                 "Agent failed to resolve host default network interface",
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(defaultIfaceResolveErr),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterface(nil)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, defaultIfaceResolveErr),
+		},
+		{
+			name:               "failed-to-unmarshal-json",
+			expectedStatusCode: 500,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"Unknown":            "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte("["), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 "request timed out",
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(requestTimedOutError, name)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Do(func(_, _ interface{}) {
+						// Sleep for ctxTimeoutDuration plus 1 second, to make sure the
+						// ctx that we passed to the os/exec execution times out.
+						time.Sleep(ctxTimeoutDuration + 1*time.Second)
+					}).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(requestTimedOutError, name)),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata obtain default network interface name fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(missingHostInterfaceError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterfaceName(
+					missingHostInterfaceError))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, missingHostInterfaceError),
+		},
+	}
+	return tcs
+}
+
+func generateStartNetworkLatencyTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkLatencyTestCases(startNetworkLatencyTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no-existing-fault",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				latencyNetemArguments := fmt.Sprintf("delay %dms %dms", delayMilliseconds, jitterMilliseconds)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, latencyNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "zero-delay",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBodyWithZeroDelay,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				latencyNetemArguments := fmt.Sprintf("delay %dms %dms", 0, jitterMilliseconds)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, latencyNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "no-existing-fault - two interfaces",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				latencyNetemArguments := fmt.Sprintf("delay %dms %dms", delayMilliseconds, jitterMilliseconds)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0", "eth1"}, latencyNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, noNsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultAlreadyRunningError),
+		},
+		{
+			name:                 "existing-network-latency-fault-with-0-delay",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultAlreadyRunningError),
+		},
+		{
+			name:                 "existing-network-packet-loss-fault",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(packetLossFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, packetLossFaultAlreadyRunningError),
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+				"Unknown":            "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				latencyNetemArguments := fmt.Sprintf("delay %dms %dms", delayMilliseconds, jitterMilliseconds)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, latencyNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               "no-existing-fault - valid FlowsPercent",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+				"FlowsPercent":       50,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				latencyNetemArguments := fmt.Sprintf("delay %dms %dms", delayMilliseconds, jitterMilliseconds)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, latencyNetemArguments, ipSourcesToFilter, ipSources, 50, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s no request body", startNetworkLatencyTestPrefix),
+			expectedStatusCode:   400,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.MissingRequestBodyError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.MissingRequestBodyError),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 1", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  "incorrect-field",
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.DelayMilliseconds", "uint64")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.DelayMilliseconds", "uint64")),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            "",
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.Sources", "[]*string")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.Sources", "[]*string")),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 3", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.SourcesToFilter", "[]*string")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkLatencyRequest.SourcesToFilter", "[]*string")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 1", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            []string{},
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 3", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds": delayMilliseconds,
+				"Sources":           []string{},
+				"SourcesToFilter":   []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "JitterMilliseconds")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "JitterMilliseconds")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid delay and jitter", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  0,
+				"JitterMilliseconds": 0,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.ZeroDelayAndJitterError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.ZeroDelayAndJitterError),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid DelayMilliseconds in the request body 1", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  -1,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkLatencyRequest.DelayMilliseconds", "uint64")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkLatencyRequest.DelayMilliseconds", "uint64")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid JitterMilliseconds in the request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": -1,
+				"Sources":            ipSources,
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkLatencyRequest.JitterMilliseconds", "uint64")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkLatencyRequest.JitterMilliseconds", "uint64")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP value in the request body 1", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            []string{"10.1.2.3.4"},
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "10.1.2.3.4", "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "10.1.2.3.4", "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP CIDR block value in the request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            []string{"52.95.154.0/33"},
+				"SourcesToFilter":    []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP CIDR block value in the request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    []string{"52.95.154.0/33"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "SourcesToFilter")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "SourcesToFilter")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 1", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+				"flowsPercent":       101,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "101", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "101", "flowsPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 2", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+				"flowsPercent":       0,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "0", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "0", "flowsPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 3", startNetworkLatencyTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  delayMilliseconds,
+				"JitterMilliseconds": jitterMilliseconds,
+				"Sources":            ipSources,
+				"SourcesToFilter":    ipSourcesToFilter,
+				"flowsPercent":       -1,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "-1", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "-1", "flowsPercent")),
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func generateStopNetworkLatencyTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkLatencyTestCases(stopNetworkLatencyTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no-existing-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-empty-request-payload-two-interfaces",
+			expectedStatusCode:   200,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setStopTCFaultExpectations(exec, ctrl, []string{"eth0", "eth1"}, tcLatencyFaultExistsCommandOutput)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+				)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(2).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(2).Return([]byte(""), nil)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-with-0-delay-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil),
+				)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(2).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(2).Return([]byte(""), nil)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-packet-loss-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault-invalid-request-payload",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  "",
+				"JitterMilliseconds": -1,
+				"Unknown":            "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func generateCheckNetworkLatencyTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkLatencyTestCases(checkNetworkLatencyTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "existing-network-latency-fault-two-interfaces",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				expectations := []*gomock.Call{
+					exec.EXPECT().
+						NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).
+						Return(ctx, cancel),
+				}
+
+				// Check existing fault on each interface
+				for _, iface := range []string{"eth0", "eth1"} {
+					expectations = append(expectations,
+						exec.EXPECT().
+							CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", iface, "parent", "100:1"}).
+							Return(mockCMD),
+						mockCMD.EXPECT().CombinedOutput().Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+					)
+				}
+				gomock.InOrder(expectations...)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "no-existing-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-with-0-delay-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkLatencyReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "existing-network-packet-loss-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault-invalid-request-payload",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"DelayMilliseconds":  "",
+				"JitterMilliseconds": -1,
+				"Unknown":            "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func TestStartNetworkLatency(t *testing.T) {
+	tcs := generateStartNetworkLatencyTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.LatencyFaultType, types.StartNetworkFaultPostfix))
+}
+
+func TestStopNetworkLatency(t *testing.T) {
+	tcs := generateStopNetworkLatencyTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.LatencyFaultType, types.StopNetworkFaultPostfix))
+}
+
+func TestCheckNetworkLatency(t *testing.T) {
+	tcs := generateCheckNetworkLatencyTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.LatencyFaultType, types.CheckNetworkFaultPostfix))
+}
+
+func generateCommonNetworkPacketLossTestCases(name string) []networkFaultInjectionTestCase {
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s task lookup fail", name),
+			expectedStatusCode:   404,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskLookupFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorLookupFailure("task lookup failed"))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskLookupFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata fetch fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataFetchFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorMetadataFetchFailure(
+					taskMetdataFetchFailError))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataFetchFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata unknown fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, errors.New("unknown error"))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fault injection disabled", name),
+			expectedStatusCode:   400,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: false,
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+		},
+		{
+			name:                 fmt.Sprintf("%s invalid network mode", name),
+			expectedStatusCode:   400,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig: &state.TaskNetworkConfig{
+						NetworkMode:       invalidNetworkMode,
+						NetworkNamespaces: happyNetworkNamespaces,
+					},
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(invalidNetworkModeError, invalidNetworkMode)),
+		},
+		{
+			name:                 fmt.Sprintf("%s empty task network config", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskMetdataUnknownFailureError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: true,
+					TaskNetworkConfig:     nil,
+				}, nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskMetdataUnknownFailureError),
+		},
+		{
+			name:               "failed-to-unmarshal-json",
+			expectedStatusCode: 500,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"Unknown":         "",
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte("["), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			name:                 "Agent failed to resolve host default network interface",
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(defaultIfaceResolveErr),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterface(nil)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, defaultIfaceResolveErr),
+		},
+		{
+			name:                 "request timed out",
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(requestTimedOutError, name)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Do(func(_, _ interface{}) {
+						// Sleep for ctxTimeoutDuration plus 1 second, to make sure the
+						// ctx that we passed to the os/exec execution times out.
+						time.Sleep(ctxTimeoutDuration + 1*time.Second)
+					}).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(requestTimedOutError, name)),
+		},
+		{
+			name:                 fmt.Sprintf("%s task metadata obtain default network interface name fail", name),
+			expectedStatusCode:   500,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(missingHostInterfaceError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, state.NewErrorDefaultNetworkInterfaceName(
+					missingHostInterfaceError))
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, missingHostInterfaceError),
+		},
+	}
+	return tcs
+}
+
+func generateStartNetworkPacketLossTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkPacketLossTestCases(startNetworkPacketLossTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no-existing-fault - two interfaces",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				packetLossNetemArguments := fmt.Sprintf("loss %d%%", lossPercent)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0", "eth1"}, packetLossNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, noNsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "no-existing-fault",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				packetLossNetemArguments := fmt.Sprintf("loss %d%%", lossPercent)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, packetLossNetemArguments, ipSourcesToFilter, ipSources, flowsPercent, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultAlreadyRunningError),
+		},
+		{
+			name:                 "existing-network-latency-fault-with-0-delay",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultAlreadyRunningError),
+		},
+		{
+			name:                 "existing-network-packet-loss-fault",
+			expectedStatusCode:   409,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(packetLossFaultAlreadyRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, packetLossFaultAlreadyRunningError),
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault-no-allowlist-filter",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+				"Unknown":         "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				packetLossNetemArguments := fmt.Sprintf("loss %d%%", lossPercent)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, packetLossNetemArguments, []string{}, ipSources, flowsPercent, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               "no-existing-fault - valid FlowsPercent",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": ipSourcesToFilter,
+				"FlowsPercent":    50,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				lossNetemArguments := fmt.Sprintf("loss %d%%", lossPercent)
+				nsenterPrefix := fmt.Sprintf("nsenter --net=%s ", nspath)
+				setStartTCFaultExpectations(exec, ctrl, []string{"eth0"}, lossNetemArguments, ipSourcesToFilter, ipSources, 50, nsenterPrefix)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 fmt.Sprintf("%s no request body", startNetworkPacketLossTestPrefix),
+			expectedStatusCode:   400,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.MissingRequestBodyError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.MissingRequestBodyError),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 1", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     "incorrect-field",
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.LossPercent", "uint64")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.LossPercent", "uint64")),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 2", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         "",
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.Sources", "[]*string")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.Sources", "[]*string")),
+		},
+		{
+			name:               fmt.Sprintf("%s malformed request body 3", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.SourcesToFilter", "[]*string")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonStringMarshalError, "NetworkPacketLossRequest.SourcesToFilter", "[]*string")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 1", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         []string{},
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 2", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s incomplete request body 3", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.MissingRequiredFieldError, "LossPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.MissingRequiredFieldError, "LossPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid LossPercent in the request body 1", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     -1,
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkPacketLossRequest.LossPercent", "uint64")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(jsonIntMarshalError, "-1", "NetworkPacketLossRequest.LossPercent", "uint64")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid LossPercent in the request body 2", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     101,
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "101", "LossPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "101", "LossPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid LossPercent in the request body 3", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     0,
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "0", "LossPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "0", "LossPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP value in the request body 1", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         []string{"10.1.2.3.4"},
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "10.1.2.3.4", "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "10.1.2.3.4", "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP CIDR block value in the request body 2", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         []string{"52.95.154.0/33"},
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid IP CIDR block value in the request body 3", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": []string{"52.95.154.0/33"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "SourcesToFilter")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "52.95.154.0/33", "SourcesToFilter")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 1", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": ipSourcesToFilter,
+				"flowsPercent":    101,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "101", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "101", "flowsPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 2", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": ipSourcesToFilter,
+				"flowsPercent":    0,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "0", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "0", "flowsPercent")),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid flowsPercent in the request body 3", startNetworkPacketLossTestPrefix),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"LossPercent":     lossPercent,
+				"Sources":         ipSources,
+				"SourcesToFilter": ipSourcesToFilter,
+				"flowsPercent":    -1,
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "-1", "flowsPercent")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{}, nil).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "-1", "flowsPercent")),
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func generateStopNetworkPacketLossTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkPacketLossTestCases(stopNetworkPacketLossTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no-existing-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-packet-loss-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil),
+				)
+				exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(2).Return(mockCMD)
+				mockCMD.EXPECT().CombinedOutput().Times(2).Return([]byte(""), nil)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:                 "existing-network-packet-loss-fault-empty-request-payload-two-interfaces",
+			expectedStatusCode:   200,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setStopTCFaultExpectations(exec, ctrl, []string{"eth0", "eth1"}, tcLossFaultExistsCommandOutput)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault-invalid-request-payload",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"LossPercent": -1,
+				"Sources":     "",
+				"Unknown":     "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("stopped"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultStoppedResponse,
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func generateCheckNetworkPacketLossTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonNetworkPacketLossTestCases(checkNetworkPacketLossTestPrefix)
+	tcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "existing-network-packet-loss-fault-two-interfaces",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				expectations := []*gomock.Call{
+					exec.EXPECT().
+						NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).
+						Return(ctx, cancel),
+				}
+
+				// Check existing fault on each interface
+				for _, iface := range []string{"eth0", "eth1"} {
+					expectations = append(expectations,
+						exec.EXPECT().
+							CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", iface, "parent", "100:1"}).
+							Return(mockCMD),
+						mockCMD.EXPECT().CombinedOutput().Return([]byte(tcLossFaultExistsCommandOutput), nil),
+					)
+				}
+				gomock.InOrder(expectations...)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "no-existing-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:                 "existing-network-latency-fault-with-0-delay-happy-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          happyNetworkPacketLossReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+		{
+			name:                 "existing-network-packet-loss-fault-empty-request-payload",
+			expectedStatusCode:   200,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               "unknown-request-body-no-existing-fault-invalid-request-payload",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"LossPercent": -1,
+				"Sources":     "",
+				"Unknown":     "",
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("not-running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: happyFaultNotRunningResponse,
+		},
+	}
+	return append(tcs, commonTcs...)
+}
+
+func TestStartNetworkPacketLoss(t *testing.T) {
+	tcs := generateStartNetworkPacketLossTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.PacketLossFaultType, types.StartNetworkFaultPostfix))
+}
+
+func TestStopNetworkPacketLoss(t *testing.T) {
+	tcs := generateStopNetworkPacketLossTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.PacketLossFaultType, types.StopNetworkFaultPostfix))
+}
+
+func TestCheckNetworkPacketLoss(t *testing.T) {
+	tcs := generateCheckNetworkPacketLossTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.PacketLossFaultType, types.CheckNetworkFaultPostfix))
+}
+
+// TestIsIPv6OnlyTask does focused testing for isIPv6OnlyTask function.
+func TestIsIPv6OnlyTask(t *testing.T) {
+	tests := []struct {
+		name     string
+		task     *state.TaskResponse
+		expected bool
+	}{
+		{
+			name:     "IPv6-only single interface",
+			task:     &happyV6OnlyTaskResponse,
+			expected: true,
+		},
+		{
+			name:     "IPv4-only single interface",
+			task:     &happyV4OnlyTaskResponse,
+			expected: false,
+		},
+		{
+			name:     "Dual-stack single interface",
+			task:     &happyV4V6TaskResponse,
+			expected: false,
+		},
+		{
+			name:     "Multiple interfaces",
+			task:     &happyTaskResponseTwoInterfaces,
+			expected: false,
+		},
+		{
+			name: "Single interface with no addresses",
+			task: &state.TaskResponse{
+				TaskNetworkConfig: &state.TaskNetworkConfig{
+					NetworkMode: awsvpcNetworkMode,
+					NetworkNamespaces: []*state.NetworkNamespace{
+						{
+							Path: nspath,
+							NetworkInterfaces: []*state.NetworkInterface{
+								{
+									DeviceName: deviceName,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := isIPv6OnlyTask(tc.task)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+// TestCheckTCFault does focused testing for CheckTCFault function.
+func TestCheckTCFault(t *testing.T) {
+	createTestTaskMetadata := func(deviceNames []string) *state.TaskResponse {
+		interfaces := make([]*state.NetworkInterface, len(deviceNames))
+		for i, name := range deviceNames {
+			interfaces[i] = &state.NetworkInterface{
+				DeviceName: name,
+			}
+		}
+
+		return &state.TaskResponse{
+			TaskResponse: &v2.TaskResponse{TaskARN: "test-task"},
+			TaskNetworkConfig: &state.TaskNetworkConfig{
+				NetworkMode: "host",
+				NetworkNamespaces: []*state.NetworkNamespace{
+					{
+						Path:              "host",
+						NetworkInterfaces: interfaces,
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name                string
+		deviceNames         []string
+		expectedLatency     bool
+		expectedPacketLoss  bool
+		expectedError       error
+		commandExpectations func(*mock_execwrapper.MockExec, *mock_execwrapper.MockCmd)
+	}{
+		{
+			name:               "No faults exist",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    false,
+			expectedPacketLoss: false,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil)
+			},
+		},
+		{
+			name:               "Latency fault exists",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    true,
+			expectedPacketLoss: false,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcLatencyFaultExistsCommandOutput), nil)
+			},
+		},
+		{
+			name:               "Latency fault with 0 delay exists",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    true,
+			expectedPacketLoss: false,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcLatencyFaultWithZeroDelayExistsCommandOutput), nil)
+			},
+		},
+		{
+			name:               "Packet loss fault exists",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    false,
+			expectedPacketLoss: true,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcLossFaultExistsCommandOutput), nil)
+			},
+		},
+		{
+			name:               "Command execution error",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    false,
+			expectedPacketLoss: false,
+			expectedError:      errors.New("failed to check existing network fault: 'tc -j q show dev eth0 parent 100:1' command failed with the following error: 'command failed'. std output: ''. TaskArn: test-task"),
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(""), errors.New("command failed"))
+			},
+		},
+		{
+			name:               "Invalid JSON output",
+			deviceNames:        []string{"eth0"},
+			expectedLatency:    false,
+			expectedPacketLoss: false,
+			expectedError:      errors.New("failed to check existing network fault: failed to unmarshal tc command output: invalid character 'i' looking for beginning of value. TaskArn: test-task"),
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte("invalid json"), nil)
+			},
+		},
+		{
+			name:               "Multiple network interfaces - no faults",
+			deviceNames:        []string{"eth0", "eth1"},
+			expectedLatency:    false,
+			expectedPacketLoss: false,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				// First interface check
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil)
+
+				// Second interface check
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth1", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil)
+			},
+		},
+		{
+			name:               "Multiple network interfaces - latency fault on second interface",
+			deviceNames:        []string{"eth0", "eth1"},
+			expectedLatency:    true,
+			expectedPacketLoss: false,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				// First interface check - no fault
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil)
+
+				// Second interface check - has fault
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth1", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcLatencyFaultExistsCommandOutput), nil)
+			},
+		},
+		{
+			name:               "Multiple network interfaces - packet loss fault on second interface",
+			deviceNames:        []string{"eth0", "eth1"},
+			expectedLatency:    false,
+			expectedPacketLoss: true,
+			expectedError:      nil,
+			commandExpectations: func(exec *mock_execwrapper.MockExec, cmd *mock_execwrapper.MockCmd) {
+				// First interface check - no fault
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth0", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcCommandEmptyOutput), nil)
+
+				// Second interface check - has fault
+				exec.EXPECT().CommandContext(gomock.Any(), "tc", []string{"-j", "q", "show", "dev", "eth1", "parent", "100:1"}).Return(cmd)
+				cmd.EXPECT().CombinedOutput().Return([]byte(tcLossFaultExistsCommandOutput), nil)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockExec := mock_execwrapper.NewMockExec(ctrl)
+			mockCmd := mock_execwrapper.NewMockCmd(ctrl)
+
+			handler := &FaultHandler{
+				osExecWrapper: mockExec,
+			}
+
+			tc.commandExpectations(mockExec, mockCmd)
+
+			taskMetadata := createTestTaskMetadata(tc.deviceNames)
+			latencyExists, packetLossExists, err := handler.checkTCFault(context.Background(), taskMetadata)
+
+			if tc.expectedError != nil {
+				assert.EqualError(t, err, tc.expectedError.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, tc.expectedLatency, latencyExists)
+			assert.Equal(t, tc.expectedPacketLoss, packetLossExists)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Add-sources tests (network-latency and network-packet-loss)
+// ---------------------------------------------------------------------------
+
+var (
+	happyAddSourcesReqBody = map[string]interface{}{
+		"Sources":         []string{"203.0.113.10", "203.0.113.11"},
+		"SourcesToFilter": []string{"10.0.0.2"},
+	}
+
+	addSourcesNetworkLatencyTestPrefix    = fmt.Sprintf(addSourcesFaultRequestType, types.LatencyFaultType)
+	addSourcesNetworkPacketLossTestPrefix = fmt.Sprintf(addSourcesFaultRequestType, types.PacketLossFaultType)
+)
+
+// setAddSourcesExpectations wires up the canonical happy-path exec mocks for
+// an add-sources call: one context setup, one checkTCFault call per interface
+// returning `checkOutput`, then the allowlist and impaired tc filter add
+// commands for each (interface, ip) pair.
+func setAddSourcesExpectations(
+	exec *mock_execwrapper.MockExec,
+	ctrl *gomock.Controller,
+	interfaces []string,
+	checkOutput string,
+	sourcesToFilter []string,
+	sources []string,
+	nsenterPrefix string,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+	mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+
+	expectations := []*gomock.Call{
+		exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+	}
+
+	// checkTCFault runs once per interface.
+	checkCommands := make([]string, 0, len(interfaces))
+	for _, iface := range interfaces {
+		checkCommands = append(checkCommands, fmt.Sprintf("tc -j q show dev %s parent 100:1", iface))
+	}
+	expectations = addExpectedCommandsWithOutput(exec, nsenterPrefix, checkCommands, expectations, mockCMD, checkOutput)
+
+	// For each interface, install SourcesToFilter (prio 1, allowlist) then
+	// Sources (prio 2, impaired). Matches addSourcesToFault's ordering.
+	for _, iface := range interfaces {
+		filterCommands := []string{}
+		for _, src := range sourcesToFilter {
+			proto := ip4
+			if !isIPv4(src) {
+				proto = ip6
+			}
+			filterCommands = append(filterCommands, fmt.Sprintf(
+				"tc filter add dev %s protocol all parent 1:0 prio 1 u32 match %s dst %s flowid 1:3",
+				iface, proto, src))
+		}
+		for _, src := range sources {
+			proto := ip4
+			if !isIPv4(src) {
+				proto = ip6
+			}
+			filterCommands = append(filterCommands, fmt.Sprintf(
+				"tc filter add dev %s protocol all parent 1:0 prio 2 u32 match %s dst %s flowid 1:1",
+				iface, proto, src))
+		}
+		expectations = addExpectedCommandsWithOutput(exec, nsenterPrefix, filterCommands, expectations, mockCMD, "")
+	}
+
+	gomock.InOrder(expectations...)
+}
+
+// addExpectedCommandsWithOutput is a variant of addExpectedCommandsWithPrefix
+// that lets the caller control the CombinedOutput bytes per command batch.
+// The existing helper hardcodes tcCommandEmptyOutput which does not fit the
+// add-sources check-then-apply flow.
+func addExpectedCommandsWithOutput(
+	exec *mock_execwrapper.MockExec, nsenterPrefix string, commands []string,
+	expectations []*gomock.Call, mockCMD *mock_execwrapper.MockCmd, output string,
+) []*gomock.Call {
+	for _, cmd := range commands {
+		if nsenterPrefix != "" {
+			cmd = nsenterPrefix + cmd
+		}
+		parts := strings.Split(cmd, " ")
+		expectations = append(expectations,
+			exec.EXPECT().CommandContext(gomock.Any(), parts[0], parts[1:]).Return(mockCMD),
+			mockCMD.EXPECT().CombinedOutput().Return([]byte(output), nil),
+		)
+	}
+	return expectations
+}
+
+// generateCommonAddSourcesTestCases returns test cases that exercise the
+// validation layer shared by both add-sources endpoints (latency, packet loss)
+// and the task metadata error paths.
+func generateCommonAddSourcesTestCases(name, notRunningErr string) []networkFaultInjectionTestCase {
+	return []networkFaultInjectionTestCase{
+		{
+			name:                 fmt.Sprintf("%s no request body", name),
+			expectedStatusCode:   400,
+			requestBody:          nil,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.MissingRequestBodyError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.MissingRequestBodyError),
+		},
+		{
+			name:               fmt.Sprintf("%s both lists empty", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Sources":         []string{},
+				"SourcesToFilter": []string{},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(types.AddSourcesEmptyError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, types.AddSourcesEmptyError),
+		},
+		{
+			name:               fmt.Sprintf("%s exceeds max IPs", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Sources": func() []string {
+					s := make([]string, 17)
+					for i := range s {
+						s[i] = fmt.Sprintf("10.0.0.%d", i+1)
+					}
+					return s
+				}(),
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.AddSourcesTooManyIPsError, 17, types.AddSourcesMaxIPs)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.AddSourcesTooManyIPsError, 17, types.AddSourcesMaxIPs)),
+		},
+		{
+			name:               fmt.Sprintf("%s invalid ip rejected", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Sources": []string{"not-an-ip"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.InvalidValueError, "not-an-ip", "Sources")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.InvalidValueError, "not-an-ip", "Sources")),
+		},
+		{
+			name:               fmt.Sprintf("%s overlap rejected", name),
+			expectedStatusCode: 400,
+			requestBody: map[string]interface{}{
+				"Sources":         []string{"1.2.3.4"},
+				"SourcesToFilter": []string{"1.2.3.4"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(types.AddSourcesOverlapError, "1.2.3.4")),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Times(0)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(types.AddSourcesOverlapError, "1.2.3.4")),
+		},
+		{
+			name:                 fmt.Sprintf("%s task lookup fail", name),
+			expectedStatusCode:   404,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(taskLookupFailError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(state.TaskResponse{}, state.NewErrorLookupFailure(taskLookupFailError)).
+					Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, taskLookupFailError),
+		},
+		{
+			name:                 fmt.Sprintf("%s fault injection disabled", name),
+			expectedStatusCode:   400,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(state.TaskResponse{
+					TaskResponse:          &v2.TaskResponse{TaskARN: taskARN},
+					FaultInjectionEnabled: false,
+				}, nil).Times(1)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(faultInjectionEnabledError, taskARN)),
+		},
+	}
+}
+
+func generateAddSourcesNetworkLatencyTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonAddSourcesTestCases(addSourcesNetworkLatencyTestPrefix, latencyFaultNotRunningError)
+	specificTcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no fault running returns 404",
+			expectedStatusCode:   404,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultNotRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultNotRunningError),
+		},
+		{
+			// Design calls this out explicitly: latency add-sources must only
+			// honor the latency flag. A running packet-loss fault does not
+			// satisfy the latency endpoint.
+			name:                 "packet-loss running but not latency returns 404",
+			expectedStatusCode:   404,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(latencyFaultNotRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLossFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, latencyFaultNotRunningError),
+		},
+		{
+			name:                 "latency running, single interface, happy",
+			expectedStatusCode:   200,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{deviceName}, tcLatencyFaultExistsCommandOutput,
+					[]string{"10.0.0.2"}, []string{"203.0.113.10", "203.0.113.11"},
+					fmt.Sprintf(nsenterCommandString, nspath))
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			// IPv6 and dual-stack sources flow through the same v4/v6 switch
+			// in addIPAddressesToFilter; this test pins the tc filter command
+			// shape to "match ip6 dst <addr>" for v6 entries.
+			name:               "latency running, dual-stack add-sources, happy",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Sources":         []string{"203.0.113.10", "2001:db8::1"},
+				"SourcesToFilter": []string{"10.0.0.2", "2001:db8:1::/48"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{deviceName}, tcLatencyFaultExistsCommandOutput,
+					[]string{"10.0.0.2", "2001:db8:1::/48"},
+					[]string{"203.0.113.10", "2001:db8::1"},
+					fmt.Sprintf(nsenterCommandString, nspath))
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "latency running, two interfaces (host mode), happy",
+			expectedStatusCode:   200,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().
+					GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).
+					Return(happyTaskResponseTwoInterfaces, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				// host mode does not add nsenter prefix.
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{"eth0", "eth1"}, tcLatencyFaultExistsCommandOutput,
+					[]string{"10.0.0.2"}, []string{"203.0.113.10", "203.0.113.11"},
+					"")
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:                 "tc filter add fails returns 500",
+			expectedStatusCode:   500,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// checkTCFault returns "latency running"
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+					// First filter add fails (simulating the kernel rejecting a dup filter).
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte("RTNETLINK answers: File exists"), errors.New("exit status 2")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			// checkTCFault returning a non-timeout error must surface as 500
+			// "internal error", not as a 404 (the zero values of the returned
+			// flags would otherwise route the request into the "not running"
+			// branch).
+			name:                 "checkTCFault error returns 500",
+			expectedStatusCode:   500,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(internalError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					// Non-parseable output + non-nil error from the tc show
+					// command makes checkTCFault return an error while the
+					// context is still alive.
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte("boom"), errors.New("exit status 1")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, internalError),
+		},
+		{
+			// Context deadline exceeded during checkTCFault must map to the
+			// request-timed-out 500, not the generic internal-error 500.
+			name:                 "checkTCFault deadline exceeded returns 500 timed out",
+			expectedStatusCode:   500,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(fmt.Sprintf(requestTimedOutError, addSourcesNetworkLatencyTestPrefix)),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				// A negative timeout yields a context whose Err() is already
+				// DeadlineExceeded, matching how the existing request-timed-out
+				// tests in this file simulate the deadline branch.
+				ctx, cancel := context.WithTimeout(context.Background(), -1*time.Second)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte{}, errors.New("signal: killed")),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, fmt.Sprintf(requestTimedOutError, addSourcesNetworkLatencyTestPrefix)),
+		},
+	}
+	return append(specificTcs, commonTcs...)
+}
+
+func generateAddSourcesNetworkPacketLossTestCases() []networkFaultInjectionTestCase {
+	commonTcs := generateCommonAddSourcesTestCases(addSourcesNetworkPacketLossTestPrefix, packetLossFaultNotRunningError)
+	specificTcs := []networkFaultInjectionTestCase{
+		{
+			name:                 "no fault running returns 404",
+			expectedStatusCode:   404,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(packetLossFaultNotRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcCommandEmptyOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, packetLossFaultNotRunningError),
+		},
+		{
+			name:                 "latency running but not packet-loss returns 404",
+			expectedStatusCode:   404,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionErrorResponse(packetLossFaultNotRunningError),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				ctx, cancel := context.WithTimeout(context.Background(), ctxTimeoutDuration)
+				mockCMD := mock_execwrapper.NewMockCmd(ctrl)
+				gomock.InOrder(
+					exec.EXPECT().NewExecContextWithTimeout(gomock.Any(), gomock.Any()).Times(1).Return(ctx, cancel),
+					exec.EXPECT().CommandContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(mockCMD),
+					mockCMD.EXPECT().CombinedOutput().Times(1).Return([]byte(tcLatencyFaultExistsCommandOutput), nil),
+				)
+			},
+			expectedResponseJSON: fmt.Sprintf(errorResponse, packetLossFaultNotRunningError),
+		},
+		{
+			name:                 "packet-loss running, single interface, happy",
+			expectedStatusCode:   200,
+			requestBody:          happyAddSourcesReqBody,
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{deviceName}, tcLossFaultExistsCommandOutput,
+					[]string{"10.0.0.2"}, []string{"203.0.113.10", "203.0.113.11"},
+					fmt.Sprintf(nsenterCommandString, nspath))
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			// IPv6 and dual-stack sources flow through the same v4/v6 switch
+			// in addIPAddressesToFilter; this test pins the tc filter command
+			// shape to "match ip6 dst <addr>" for v6 entries.
+			name:               "packet-loss running, dual-stack add-sources, happy",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Sources":         []string{"203.0.113.10", "2001:db8::1"},
+				"SourcesToFilter": []string{"10.0.0.2", "2001:db8:1::/48"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{deviceName}, tcLossFaultExistsCommandOutput,
+					[]string{"10.0.0.2", "2001:db8:1::/48"},
+					[]string{"203.0.113.10", "2001:db8::1"},
+					fmt.Sprintf(nsenterCommandString, nspath))
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+		{
+			name:               "Sources only (no SourcesToFilter), happy",
+			expectedStatusCode: 200,
+			requestBody: map[string]interface{}{
+				"Sources": []string{"203.0.113.10"},
+			},
+			expectedResponseBody: types.NewNetworkFaultInjectionSuccessResponse("running"),
+			setAgentStateExpectations: func(agentState *mock_state.MockAgentState, netConfigClient *netconfig.NetworkConfigClient) {
+				agentState.EXPECT().GetTaskMetadataWithTaskNetworkConfig(endpointId, netConfigClient).Return(happyTaskResponse, nil)
+			},
+			setExecExpectations: func(exec *mock_execwrapper.MockExec, ctrl *gomock.Controller) {
+				setAddSourcesExpectations(exec, ctrl,
+					[]string{deviceName}, tcLossFaultExistsCommandOutput,
+					nil, []string{"203.0.113.10"},
+					fmt.Sprintf(nsenterCommandString, nspath))
+			},
+			expectedResponseJSON: happyFaultRunningResponse,
+		},
+	}
+	return append(specificTcs, commonTcs...)
+}
+
+func TestAddSourcesNetworkLatency(t *testing.T) {
+	tcs := generateAddSourcesNetworkLatencyTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.LatencyFaultType, types.AddNetworkFaultPostfix))
+}
+
+func TestAddSourcesNetworkPacketLoss(t *testing.T) {
+	tcs := generateAddSourcesNetworkPacketLossTestCases()
+	testNetworkFaultInjectionCommon(t, tcs, NetworkFaultPath(types.PacketLossFaultType, types.AddNetworkFaultPostfix))
+}

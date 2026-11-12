@@ -22,14 +22,15 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/data"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	"github.com/aws/amazon-ecs-agent/agent/metrics"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	apierrors "github.com/aws/amazon-ecs-agent/ecs-agent/api/errors"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
 	"github.com/cihub/seelog"
 )
 
@@ -78,7 +79,7 @@ type TaskHandler struct {
 	maxDrainEventsFrequency time.Duration
 
 	state  dockerstate.TaskEngineState
-	client api.ECSClient
+	client ecs.ECSClient
 	ctx    context.Context
 }
 
@@ -103,7 +104,7 @@ type taskSendableEvents struct {
 func NewTaskHandler(ctx context.Context,
 	dataClient data.Client,
 	state dockerstate.TaskEngineState,
-	client api.ECSClient) *TaskHandler {
+	client ecs.ECSClient) *TaskHandler {
 	// Create a handler and start the periodic event drain loop
 	taskHandler := &TaskHandler{
 		ctx:                       ctx,
@@ -130,7 +131,7 @@ func NewTaskHandler(ctx context.Context,
 // If the event is for task state change, it triggers the non-blocking
 // handler.submitTaskEvents method to submit the batched container state
 // changes and the task state change to ECS
-func (handler *TaskHandler) AddStateChangeEvent(change statechange.Event, client api.ECSClient) error {
+func (handler *TaskHandler) AddStateChangeEvent(change statechange.Event, client ecs.ECSClient) error {
 	handler.lock.Lock()
 	defer handler.lock.Unlock()
 	switch change.GetEventType() {
@@ -183,9 +184,8 @@ func (handler *TaskHandler) startDrainEventsTicker() {
 			// the tasksToContainerStates and tasksToManagedAgentStates maps based on the
 			// task arns of containers and managed agents that haven't been sent to ECS yet.
 			for _, taskEvent := range handler.taskStateChangesToSend() {
-				seelog.Infof(
-					"TaskHandler: Adding a state change event to send batched container/managed agent events: %s",
-					taskEvent.String())
+				logger.Debug("TaskHandler: Adding a state change event to send batched container/managed agent events",
+					taskEvent.ToFields())
 				// Force start the the task state change submission
 				// workflow by calling AddStateChangeEvent method.
 				handler.AddStateChangeEvent(taskEvent, handler.client)
@@ -273,7 +273,7 @@ func (handler *TaskHandler) batchManagedAgentEventUnsafe(event api.ManagedAgentS
 
 // flushBatchUnsafe attaches the task arn's container events to TaskStateChange event
 // by creating the sendable event list. It then submits this event to ECS asynchronously
-func (handler *TaskHandler) flushBatchUnsafe(taskStateChange *api.TaskStateChange, client api.ECSClient) {
+func (handler *TaskHandler) flushBatchUnsafe(taskStateChange *api.TaskStateChange, client ecs.ECSClient) {
 	taskStateChange.Containers = append(taskStateChange.Containers,
 		handler.tasksToContainerStates[taskStateChange.TaskARN]...)
 	// All container events for the task have now been copied to the
@@ -310,8 +310,7 @@ func (handler *TaskHandler) getTaskEventsUnsafe(event *sendableEvent) *taskSenda
 			taskARN:   taskARN,
 		}
 		handler.tasksToEvents[taskARN] = taskEvents
-		seelog.Debugf("TaskHandler: collecting events for new task; event: %s; events: %s ",
-			event.toString(), taskEvents.toStringUnsafe())
+		logger.Debug(fmt.Sprintf("TaskHandler: collecting events for new task; events: %s", taskEvents.toStringUnsafe()), event.toFields())
 	}
 
 	return taskEvents
@@ -319,8 +318,7 @@ func (handler *TaskHandler) getTaskEventsUnsafe(event *sendableEvent) *taskSenda
 
 // Continuously retries sending an event until it succeeds, sleeping between each
 // attempt
-func (handler *TaskHandler) submitTaskEvents(taskEvents *taskSendableEvents, client api.ECSClient, taskARN string) {
-	defer metrics.MetricsEngineGlobal.RecordECSClientMetric("SUBMIT_TASK_EVENTS")()
+func (handler *TaskHandler) submitTaskEvents(taskEvents *taskSendableEvents, client ecs.ECSClient, taskARN string) {
 	defer handler.removeTaskEvents(taskARN)
 
 	backoff := retry.NewExponentialBackoff(submitStateBackoffMin, submitStateBackoffMax,
@@ -359,14 +357,14 @@ func (handler *TaskHandler) removeTaskEvents(taskARN string) {
 // the handler's submitTaskEvents async method to submit this change if
 // there's no go routines already sending changes for this event list
 func (taskEvents *taskSendableEvents) sendChange(change *sendableEvent,
-	client api.ECSClient,
+	client ecs.ECSClient,
 	handler *TaskHandler) {
 
 	taskEvents.lock.Lock()
 	defer taskEvents.lock.Unlock()
 
 	// Add event to the queue
-	seelog.Debugf("TaskHandler: Adding event: %s", change.toString())
+	logger.Debug("TaskHandler: Adding event", change.toFields())
 	taskEvents.events.PushBack(change)
 
 	if !taskEvents.sending {
@@ -375,9 +373,9 @@ func (taskEvents *taskSendableEvents) sendChange(change *sendableEvent,
 		taskEvents.sending = true
 		go handler.submitTaskEvents(taskEvents, client, change.taskArn())
 	} else {
-		seelog.Debugf(
-			"TaskHandler: Not submitting change as the task is already being sent: %s",
-			change.toString())
+		logger.Debug(
+			"TaskHandler: Not submitting change as the task is already being sent",
+			change.toFields())
 	}
 }
 
@@ -422,12 +420,12 @@ func (taskEvents *taskSendableEvents) submitFirstEvent(handler *TaskHandler, bac
 		}
 	} else {
 		// Shouldn't be sent as either a task or container change event; must have been already sent
-		seelog.Infof("TaskHandler: Not submitting redundant event; just removing: %s", event.toString())
+		logger.Info("TaskHandler: Not submitting redundant event; just removing", event.toFields())
 		taskEvents.events.Remove(eventToSubmit)
 	}
 
 	if taskEvents.events.Len() == 0 {
-		seelog.Debug("TaskHandler: Removed the last element, no longer sending")
+		logger.Debug("TaskHandler: Removed the last element, no longer sending")
 		taskEvents.sending = false
 		return true, nil
 	}
@@ -443,9 +441,9 @@ func (taskEvents *taskSendableEvents) toStringUnsafe() string {
 // handleInvalidParamException removes the event from event queue when its parameters are
 // invalid to reduce redundant API call
 func handleInvalidParamException(err error, events *list.List, eventToSubmit *list.Element) {
-	if utils.IsAWSErrorCodeEqual(err, ecs.ErrCodeInvalidParameterException) {
+	if utils.IsAWSErrorCodeEqual(err, apierrors.ErrCodeInvalidParameterException) {
 		event := eventToSubmit.Value.(*sendableEvent)
-		seelog.Warnf("TaskHandler: Event is sent with invalid parameters; just removing: %s", event.toString())
+		logger.Warn("TaskHandler: Event is sent with invalid parameters; just removing", event.toFields())
 		events.Remove(eventToSubmit)
 	}
 }

@@ -26,10 +26,11 @@ import (
 	"strconv"
 	"strings"
 
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
 	dockercontainer "github.com/docker/docker/api/types/container"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/pborman/uuid"
 )
 
@@ -49,15 +50,12 @@ const (
 var (
 	execAgentConfigTemplate = `{
 	"Mgs": {
-		"Region": "",
-		"Endpoint": "",
 		"StopTimeoutMillis": 20000,
 		"SessionWorkersLimit": %d
 	},
 	"Agent": {
-		"Region": "",
-		"OrchestrationRootDir": "",
-		"ContainerMode": true
+		"ContainerMode": true,
+		"UseDualStackEndpoint": %t
 	}
 }`
 
@@ -66,7 +64,9 @@ var (
 
 // InitializeContainer adds the necessary bind mounts in order for the ExecCommandAgent to run properly in the container
 // TODO: [ecs-exec] Should we validate the ssm agent binaries & certs are valid and fail here if they're not? (bind mount will succeed even if files don't exist in host)
-func (m *manager) InitializeContainer(taskId string, container *apicontainer.Container, hostConfig *dockercontainer.HostConfig) (rErr error) {
+func (m *manager) InitializeContainer(
+	task *apitask.Task, container *apicontainer.Container, hostConfig *dockercontainer.HostConfig,
+) (rErr error) {
 	defer func() {
 		if rErr != nil {
 			container.UpdateManagedAgentByName(ExecuteCommandAgentName, apicontainer.ManagedAgentState{
@@ -89,7 +89,8 @@ func (m *manager) InitializeContainer(taskId string, container *apicontainer.Con
 		return rErr
 	}
 
-	rErr = addRequiredBindMounts(taskId, cn, latestBinVersionDir, uuid, sessionWorkersLimit, hostConfig)
+	rErr = addRequiredBindMounts(task, cn, latestBinVersionDir, uuid, sessionWorkersLimit,
+		hostConfig, m.agentConfig)
 	if rErr != nil {
 		return rErr
 	}

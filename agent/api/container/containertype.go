@@ -35,6 +35,14 @@ const (
 	// sharing either PID or IPC resource namespaces. Regardless if one or
 	// both flags are used, only 1 of these containers need to be active
 	ContainerNamespacePause
+
+	// ContainerServiceConnectRelay represents the internal container type
+	// for the relay to share connections to management infrastructure.
+	ContainerServiceConnectRelay
+
+	// ContainerManagedDaemon represents the internal container type
+	// for Managed Daemons
+	ContainerManagedDaemon
 )
 
 // ContainerType represents the type of the internal container created
@@ -45,6 +53,7 @@ var stringToContainerType = map[string]ContainerType{
 	"EMPTY_HOST_VOLUME": ContainerEmptyHostVolume,
 	"CNI_PAUSE":         ContainerCNIPause,
 	"NAMESPACE_PAUSE":   ContainerNamespacePause,
+	"MANAGED_DAEMON":    ContainerManagedDaemon,
 }
 
 // String converts the container type enum to a string

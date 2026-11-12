@@ -24,16 +24,18 @@ import (
 	"github.com/pkg/errors"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	"github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/asm"
 	"github.com/aws/amazon-ecs-agent/agent/asm/factory"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
 const (
@@ -299,7 +301,11 @@ func (secret *ASMSecretResource) Create() error {
 func (secret *ASMSecretResource) retrieveASMSecretValue(apiSecret apicontainer.Secret, iamCredentials credentials.IAMRoleCredentials, wg *sync.WaitGroup, errorEvents chan error) {
 	defer wg.Done()
 
-	asmClient := secret.asmClientCreator.NewASMClient(apiSecret.Region, iamCredentials)
+	asmClient, err := secret.asmClientCreator.NewASMClient(apiSecret.Region, iamCredentials)
+	if err != nil {
+		errorEvents <- fmt.Errorf("unable to create ASM client: %v", err)
+		return
+	}
 	seelog.Debugf("ASM secret resource: retrieving resource for secret %v in region %s for task: [%s]", apiSecret.ValueFrom, apiSecret.Region, secret.taskARN)
 	input, jsonKey, err := getASMParametersFromInput(apiSecret.ValueFrom)
 	if err != nil {
@@ -315,7 +321,7 @@ func (secret *ASMSecretResource) retrieveASMSecretValue(apiSecret apicontainer.S
 
 	secretValue, err := asm.GetSecretFromASMWithInput(input, asmClient, jsonKey)
 	if err != nil {
-		errorEvents <- fmt.Errorf("fetching secret data from AWS Secrets Manager in region %s: %v", apiSecret.Region, err)
+		errorEvents <- err
 		return
 	}
 
@@ -440,7 +446,9 @@ func (secret *ASMSecretResource) SetCachedSecretValue(secretKey string, secretVa
 	secret.secretData[secretKey] = secretValue
 }
 
-func (secret *ASMSecretResource) Initialize(resourceFields *taskresource.ResourceFields,
+func (secret *ASMSecretResource) Initialize(
+	config *config.Config,
+	resourceFields *taskresource.ResourceFields,
 	taskKnownStatus status.TaskStatus,
 	taskDesiredStatus status.TaskStatus) {
 	secret.initStatusToTransition()
@@ -533,4 +541,10 @@ func (secret *ASMSecretResource) BuildContainerDependency(containerName string, 
 
 func (secret *ASMSecretResource) GetContainerDependencies(dependent resourcestatus.ResourceStatus) []apicontainer.ContainerDependency {
 	return nil
+}
+
+// RequiresExecutionRoleCredentials returns true if the resource requires execution role credentials.
+// ASM secret resource always requires the task execution role credentials.
+func (secret *ASMSecretResource) RequiresExecutionRoleCredentials() bool {
+	return true
 }

@@ -18,8 +18,10 @@ package stats
 import (
 	"encoding/json"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/stretchr/testify/assert"
@@ -55,7 +57,104 @@ func TestDockerStatsToContainerStatsEmptyCpuUsageGeneratesError(t *testing.T) {
 	json.Unmarshal([]byte(jsonBytes), dockerStat)
 	prevNumCores := numCores
 	numCores = uint64(0)
-	err := validateDockerStats(dockerStat)
+	err := validateDockerStats(dockerStat, false)
 	assert.Error(t, err, "expected error converting container stats with numCores=0")
 	numCores = prevNumCores
+}
+
+func TestGetStorageStats(t *testing.T) {
+	testCases := []struct {
+		name               string
+		blkioStats         []types.BlkioStatEntry
+		expectedReadBytes  uint64
+		expectedWriteBytes uint64
+	}{
+		{
+			name: "lowercase op values",
+			blkioStats: []types.BlkioStatEntry{
+				{Op: "read", Value: 100},
+				{Op: "write", Value: 200},
+			},
+			expectedReadBytes:  100,
+			expectedWriteBytes: 200,
+		},
+		{
+			name: "capitalized op values",
+			blkioStats: []types.BlkioStatEntry{
+				{Op: "Read", Value: 300},
+				{Op: "Write", Value: 400},
+			},
+			expectedReadBytes:  300,
+			expectedWriteBytes: 400,
+		},
+		{
+			name: "all caps op values",
+			blkioStats: []types.BlkioStatEntry{
+				{Op: "READ", Value: 500},
+				{Op: "WRITE", Value: 600},
+			},
+			expectedReadBytes:  500,
+			expectedWriteBytes: 600,
+		},
+		{
+			name: "unrecognized op values are ignored",
+			blkioStats: []types.BlkioStatEntry{
+				{Op: "invalid", Value: 700},
+				{Op: "garbage", Value: 800},
+			},
+			expectedReadBytes:  0,
+			expectedWriteBytes: 0,
+		},
+		{
+			name:               "nil blkio stats",
+			blkioStats:         nil,
+			expectedReadBytes:  0,
+			expectedWriteBytes: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dockerStats := &types.StatsJSON{}
+			dockerStats.BlkioStats.IoServiceBytesRecursive = tc.blkioStats
+			readBytes, writeBytes := getStorageStats(dockerStats)
+			assert.Equal(t, tc.expectedReadBytes, readBytes)
+			assert.Equal(t, tc.expectedWriteBytes, writeBytes)
+		})
+	}
+}
+
+func TestValidateDockerStatsZeroValueReadTime(t *testing.T) {
+	testCases := []struct {
+		name                          string
+		containerEnabledRestartPolicy bool
+	}{
+		{
+			name:                          "container does not have restart policy enabled",
+			containerEnabledRestartPolicy: false,
+		},
+		{
+			name:                          "container has restart policy enabled",
+			containerEnabledRestartPolicy: true,
+		},
+	}
+	inputJsonFile, _ := filepath.Abs("./unix_test_stats.json")
+	jsonBytes, err := os.ReadFile(inputJsonFile)
+	assert.NoError(t, err)
+	dockerStat := &types.StatsJSON{}
+	json.Unmarshal(jsonBytes, dockerStat)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set read time of docker stat to zero value of time.Time.
+			dockerStat.Read = time.Time{}
+			err = validateDockerStats(dockerStat, tc.containerEnabledRestartPolicy)
+			if tc.containerEnabledRestartPolicy {
+				assert.Error(t, err)
+				assert.ErrorContains(t, err, invalidStatZeroValueReadTimeMsg)
+			} else {
+				assert.NoError(t, nil)
+			}
+		})
+	}
 }

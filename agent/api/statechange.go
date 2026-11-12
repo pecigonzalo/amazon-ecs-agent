@@ -19,14 +19,27 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
-	apieni "github.com/aws/amazon-ecs-agent/agent/api/eni"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
-	"github.com/pkg/errors"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/attachment"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/field"
+	ni "github.com/aws/amazon-ecs-agent/ecs-agent/netlib/model/networkinterface"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils"
 
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/docker/go-connections/nat"
+	"github.com/pkg/errors"
+)
+
+const (
+	// ecsMaxNetworkBindingsLength is the maximum length of the ecs.NetworkBindings list sent as part of the
+	// container state change payload. Currently, this is enforced only when containerPortRanges are requested.
+	ecsMaxNetworkBindingsLength = 100
 )
 
 // ContainerStateChange represents a state change that needs to be sent to the
@@ -72,7 +85,7 @@ type ManagedAgentStateChange struct {
 // SubmitTaskStateChange API
 type TaskStateChange struct {
 	// Attachment is the eni attachment object to send
-	Attachment *apieni.ENIAttachment
+	Attachment *ni.ENIAttachment
 	// TaskArn is the unique identifier for the task
 	TaskARN string
 	// Status is the status to send
@@ -97,16 +110,27 @@ type TaskStateChange struct {
 // AttachmentStateChange represents a state change that needs to be sent to the
 // SubmitAttachmentStateChanges API
 type AttachmentStateChange struct {
-	// Attachment is the eni attachment object to send
-	Attachment *apieni.ENIAttachment
+	// Attachment is the attachment object to send
+	Attachment attachment.Attachment
+}
+
+type ErrShouldNotSendEvent struct {
+	resourceId string
+}
+
+func (e ErrShouldNotSendEvent) Error() string {
+	return fmt.Sprintf("should not send events for internal tasks or containers: %s", e.resourceId)
 }
 
 // NewTaskStateChangeEvent creates a new task state change event
 // returns error if the state change doesn't need to be sent to the ECS backend.
 func NewTaskStateChangeEvent(task *apitask.Task, reason string) (TaskStateChange, error) {
 	var event TaskStateChange
+	if task.IsInternal {
+		return event, ErrShouldNotSendEvent{task.Arn}
+	}
 	taskKnownStatus := task.GetKnownStatus()
-	if !taskKnownStatus.BackendRecognized() {
+	if taskKnownStatus != apitaskstatus.TaskManifestPulled && !taskKnownStatus.BackendRecognized() {
 		return event, errors.Errorf(
 			"create task state change event api: status not recognized by ECS: %v",
 			taskKnownStatus)
@@ -115,6 +139,14 @@ func NewTaskStateChangeEvent(task *apitask.Task, reason string) (TaskStateChange
 		return event, errors.Errorf(
 			"create task state change event api: status [%s] already sent",
 			taskKnownStatus.String())
+	}
+	if taskKnownStatus == apitaskstatus.TaskManifestPulled && !task.HasAContainerWithResolvedDigest() {
+		return event, ErrShouldNotSendEvent{
+			fmt.Sprintf(
+				"create task state change event api: status %s not eligible for backend reporting as"+
+					" no digests were resolved",
+				apitaskstatus.TaskManifestPulled.String()),
+		}
 	}
 
 	event = TaskStateChange{
@@ -137,15 +169,25 @@ func NewContainerStateChangeEvent(task *apitask.Task, cont *apicontainer.Contain
 		return event, err
 	}
 	contKnownStatus := cont.GetKnownStatus()
-	if !contKnownStatus.ShouldReportToBackend(cont.GetSteadyStateStatus()) {
-		return event, errors.Errorf(
+	if contKnownStatus != apicontainerstatus.ContainerManifestPulled &&
+		!contKnownStatus.ShouldReportToBackend(cont.GetSteadyStateStatus()) {
+		return event, ErrShouldNotSendEvent{fmt.Sprintf(
 			"create container state change event api: status not recognized by ECS: %v",
-			contKnownStatus)
+			contKnownStatus)}
+	}
+	if contKnownStatus == apicontainerstatus.ContainerManifestPulled && !cont.DigestResolved() {
+		// Transition to MANIFEST_PULLED state is sent to the backend only to report a resolved
+		// image manifest digest. No need to generate an event if the digest was not resolved
+		// which could happen due to various reasons.
+		return event, ErrShouldNotSendEvent{fmt.Sprintf(
+			"create container state change event api:"+
+				" no need to send %s event as no resolved digests were found",
+			apicontainerstatus.ContainerManifestPulled.String())}
 	}
 	if cont.GetSentStatus() >= contKnownStatus {
-		return event, errors.Errorf(
+		return event, ErrShouldNotSendEvent{fmt.Sprintf(
 			"create container state change event api: status [%s] already sent for container %s, task %s",
-			contKnownStatus.String(), cont.Name, task.Arn)
+			contKnownStatus.String(), cont.Name, task.Arn)}
 	}
 	if reason == "" && cont.ApplyingError != nil {
 		reason = cont.ApplyingError.Error()
@@ -157,23 +199,50 @@ func NewContainerStateChangeEvent(task *apitask.Task, cont *apicontainer.Contain
 func newUncheckedContainerStateChangeEvent(task *apitask.Task, cont *apicontainer.Container, reason string) (ContainerStateChange, error) {
 	var event ContainerStateChange
 	if cont.IsInternal() {
-		return event, errors.Errorf(
-			"create container state change event api: internal container: %s",
-			cont.Name)
+		return event, ErrShouldNotSendEvent{cont.Name}
+	}
+	portBindings := cont.GetKnownPortBindings()
+	if task.IsServiceConnectEnabled() && task.IsNetworkModeBridge() {
+		pauseCont, err := task.GetBridgeModePauseContainerForTaskContainer(cont)
+		if err != nil {
+			return event, fmt.Errorf("error resolving pause container for bridge mode SC container: %s", cont.Name)
+		}
+		portBindings = pauseCont.GetKnownPortBindings()
 	}
 	contKnownStatus := cont.GetKnownStatus()
 	event = ContainerStateChange{
 		TaskArn:       task.Arn,
 		ContainerName: cont.Name,
 		RuntimeID:     cont.GetRuntimeID(),
-		Status:        contKnownStatus.BackendStatus(cont.GetSteadyStateStatus()),
+		Status:        containerStatusChangeStatus(contKnownStatus, cont.GetSteadyStateStatus()),
 		ExitCode:      cont.GetKnownExitCode(),
-		PortBindings:  cont.GetKnownPortBindings(),
+		PortBindings:  portBindings,
 		ImageDigest:   cont.GetImageDigest(),
 		Reason:        reason,
 		Container:     cont,
 	}
 	return event, nil
+}
+
+// Maps container known status to a suitable status for ContainerStateChange.
+//
+// Returns ContainerRunning if known status matches steady state status,
+// returns knownStatus if it is ContainerManifestPulled or ContainerStopped,
+// returns ContainerStatusNone for all other cases.
+func containerStatusChangeStatus(
+	knownStatus apicontainerstatus.ContainerStatus,
+	steadyStateStatus apicontainerstatus.ContainerStatus,
+) apicontainerstatus.ContainerStatus {
+	switch knownStatus {
+	case steadyStateStatus:
+		return apicontainerstatus.ContainerRunning
+	case apicontainerstatus.ContainerManifestPulled:
+		return apicontainerstatus.ContainerManifestPulled
+	case apicontainerstatus.ContainerStopped:
+		return apicontainerstatus.ContainerStopped
+	default:
+		return apicontainerstatus.ContainerStatusNone
+	}
 }
 
 // NewManagedAgentChangeEvent creates a new managedAgent change event to convey managed agent state changes
@@ -200,35 +269,75 @@ func NewManagedAgentChangeEvent(task *apitask.Task, cont *apicontainer.Container
 }
 
 // NewAttachmentStateChangeEvent creates a new attachment state change event
-func NewAttachmentStateChangeEvent(eniAttachment *apieni.ENIAttachment) AttachmentStateChange {
+func NewAttachmentStateChangeEvent(eniAttachment *ni.ENIAttachment) AttachmentStateChange {
 	return AttachmentStateChange{
 		Attachment: eniAttachment,
 	}
 }
 
+func (c *ContainerStateChange) ToFields() logger.Fields {
+	return logger.Fields{
+		"eventType":       "ContainerStateChange",
+		"taskArn":         c.TaskArn,
+		"containerName":   c.ContainerName,
+		"containerStatus": c.Status.String(),
+		"exitCode":        strconv.Itoa(*c.ExitCode),
+		"reason":          c.Reason,
+		"portBindings":    c.PortBindings,
+	}
+}
+
 // String returns a human readable string representation of this object
 func (c *ContainerStateChange) String() string {
-	res := fmt.Sprintf("%s %s -> %s", c.TaskArn, c.ContainerName, c.Status.String())
+	res := fmt.Sprintf("containerName=%s containerStatus=%s", c.ContainerName, c.Status.String())
 	if c.ExitCode != nil {
-		res += ", Exit " + strconv.Itoa(*c.ExitCode) + ", "
+		res += " containerExitCode=" + strconv.Itoa(*c.ExitCode)
 	}
 	if c.Reason != "" {
-		res += ", Reason " + c.Reason
+		res += " containerReason=" + c.Reason
 	}
 	if len(c.PortBindings) != 0 {
-		res += fmt.Sprintf(", Ports %v", c.PortBindings)
+		res += fmt.Sprintf(" containerPortBindings=%v", c.PortBindings)
 	}
 	if c.Container != nil {
-		res += ", Known Sent: " + c.Container.GetSentStatus().String()
+		res += fmt.Sprintf(" containerKnownSentStatus=%s containerRuntimeID=%s containerIsEssential=%v",
+			c.Container.GetSentStatus().String(), c.Container.GetRuntimeID(), c.Container.IsEssential())
 	}
 	return res
 }
 
+// ToECSAgent converts the agent module level ContainerStateChange to ecs-agent module level ContainerStateChange.
+func (c *ContainerStateChange) ToECSAgent() (*ecs.ContainerStateChange, error) {
+	pl, err := buildContainerStateChangePayload(*c)
+	if err != nil {
+		logger.Error("Could not convert agent container state change to ecs-agent container state change",
+			logger.Fields{
+				"agentContainerStateChange": c.String(),
+				field.Error:                 err,
+			})
+		return nil, err
+	} else if pl == nil {
+		return nil, nil
+	}
+
+	return &ecs.ContainerStateChange{
+		TaskArn:         c.TaskArn,
+		RuntimeID:       aws.ToString(pl.RuntimeId),
+		ContainerName:   c.ContainerName,
+		Status:          c.Status,
+		ImageDigest:     aws.ToString(pl.ImageDigest),
+		Reason:          aws.ToString(pl.Reason),
+		ExitCode:        utils.Int32PtrToIntPtr(pl.ExitCode),
+		NetworkBindings: pl.NetworkBindings,
+		MetadataGetter:  newContainerMetadataGetter(c.Container),
+	}, nil
+}
+
 // String returns a human readable string representation of ManagedAgentStateChange
 func (m *ManagedAgentStateChange) String() string {
-	res := fmt.Sprintf("%s %s %s -> %s", m.TaskArn, m.Container.Name, m.Name, m.Status.String())
+	res := fmt.Sprintf("containerName=%s managedAgentName=%s managedAgentStatus=%s", m.Container.Name, m.Name, m.Status.String())
 	if m.Reason != "" {
-		res += ", Reason " + m.Reason
+		res += " managedAgentReason=" + m.Reason
 	}
 	return res
 }
@@ -252,22 +361,29 @@ func (change *TaskStateChange) SetTaskTimestamps() {
 	}
 }
 
-// ShouldBeReported checks if the statechange should be reported to backend
-func (change *TaskStateChange) ShouldBeReported() bool {
-	// Events that should be reported:
-	// 1. Normal task state change: RUNNING/STOPPED
-	// 2. Container state change, with task status in CREATED/RUNNING/STOPPED
-	// The task timestamp will be sent in both of the event type
-	// TODO Move the Attachment statechange check into this method
-	if change.Status == apitaskstatus.TaskRunning || change.Status == apitaskstatus.TaskStopped {
-		return true
+func (change *TaskStateChange) ToFields() logger.Fields {
+	fields := logger.Fields{
+		"eventType":  "TaskStateChange",
+		"taskArn":    change.TaskARN,
+		"taskStatus": change.Status.String(),
+		"taskReason": change.Reason,
 	}
-
-	if len(change.Containers) != 0 {
-		return true
+	if change.Task != nil {
+		fields["taskKnownSentStatus"] = change.Task.GetSentStatus().String()
+		fields["taskPullStartedAt"] = change.Task.GetPullStartedAt().UTC().Format(time.RFC3339)
+		fields["taskPullStoppedAt"] = change.Task.GetPullStoppedAt().UTC().Format(time.RFC3339)
+		fields["taskExecutionStoppedAt"] = change.Task.GetExecutionStoppedAt().UTC().Format(time.RFC3339)
 	}
-
-	return false
+	if change.Attachment != nil {
+		fields["eniAttachment"] = change.Attachment.String()
+	}
+	for i, containerChange := range change.Containers {
+		fields["containerChange-"+strconv.Itoa(i)] = containerChange.String()
+	}
+	for i, managedAgentChange := range change.ManagedAgents {
+		fields["managedAgentChange-"+strconv.Itoa(i)] = managedAgentChange.String()
+	}
+	return fields
 }
 
 // String returns a human readable string representation of this object
@@ -293,14 +409,57 @@ func (change *TaskStateChange) String() string {
 	return res
 }
 
+// ToECSAgent converts the agent module level TaskStateChange to ecs-agent module level TaskStateChange.
+func (change *TaskStateChange) ToECSAgent() (*ecs.TaskStateChange, error) {
+	output := &ecs.TaskStateChange{
+		Attachment:         change.Attachment,
+		TaskARN:            change.TaskARN,
+		Status:             change.Status,
+		Reason:             change.Reason,
+		PullStartedAt:      change.PullStartedAt,
+		PullStoppedAt:      change.PullStoppedAt,
+		ExecutionStoppedAt: change.ExecutionStoppedAt,
+		MetadataGetter:     newTaskMetadataGetter(change.Task),
+	}
+
+	for _, managedAgentEvent := range change.ManagedAgents {
+		if mgspl := buildManagedAgentStateChangePayload(managedAgentEvent); mgspl != nil {
+			output.ManagedAgents = append(output.ManagedAgents, *mgspl)
+		}
+	}
+
+	containerEvents := make([]types.ContainerStateChange, len(change.Containers))
+	for i, containerEvent := range change.Containers {
+		payload, err := buildContainerStateChangePayload(containerEvent)
+		if err != nil {
+			logger.Error("Could not convert agent task state change to ecs-agent task state change", logger.Fields{
+				"agentTaskStateChange": change.String(),
+				field.Error:            err,
+			})
+			return nil, err
+		}
+		containerEvents[i] = *payload
+	}
+	output.Containers = containerEvents
+
+	return output, nil
+}
+
 // String returns a human readable string representation of this object
 func (change *AttachmentStateChange) String() string {
 	if change.Attachment != nil {
-		return fmt.Sprintf("%s -> %s, %s", change.Attachment.AttachmentARN, change.Attachment.Status.String(),
-			change.Attachment.String())
+		return fmt.Sprintf("%s -> %v, %s", change.Attachment.GetAttachmentARN(),
+			change.Attachment.GetAttachmentStatus(), change.Attachment.String())
 	}
 
 	return ""
+}
+
+// ToECSAgent converts the agent module level AttachmentStateChange to ecs-agent module level AttachmentStateChange.
+func (change *AttachmentStateChange) ToECSAgent() *ecs.AttachmentStateChange {
+	return &ecs.AttachmentStateChange{
+		Attachment: change.Attachment,
+	}
 }
 
 // GetEventType returns an enum identifying the event type
@@ -320,4 +479,137 @@ func (ts TaskStateChange) GetEventType() statechange.EventType {
 // GetEventType returns an enum identifying the event type
 func (AttachmentStateChange) GetEventType() statechange.EventType {
 	return statechange.AttachmentEvent
+}
+
+func buildManagedAgentStateChangePayload(change ManagedAgentStateChange) *types.ManagedAgentStateChange {
+	if !change.Status.ShouldReportToBackend() {
+		logger.Warn("Not submitting unsupported managed agent state", logger.Fields{
+			field.Status:        change.Status.String(),
+			field.ContainerName: change.Container.Name,
+			field.TaskARN:       change.TaskArn,
+		})
+		return nil
+	}
+	return &types.ManagedAgentStateChange{
+		ManagedAgentName: types.ManagedAgentName(change.Name),
+		ContainerName:    aws.String(change.Container.Name),
+		Status:           aws.String(change.Status.String()),
+		Reason:           aws.String(change.Reason),
+	}
+}
+
+func buildContainerStateChangePayload(change ContainerStateChange) (*types.ContainerStateChange, error) {
+	if change.ContainerName == "" {
+		return nil, fmt.Errorf("container state change has no container name")
+	}
+	statechange := types.ContainerStateChange{
+		ContainerName: aws.String(change.ContainerName),
+	}
+	if change.RuntimeID != "" {
+		statechange.RuntimeId = aws.String(change.RuntimeID)
+	}
+	if change.Reason != "" {
+		statechange.Reason = aws.String(change.Reason)
+	}
+	if change.ImageDigest != "" {
+		statechange.ImageDigest = aws.String(change.ImageDigest)
+	}
+
+	// TODO: This check already exists in NewContainerStateChangeEvent and shouldn't be repeated here; remove after verifying
+	stat := change.Status
+	if stat != apicontainerstatus.ContainerManifestPulled &&
+		stat != apicontainerstatus.ContainerStopped &&
+		stat != apicontainerstatus.ContainerRunning {
+		logger.Warn("Not submitting unsupported upstream container state", logger.Fields{
+			field.Status:        stat.String(),
+			field.ContainerName: change.ContainerName,
+			field.TaskARN:       change.TaskArn,
+		})
+		return nil, nil
+	}
+	// TODO: This check is probably redundant as String() method never returns "DEAD"; remove after verifying
+	if stat.String() == "DEAD" {
+		stat = apicontainerstatus.ContainerStopped
+	}
+	statechange.Status = aws.String(stat.BackendStatusString())
+
+	if change.ExitCode != nil {
+		exitCode := int32(aws.ToInt(change.ExitCode))
+		statechange.ExitCode = aws.Int32(exitCode)
+	}
+
+	networkBindings := getNetworkBindings(change)
+	// we enforce a limit on the no. of network bindings for containers with at-least 1 port range requested.
+	// this limit is enforced by ECS, and we fail early and don't call SubmitContainerStateChange.
+	if change.Container.HasPortRange() && len(networkBindings) > ecsMaxNetworkBindingsLength {
+		return nil, fmt.Errorf("no. of network bindings %v is more than the maximum supported no. %v, "+
+			"container: %s "+"task: %s", len(networkBindings), ecsMaxNetworkBindingsLength, change.ContainerName, change.TaskArn)
+	}
+	statechange.NetworkBindings = networkBindings
+
+	return &statechange, nil
+}
+
+// ProtocolBindIP used to store protocol and bindIP information associated to a particular host port
+type ProtocolBindIP struct {
+	protocol string
+	bindIP   string
+}
+
+// getNetworkBindings returns the list of networkingBindings, sent to ECS as part of the container state change payload
+func getNetworkBindings(change ContainerStateChange) []types.NetworkBinding {
+	networkBindings := []types.NetworkBinding{}
+	// hostPortToProtocolBindIPMap is a map to store protocol and bindIP information associated to host ports
+	// that belong to a range. This is used in case when there are multiple protocol/bindIP combinations associated to a
+	// port binding. example: when both IPv4 and IPv6 bindIPs are populated by docker.
+	hostPortToProtocolBindIPMap := map[int64][]ProtocolBindIP{}
+
+	// ContainerPortSet consists of singular ports, and ports that belong to a range, but for which we were not able to
+	// find contiguous host ports and ask docker to pick instead.
+	containerPortSet := change.Container.GetContainerPortSet()
+	// each entry in the ContainerPortRangeMap implies that we found a contiguous host port range for the same
+	containerPortRangeMap := change.Container.GetContainerPortRangeMap()
+
+	for _, binding := range change.PortBindings {
+		containerPort := int32(binding.ContainerPort)
+		bindIP := binding.BindIP
+		protocol := binding.Protocol.String()
+
+		// create network binding for each containerPort that exists in the singular ContainerPortSet
+		// for container ports that belong to a range, we'll have 1 consolidated network binding for the range
+		if _, ok := containerPortSet[int(containerPort)]; ok {
+			networkBindings = append(networkBindings, types.NetworkBinding{
+				BindIP:        aws.String(bindIP),
+				ContainerPort: aws.Int32(containerPort),
+				HostPort:      aws.Int32(int32(binding.HostPort)),
+				Protocol:      types.TransportProtocol(protocol),
+			})
+		} else {
+			// populate hostPortToProtocolBindIPMap – this is used below when we construct network binding for ranges.
+			hostPort := int64(binding.HostPort)
+			hostPortToProtocolBindIPMap[hostPort] = append(hostPortToProtocolBindIPMap[hostPort],
+				ProtocolBindIP{
+					protocol: protocol,
+					bindIP:   bindIP,
+				})
+		}
+	}
+
+	for containerPortRange, hostPortRange := range containerPortRangeMap {
+		// we check for protocol and bindIP information associated to any one of the host ports from the hostPortRange,
+		// all ports belonging to the same range share this information.
+		hostPort, _, _ := nat.ParsePortRangeToInt(hostPortRange)
+		if val, ok := hostPortToProtocolBindIPMap[int64(hostPort)]; ok {
+			for _, v := range val {
+				networkBindings = append(networkBindings, types.NetworkBinding{
+					BindIP:             aws.String(v.bindIP),
+					ContainerPortRange: aws.String(containerPortRange),
+					HostPortRange:      aws.String(hostPortRange),
+					Protocol:           types.TransportProtocol(v.protocol),
+				})
+			}
+		}
+	}
+
+	return networkBindings
 }

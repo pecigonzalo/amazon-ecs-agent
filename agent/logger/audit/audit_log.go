@@ -18,15 +18,10 @@ import (
 	"strconv"
 
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/logger"
-	"github.com/aws/amazon-ecs-agent/agent/logger/audit/request"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger"
+	auditinterface "github.com/aws/amazon-ecs-agent/ecs-agent/logger/audit"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/logger/audit/request"
 )
-
-type AuditLogger interface {
-	Log(r request.LogRequest, httpResponseCode int, eventType string)
-	GetContainerInstanceArn() string
-	GetCluster() string
-}
 
 type InfoLogger interface {
 	Info(i ...interface{})
@@ -39,7 +34,7 @@ type auditLog struct {
 	cfg                  *config.Config
 }
 
-func NewAuditLog(containerInstanceArn string, cfg *config.Config, logger InfoLogger) AuditLogger {
+func NewAuditLog(containerInstanceArn string, cfg *config.Config, logger InfoLogger) auditinterface.AuditLogger {
 	return &auditLog{
 		cluster:              cfg.Cluster,
 		containerInstanceArn: containerInstanceArn,

@@ -38,6 +38,7 @@ type dockerClient interface {
 	StartAgent() (int, error)
 	StopAgent() error
 	LoadEnvVars() map[string]string
+	FindDefaultBridgeNetworkInterfaceName() (string, error)
 }
 
 type loopbackRouting interface {
@@ -48,6 +49,13 @@ type loopbackRouting interface {
 type credentialsProxyRoute interface {
 	Create() error
 	Remove() error
+}
+
+// Provides methods to create routes for Task Metadata Server access from the host for
+// IPv6-only hosts.
+type tmdsRouteManagerForIPv6Only interface {
+	CreateRoute() error
+	RemoveRoute() error
 }
 
 type ipv6RouterAdvertisements interface {

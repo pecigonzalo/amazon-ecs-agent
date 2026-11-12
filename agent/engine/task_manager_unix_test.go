@@ -26,7 +26,7 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/data"
 	mock_dockerapi "github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dependencygraph"
@@ -37,16 +37,16 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup"
 	resourcestatus "github.com/aws/amazon-ecs-agent/agent/taskresource/status"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource/volume"
-	mock_ttime "github.com/aws/amazon-ecs-agent/agent/utils/ttime/mocks"
-	"github.com/golang/mock/gomock"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/task/status"
+	mock_ttime "github.com/aws/amazon-ecs-agent/ecs-agent/utils/ttime/mocks"
 
-	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
-	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 )
 
 // These tests use cgroup resource, which is linux specific.
-// generic resource's(eg.volume) tests should be added to common test file.
+// generic resources (e.g. volume) tests should be added to common test file.
 func TestHandleResourceStateChangeAndSave(t *testing.T) {
 	testCases := []struct {
 		Name               string
@@ -219,7 +219,7 @@ func TestStartResourceTransitionsHappyPath(t *testing.T) {
 			task.AddResource("cgroup", res)
 			wg := sync.WaitGroup{}
 			wg.Add(1)
-			canTransition, transitions := task.startResourceTransitions(
+			canTransition, transitions, reasons := task.startResourceTransitions(
 				func(resource taskresource.TaskResource, nextStatus resourcestatus.ResourceStatus) {
 					assert.Equal(t, nextStatus, tc.TransitionStatus)
 					wg.Done()
@@ -230,6 +230,7 @@ func TestStartResourceTransitionsHappyPath(t *testing.T) {
 			resTransition, ok := transitions["cgroup"]
 			assert.True(t, ok)
 			assert.Equal(t, resTransition, tc.StatusString)
+			assert.Empty(t, reasons)
 		})
 	}
 }
@@ -277,17 +278,18 @@ func TestStartResourceTransitionsEmpty(t *testing.T) {
 				resourceStateChangeEvent: make(chan resourceStateChange),
 			}
 			mtask.Task.AddResource("cgroup", res)
-			canTransition, transitions := mtask.startResourceTransitions(
+			canTransition, transitions, reasons := mtask.startResourceTransitions(
 				func(resource taskresource.TaskResource, nextStatus resourcestatus.ResourceStatus) {
 					t.Error("Transition function should not be called when no transitions are possible")
 				})
 			assert.Equal(t, tc.CanTransition, canTransition)
 			assert.Empty(t, transitions)
+			assert.Empty(t, reasons)
 		})
 	}
 }
 
-//TestEFSNextStateWithTransitionDependencies verifies the dependencies are resolved correctly for task resource
+// TestEFSNextStateWithTransitionDependencies verifies the dependencies are resolved correctly for task resource
 func TestEFSVolumeNextStateWithTransitionDependencies(t *testing.T) {
 	testCases := []struct {
 		name                         string

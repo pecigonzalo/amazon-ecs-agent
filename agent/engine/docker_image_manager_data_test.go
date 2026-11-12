@@ -48,8 +48,7 @@ var (
 )
 
 func TestAddImageStateSaveData(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	imageManager := &dockerImageManager{
 		dataClient: dataClient,
@@ -62,36 +61,33 @@ func TestAddImageStateSaveData(t *testing.T) {
 }
 
 func TestAddContainerReferenceToNewImageStateSaveData(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	imageManager := &dockerImageManager{
 		dataClient: dataClient,
 	}
 
-	imageManager.addContainerReferenceToNewImageState(testContainerData, 0)
+	imageManager.addContainerReferenceToNewImageState(testContainerData, 0, nil)
 	imageStates, err := dataClient.GetImageStates()
 	assert.NoError(t, err)
 	assert.Len(t, imageStates, 1)
 }
 
 func TestAddContainerReferenceToExistingImageStateSaveData(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	imageManager := &dockerImageManager{
 		dataClient: dataClient,
 	}
 	imageManager.imageStates = append(imageManager.imageStates, testImageStateData)
-	imageManager.addContainerReferenceToExistingImageState(testContainerData)
+	imageManager.addContainerReferenceToExistingImageState(testContainerData, nil)
 	imageStates, err := dataClient.GetImageStates()
 	assert.NoError(t, err)
 	assert.Len(t, imageStates, 1)
 }
 
 func TestRemoveExistingImageNameOfDifferentID(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	imageManager := &dockerImageManager{
 		dataClient: dataClient,
@@ -110,8 +106,7 @@ func TestRemoveExistingImageNameOfDifferentID(t *testing.T) {
 }
 
 func TestRemoveImageStateSaveData(t *testing.T) {
-	dataClient, cleanup := newTestDataClient(t)
-	defer cleanup()
+	dataClient := newTestDataClient(t)
 
 	imageManager := &dockerImageManager{
 		dataClient: dataClient,

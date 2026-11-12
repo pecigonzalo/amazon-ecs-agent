@@ -16,23 +16,33 @@ package handlers
 import (
 	"context"
 	"net/http"
-	"strconv"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
-	handlersutils "github.com/aws/amazon-ecs-agent/agent/handlers/utils"
-	v1 "github.com/aws/amazon-ecs-agent/agent/handlers/v1"
+	tpfactory "github.com/aws/amazon-ecs-agent/agent/handlers/agentapi/taskprotection"
 	v2 "github.com/aws/amazon-ecs-agent/agent/handlers/v2"
 	v3 "github.com/aws/amazon-ecs-agent/agent/handlers/v3"
 	v4 "github.com/aws/amazon-ecs-agent/agent/handlers/v4"
 	"github.com/aws/amazon-ecs-agent/agent/logger/audit"
 	"github.com/aws/amazon-ecs-agent/agent/stats"
-	"github.com/aws/amazon-ecs-agent/agent/utils/retry"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/api/ecs"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
+	auditinterface "github.com/aws/amazon-ecs-agent/ecs-agent/logger/audit"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/metrics"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/tmds"
+	fault "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/fault/v1/handlers"
+	faulttype "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/fault/v1/types"
+	tp "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/taskprotection/v1/handlers"
+	tmdsv1 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v1"
+	tmdsv2 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v2"
+	tmdsv4 "github.com/aws/amazon-ecs-agent/ecs-agent/tmds/handlers/v4"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/execwrapper"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/utils/retry"
+
 	"github.com/cihub/seelog"
 	"github.com/didip/tollbooth"
+	"github.com/didip/tollbooth/limiter"
 	"github.com/gorilla/mux"
 )
 
@@ -44,68 +54,72 @@ const (
 	// writeTimeout specifies the maximum duration before timing out write of the response.
 	// The value is set to 5 seconds as per AWS SDK defaults.
 	writeTimeout = 5 * time.Second
+
+	// Timeout for ECS calls. Must be lower than server write timeout defined above.
+	ecsCallTimeout = 4 * time.Second
 )
 
-func taskServerSetup(credentialsManager credentials.Manager,
-	auditLogger audit.AuditLogger,
+func taskServerSetup(
+	credentialsManager credentials.Manager,
+	auditLogger auditinterface.AuditLogger,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	cluster string,
 	statsEngine stats.Engine,
 	steadyStateRate int,
 	burstRate int,
 	availabilityZone string,
-	containerInstanceArn string) *http.Server {
+	availabilityZoneID string,
+	vpcID string,
+	containerInstanceArn string,
+	taskProtectionClientFactory tp.TaskProtectionClientFactoryInterface,
+) (*http.Server, error) {
 	muxRouter := mux.NewRouter()
 
 	// Set this to false so that for request like "//v3//metadata/task"
 	// to permanently redirect(301) to "/v3/metadata/task" handler
 	muxRouter.SkipClean(false)
 
-	muxRouter.HandleFunc(v1.CredentialsPath,
-		v1.CredentialsHandler(credentialsManager, auditLogger))
+	muxRouter.HandleFunc(tmdsv1.CredentialsPath,
+		tmdsv1.CredentialsHandler(credentialsManager, auditLogger))
+
+	tmdsAgentState := v4.NewTMDSAgentState(state, statsEngine, ecsClient, cluster, availabilityZone, availabilityZoneID, vpcID, containerInstanceArn)
+	metricsFactory := metrics.NewNopEntryFactory()
 
 	v2HandlersSetup(muxRouter, state, ecsClient, statsEngine, cluster, credentialsManager, auditLogger, availabilityZone, containerInstanceArn)
 
 	v3HandlersSetup(muxRouter, state, ecsClient, statsEngine, cluster, availabilityZone, containerInstanceArn)
 
-	v4HandlersSetup(muxRouter, state, ecsClient, statsEngine, cluster, availabilityZone, containerInstanceArn)
+	v4HandlersSetup(muxRouter, state, ecsClient, statsEngine, cluster, availabilityZone, vpcID, containerInstanceArn,
+		tmdsAgentState, metricsFactory)
 
-	limiter := tollbooth.NewLimiter(int64(steadyStateRate), nil)
-	limiter.SetOnLimitReached(handlersutils.LimitReachedHandler(auditLogger))
-	limiter.SetBurst(burstRate)
+	agentAPIV1HandlersSetup(muxRouter, state, credentialsManager, cluster, tmdsAgentState,
+		taskProtectionClientFactory, metricsFactory)
 
-	// Log all requests and then pass through to muxRouter.
-	loggingMuxRouter := mux.NewRouter()
+	execWrapper := execwrapper.NewExec()
+	registerFaultHandlers(muxRouter, tmdsAgentState, metricsFactory, execWrapper)
 
-	// rootPath is a path for any traffic to this endpoint, "root" mux name will not be used.
-	rootPath := "/" + handlersutils.ConstructMuxVar("root", handlersutils.AnythingRegEx)
-	loggingMuxRouter.Handle(rootPath, tollbooth.LimitHandler(
-		limiter, NewLoggingHandler(muxRouter)))
-
-	loggingMuxRouter.SkipClean(false)
-
-	server := http.Server{
-		Addr:         "127.0.0.1:" + strconv.Itoa(config.AgentCredentialsPort),
-		Handler:      loggingMuxRouter,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-	}
-
-	return &server
+	return tmds.NewServer(auditLogger,
+		tmds.WithHandler(muxRouter),
+		tmds.WithListenAddress(tmds.AddressIPv4()),
+		tmds.WithReadTimeout(readTimeout),
+		tmds.WithWriteTimeout(writeTimeout),
+		tmds.WithSteadyStateRate(float64(steadyStateRate)),
+		tmds.WithBurstRate(burstRate))
 }
 
 // v2HandlersSetup adds all handlers in v2 package to the mux router.
 func v2HandlersSetup(muxRouter *mux.Router,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	statsEngine stats.Engine,
 	cluster string,
 	credentialsManager credentials.Manager,
-	auditLogger audit.AuditLogger,
+	auditLogger auditinterface.AuditLogger,
 	availabilityZone string,
-	containerInstanceArn string) {
-	muxRouter.HandleFunc(v2.CredentialsPath, v2.CredentialsHandler(credentialsManager, auditLogger))
+	containerInstanceArn string,
+) {
+	muxRouter.HandleFunc(tmdsv2.CredentialsPath, tmdsv2.CredentialsHandler(credentialsManager, auditLogger))
 	muxRouter.HandleFunc(v2.ContainerMetadataPath, v2.TaskContainerMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, false))
 	muxRouter.HandleFunc(v2.TaskMetadataPath, v2.TaskContainerMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, false))
 	muxRouter.HandleFunc(v2.TaskWithTagsMetadataPath, v2.TaskContainerMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, true))
@@ -119,11 +133,12 @@ func v2HandlersSetup(muxRouter *mux.Router,
 // v3HandlersSetup adds all handlers in v3 package to the mux router.
 func v3HandlersSetup(muxRouter *mux.Router,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	statsEngine stats.Engine,
 	cluster string,
 	availabilityZone string,
-	containerInstanceArn string) {
+	containerInstanceArn string,
+) {
 	muxRouter.HandleFunc(v3.ContainerMetadataPath, v3.ContainerMetadataHandler(state))
 	muxRouter.HandleFunc(v3.TaskMetadataPath, v3.TaskMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, false))
 	muxRouter.HandleFunc(v3.TaskWithTagsMetadataPath, v3.TaskMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, true))
@@ -137,32 +152,236 @@ func v3HandlersSetup(muxRouter *mux.Router,
 // v4HandlerSetup adda all handlers in v4 package to the mux router
 func v4HandlersSetup(muxRouter *mux.Router,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	statsEngine stats.Engine,
 	cluster string,
 	availabilityZone string,
-	containerInstanceArn string) {
-	muxRouter.HandleFunc(v4.ContainerMetadataPath, v4.ContainerMetadataHandler(state))
-	muxRouter.HandleFunc(v4.TaskMetadataPath, v4.TaskMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, false))
-	muxRouter.HandleFunc(v4.TaskWithTagsMetadataPath, v4.TaskMetadataHandler(state, ecsClient, cluster, availabilityZone, containerInstanceArn, true))
-	muxRouter.HandleFunc(v4.ContainerStatsPath, v4.ContainerStatsHandler(state, statsEngine))
-	muxRouter.HandleFunc(v4.TaskStatsPath, v4.TaskStatsHandler(state, statsEngine))
+	vpcID string,
+	containerInstanceArn string,
+	tmdsAgentState *v4.TMDSAgentState,
+	metricsFactory metrics.EntryFactory,
+) {
+	muxRouter.HandleFunc(tmdsv4.ContainerMetadataPath(), tmdsv4.ContainerMetadataHandler(tmdsAgentState, metricsFactory))
+	muxRouter.HandleFunc(tmdsv4.TaskMetadataPath(), tmdsv4.TaskMetadataHandler(tmdsAgentState, metricsFactory))
+	muxRouter.HandleFunc(tmdsv4.TaskMetadataWithTagsPath(), tmdsv4.TaskMetadataWithTagsHandler(tmdsAgentState, metricsFactory))
+	muxRouter.HandleFunc(tmdsv4.ContainerStatsPath(), tmdsv4.ContainerStatsHandler(tmdsAgentState, metricsFactory))
+	muxRouter.HandleFunc(tmdsv4.TaskStatsPath(), tmdsv4.TaskStatsHandler(tmdsAgentState, metricsFactory))
 	muxRouter.HandleFunc(v4.ContainerAssociationsPath, v4.ContainerAssociationsHandler(state))
 	muxRouter.HandleFunc(v4.ContainerAssociationPathWithSlash, v4.ContainerAssociationHandler(state))
 	muxRouter.HandleFunc(v4.ContainerAssociationPath, v4.ContainerAssociationHandler(state))
 }
 
-// ServeTaskHTTPEndpoint serves task/container metadata, task/container stats, and IAM Role Credentials
+// agentAPIV1HandlersSetup adds handlers for Agent API V1
+func agentAPIV1HandlersSetup(
+	muxRouter *mux.Router,
+	state dockerstate.TaskEngineState,
+	credentialsManager credentials.Manager,
+	cluster string,
+	agentState *v4.TMDSAgentState,
+	factory tp.TaskProtectionClientFactoryInterface,
+	metricsFactory metrics.EntryFactory,
+) {
+	muxRouter.
+		HandleFunc(
+			tp.TaskProtectionPath(),
+			tp.UpdateTaskProtectionHandler(agentState, credentialsManager,
+				factory, cluster, metricsFactory, ecsCallTimeout)).
+		Methods("PUT")
+	muxRouter.
+		HandleFunc(
+			tp.TaskProtectionPath(),
+			tp.GetTaskProtectionHandler(agentState, credentialsManager,
+				factory, cluster, metricsFactory, ecsCallTimeout)).
+		Methods("GET")
+}
+
+// registerFaultHandlers adds handlers for fault endpoints
+// TODO: Will need to be called in taskServerSetup once all of the handlers have been implemented
+func registerFaultHandlers(
+	muxRouter *mux.Router,
+	agentState *v4.TMDSAgentState,
+	metricsFactory metrics.EntryFactory,
+	execWrapper execwrapper.Exec,
+) {
+	handler := fault.New(agentState, metricsFactory, execWrapper)
+
+	if muxRouter == nil {
+		return
+	}
+
+	// Setting up handler endpoints for network blackhole port fault injections
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.BlackHolePortFaultType, faulttype.StartNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StartNetworkBlackholePort(),
+			),
+			metricsFactory,
+			faulttype.StartNetworkFaultPostfix,
+			faulttype.BlackHolePortFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.BlackHolePortFaultType, faulttype.StopNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StopNetworkBlackHolePort(),
+			),
+			metricsFactory,
+			faulttype.StopNetworkFaultPostfix,
+			faulttype.BlackHolePortFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.BlackHolePortFaultType, faulttype.CheckNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.CheckNetworkBlackHolePort(),
+			),
+			metricsFactory,
+			faulttype.CheckNetworkFaultPostfix,
+			faulttype.BlackHolePortFaultType,
+		),
+	).Methods("POST")
+
+	// Setting up handler endpoints for network latency fault injections
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.LatencyFaultType, faulttype.StartNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StartNetworkLatency(),
+			),
+			metricsFactory,
+			faulttype.StartNetworkFaultPostfix,
+			faulttype.LatencyFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.LatencyFaultType, faulttype.StopNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StopNetworkLatency(),
+			),
+			metricsFactory,
+			faulttype.StopNetworkFaultPostfix,
+			faulttype.LatencyFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.LatencyFaultType, faulttype.CheckNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.CheckNetworkLatency(),
+			),
+			metricsFactory,
+			faulttype.CheckNetworkFaultPostfix,
+			faulttype.LatencyFaultType,
+		),
+	).Methods("POST")
+
+	// Setting up handler endpoints for network packet loss fault injections
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.PacketLossFaultType, faulttype.StartNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StartNetworkPacketLoss(),
+			),
+			metricsFactory,
+			faulttype.StartNetworkFaultPostfix,
+			faulttype.PacketLossFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.PacketLossFaultType, faulttype.StopNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.StopNetworkPacketLoss(),
+			),
+			metricsFactory,
+			faulttype.StopNetworkFaultPostfix,
+			faulttype.PacketLossFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.PacketLossFaultType, faulttype.CheckNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.CheckNetworkPacketLoss(),
+			),
+			metricsFactory,
+			faulttype.CheckNetworkFaultPostfix,
+			faulttype.PacketLossFaultType,
+		),
+	).Methods("POST")
+
+	// Setting up add-sources handler endpoints for network latency and packet
+	// loss faults. These let callers push newly resolved IPs into a running
+	// tc fault without restarting it. The endpoints use the same rate-limiter
+	// and telemetry middleware wiring as start/stop/status, and share the
+	// metricsFactory so their metrics land in the same MetadataServer.*
+	// namespace.
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.LatencyFaultType, faulttype.AddNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.AddSourcesNetworkLatency(),
+			),
+			metricsFactory,
+			faulttype.AddNetworkFaultPostfix,
+			faulttype.LatencyFaultType,
+		),
+	).Methods("POST")
+	muxRouter.Handle(
+		fault.NetworkFaultPath(faulttype.PacketLossFaultType, faulttype.AddNetworkFaultPostfix),
+		fault.TelemetryMiddleware(
+			tollbooth.LimitFuncHandler(
+				createRateLimiter(),
+				handler.AddSourcesNetworkPacketLoss(),
+			),
+			metricsFactory,
+			faulttype.AddNetworkFaultPostfix,
+			faulttype.PacketLossFaultType,
+		),
+	).Methods("POST")
+
+	seelog.Debug("Successfully set up Fault TMDS handlers")
+}
+
+// faultHandlerRateLimit is the maximum number of fault handler requests per
+// second permitted by the tollbooth rate limiter.
+const faultHandlerRateLimit = 1.0
+
+// Creates a tollbooth ratelimiter for the Fault Handler APIs
+func createRateLimiter() *limiter.Limiter {
+	lmt := tollbooth.NewLimiter(faultHandlerRateLimit, nil)
+	lmt.SetMessage("You have reached maximum request limit")
+	return lmt
+}
+
+// ServeTaskHTTPEndpoint serves task/container metadata, task/container stats, IAM Role Credentials, and Agent APIs
 // for tasks being managed by the agent.
 func ServeTaskHTTPEndpoint(
 	ctx context.Context,
 	credentialsManager credentials.Manager,
 	state dockerstate.TaskEngineState,
-	ecsClient api.ECSClient,
+	ecsClient ecs.ECSClient,
 	containerInstanceArn string,
 	cfg *config.Config,
 	statsEngine stats.Engine,
-	availabilityZone string) {
+	availabilityZone string,
+	availabilityZoneID string,
+	vpcID string,
+) {
 	// Create and initialize the audit log
 	logger, err := seelog.LoggerFromConfigAsString(audit.AuditLoggerConfig(cfg))
 	if err != nil {
@@ -173,8 +392,16 @@ func ServeTaskHTTPEndpoint(
 
 	auditLogger := audit.NewAuditLog(containerInstanceArn, cfg, logger)
 
-	server := taskServerSetup(credentialsManager, auditLogger, state, ecsClient, cfg.Cluster, statsEngine,
-		cfg.TaskMetadataSteadyStateRate, cfg.TaskMetadataBurstRate, availabilityZone, containerInstanceArn)
+	taskProtectionClientFactory := tpfactory.TaskProtectionClientFactory{
+		Region: cfg.AWSRegion, Endpoint: cfg.APIEndpoint, AcceptInsecureCert: cfg.AcceptInsecureCert, IPCompatibility: cfg.InstanceIPCompatibility,
+	}
+	server, err := taskServerSetup(credentialsManager, auditLogger, state, ecsClient, cfg.Cluster,
+		statsEngine, cfg.TaskMetadataSteadyStateRate, cfg.TaskMetadataBurstRate,
+		availabilityZone, availabilityZoneID, vpcID, containerInstanceArn, taskProtectionClientFactory)
+	if err != nil {
+		seelog.Criticalf("Failed to set up Task Metadata Server: %v", err)
+		return
+	}
 
 	go func() {
 		<-ctx.Done()

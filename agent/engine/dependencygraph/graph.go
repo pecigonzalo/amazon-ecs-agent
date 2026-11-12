@@ -19,11 +19,11 @@ import (
 	"time"
 
 	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
-	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
 	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/taskresource"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/ecs-agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/credentials"
 	log "github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
@@ -45,9 +45,8 @@ const (
 )
 
 var (
-	// CredentialsNotResolvedErr is the error where a container needs to wait for
-	// credentials before it can process by agent
-	CredentialsNotResolvedErr = &dependencyError{err: errors.New("dependency graph: container execution credentials not available")}
+	// CredentialsNotResolvedErr is the error when a task needs to wait for credentials before it can be progressed to its desired status by the agent
+	CredentialsNotResolvedErr = &dependencyError{err: errors.New("dependency graph: execution role credentials not available")}
 	// DependentContainerNotResolvedErr is the error where a dependent container isn't in expected state
 	DependentContainerNotResolvedErr = &dependencyError{err: errors.New("dependency graph: dependent container not in expected state")}
 	// ContainerPastDesiredStatusErr is the error where the container status is bigger than desired status
@@ -415,6 +414,12 @@ func containerOrderingDependenciesIsResolved(target *apicontainer.Container,
 	targetContainerKnownStatus := target.GetKnownStatus()
 	dependsOnContainerKnownStatus := dependsOnContainer.GetKnownStatus()
 
+	// Containers are allowed to transition to MANIFEST_PULLED irrespective of any container
+	// ordering dependencies.
+	if targetContainerKnownStatus < apicontainerstatus.ContainerManifestPulled {
+		return true
+	}
+
 	// The 'target' container desires to be moved to 'Created' or the 'steady' state.
 	// Allow this only if the environment variable ECS_PULL_DEPENDENT_CONTAINERS_UPFRONT is enabled and
 	// known status of the `target` container state has not reached to 'Pulled' state;
@@ -426,11 +431,17 @@ func containerOrderingDependenciesIsResolved(target *apicontainer.Container,
 	case createCondition:
 		// The 'target' container desires to be moved to 'Created' or the 'steady' state.
 		// Allow this only if the known status of the dependency container state is already started
-		// i.e it's state is any of 'Created', 'steady state' or 'Stopped'
+		// i.e. it's state is any of 'Created', 'steady state' or 'Stopped'
 		return dependsOnContainerKnownStatus >= apicontainerstatus.ContainerCreated
 
 	case startCondition:
-		if targetDesiredStatus == apicontainerstatus.ContainerCreated {
+		if dependsOnContainerKnownStatus == apicontainerstatus.ContainerStopped {
+			// The 'dependsOn' container has already transitioned to STOPPED state.
+			// A container's known status is updated to STOPPED when the container transitions from
+			// RUNNING -> STOPPED. We let the 'target' container to move to its next desired state,
+			// since the START dependency has been fulfilled.
+			return true
+		} else if targetDesiredStatus == apicontainerstatus.ContainerCreated {
 			// The 'target' container desires to be moved to 'Created' state.
 			// Allow this only if the known status of the linked container is
 			// 'Created' or if the dependency container is in 'steady state'

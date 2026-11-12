@@ -24,13 +24,15 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
 	mock_dockerapi "github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	mock_ecscni "github.com/aws/amazon-ecs-agent/agent/ecscni/mocks"
+	dm "github.com/aws/amazon-ecs-agent/agent/engine/daemonmanager"
+	"github.com/aws/amazon-ecs-agent/agent/engine/serviceconnect"
 	mock_mobypkgwrapper "github.com/aws/amazon-ecs-agent/agent/utils/mobypkgwrapper/mocks"
+	"github.com/aws/amazon-ecs-agent/ecs-agent/ipcompatibility"
 
-	"github.com/aws/aws-sdk-go/aws"
-	aws_credentials "github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 )
@@ -45,7 +47,7 @@ func TestVolumeDriverCapabilitiesWindows(t *testing.T) {
 
 	client := mock_dockerapi.NewMockDockerClient(ctrl)
 	cniClient := mock_ecscni.NewMockCNIClient(ctrl)
-	mockCredentialsProvider := app_mocks.NewMockProvider(ctrl)
+	mockCredentialsProvider := app_mocks.NewMockCredentialsProvider(ctrl)
 	mockMobyPlugins := mock_mobypkgwrapper.NewMockPlugins(ctrl)
 	conf := &config.Config{
 		AvailableLoggingDrivers: []dockerclient.LoggingDriver{
@@ -60,15 +62,11 @@ func TestVolumeDriverCapabilitiesWindows(t *testing.T) {
 		AppArmorCapable:            config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
 		TaskENIEnabled:             config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
 		AWSVPCBlockInstanceMetdata: config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
-		TaskCleanupWaitDuration:    config.DefaultConfig().TaskCleanupWaitDuration,
+		TaskCleanupWaitDuration:    config.DefaultConfig(ipcompatibility.NewIPv4OnlyCompatibility()).TaskCleanupWaitDuration,
 	}
 
 	gomock.InOrder(
 		client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
-			dockerclient.Version_1_17,
-			dockerclient.Version_1_18,
-		}),
-		client.EXPECT().KnownVersions().Return([]dockerclient.DockerVersion{
 			dockerclient.Version_1_17,
 			dockerclient.Version_1_18,
 			dockerclient.Version_1_19,
@@ -80,6 +78,7 @@ func TestVolumeDriverCapabilitiesWindows(t *testing.T) {
 		capabilityPrefix + "privileged-container",
 		capabilityPrefix + "docker-remote-api.1.17",
 		capabilityPrefix + "docker-remote-api.1.18",
+		capabilityPrefix + "docker-remote-api.1.19",
 		capabilityPrefix + "logging-driver.json-file",
 		capabilityPrefix + "logging-driver.syslog",
 		capabilityPrefix + "logging-driver.journald",
@@ -90,13 +89,13 @@ func TestVolumeDriverCapabilitiesWindows(t *testing.T) {
 		attributePrefix + taskENIBlockInstanceMetadataAttributeSuffix,
 	}
 
-	var expectedCapabilities []*ecs.Attribute
+	var expectedCapabilities []types.Attribute
 	for _, name := range expectedCapabilityNames {
 		expectedCapabilities = append(expectedCapabilities,
-			&ecs.Attribute{Name: aws.String(name)})
+			types.Attribute{Name: aws.String(name)})
 	}
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{
+		[]types.Attribute{
 			{
 				Name:  aws.String(attributePrefix + cniPluginVersionSuffix),
 				Value: aws.String("v1"),
@@ -107,18 +106,20 @@ func TestVolumeDriverCapabilitiesWindows(t *testing.T) {
 	// Cancel the context to cancel async routines
 	defer cancel()
 	agent := &ecsAgent{
-		ctx:                ctx,
-		cfg:                conf,
-		dockerClient:       client,
-		cniClient:          cniClient,
-		credentialProvider: aws_credentials.NewCredentials(mockCredentialsProvider),
-		mobyPlugins:        mockMobyPlugins,
+		ctx:                   ctx,
+		cfg:                   conf,
+		dockerClient:          client,
+		cniClient:             cniClient,
+		credentialsCache:      aws.NewCredentialsCache(mockCredentialsProvider),
+		mobyPlugins:           mockMobyPlugins,
+		serviceconnectManager: serviceconnect.NewManager(),
+		daemonManagers:        make(map[string]dm.DaemonManager),
 	}
 	capabilities, err := agent.capabilities()
 	assert.NoError(t, err)
 
 	for _, expected := range expectedCapabilities {
-		assert.Contains(t, capabilities, &ecs.Attribute{
+		assert.Contains(t, capabilities, types.Attribute{
 			Name:  expected.Name,
 			Value: expected.Value,
 		})
@@ -133,7 +134,7 @@ func TestSupportedCapabilitiesWindows(t *testing.T) {
 
 	client := mock_dockerapi.NewMockDockerClient(ctrl)
 	cniClient := mock_ecscni.NewMockCNIClient(ctrl)
-	mockCredentialsProvider := app_mocks.NewMockProvider(ctrl)
+	mockCredentialsProvider := app_mocks.NewMockCredentialsProvider(ctrl)
 	mockMobyPlugins := mock_mobypkgwrapper.NewMockPlugins(ctrl)
 	conf := &config.Config{
 		AvailableLoggingDrivers: []dockerclient.LoggingDriver{
@@ -148,15 +149,11 @@ func TestSupportedCapabilitiesWindows(t *testing.T) {
 		AppArmorCapable:            config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
 		TaskENIEnabled:             config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
 		AWSVPCBlockInstanceMetdata: config.BooleanDefaultFalse{Value: config.ExplicitlyEnabled},
-		TaskCleanupWaitDuration:    config.DefaultConfig().TaskCleanupWaitDuration,
+		TaskCleanupWaitDuration:    config.DefaultConfig(ipcompatibility.NewIPv4OnlyCompatibility()).TaskCleanupWaitDuration,
 	}
 
 	gomock.InOrder(
 		client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
-			dockerclient.Version_1_17,
-			dockerclient.Version_1_18,
-		}),
-		client.EXPECT().KnownVersions().Return([]dockerclient.DockerVersion{
 			dockerclient.Version_1_17,
 			dockerclient.Version_1_18,
 			dockerclient.Version_1_19,
@@ -168,6 +165,7 @@ func TestSupportedCapabilitiesWindows(t *testing.T) {
 		capabilityPrefix + "privileged-container",
 		capabilityPrefix + "docker-remote-api.1.17",
 		capabilityPrefix + "docker-remote-api.1.18",
+		capabilityPrefix + "docker-remote-api.1.19",
 		capabilityPrefix + "logging-driver.json-file",
 		capabilityPrefix + "logging-driver.syslog",
 		capabilityPrefix + "logging-driver.journald",
@@ -184,15 +182,18 @@ func TestSupportedCapabilitiesWindows(t *testing.T) {
 		attributePrefix + capabilityContainerOrdering,
 		attributePrefix + capabilityFullTaskSync,
 		attributePrefix + capabilityEnvFilesS3,
-		attributePrefix + taskENIBlockInstanceMetadataAttributeSuffix}
+		attributePrefix + taskENIBlockInstanceMetadataAttributeSuffix,
+		attributePrefix + capabilityContainerPortRange,
+		attributePrefix + capabilityContainerRestartPolicy,
+	}
 
-	var expectedCapabilities []*ecs.Attribute
+	var expectedCapabilities []types.Attribute
 	for _, name := range expectedCapabilityNames {
 		expectedCapabilities = append(expectedCapabilities,
-			&ecs.Attribute{Name: aws.String(name)})
+			types.Attribute{Name: aws.String(name)})
 	}
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{
+		[]types.Attribute{
 			{
 				Name:  aws.String(attributePrefix + cniPluginVersionSuffix),
 				Value: aws.String("v1"),
@@ -203,61 +204,36 @@ func TestSupportedCapabilitiesWindows(t *testing.T) {
 	// Cancel the context to cancel async routines
 	defer cancel()
 	agent := &ecsAgent{
-		ctx:                ctx,
-		cfg:                conf,
-		dockerClient:       client,
-		cniClient:          cniClient,
-		credentialProvider: aws_credentials.NewCredentials(mockCredentialsProvider),
-		mobyPlugins:        mockMobyPlugins,
+		ctx:                   ctx,
+		cfg:                   conf,
+		dockerClient:          client,
+		cniClient:             cniClient,
+		credentialsCache:      aws.NewCredentialsCache(mockCredentialsProvider),
+		mobyPlugins:           mockMobyPlugins,
+		serviceconnectManager: serviceconnect.NewManager(),
+		daemonManagers:        make(map[string]dm.DaemonManager),
 	}
 	capabilities, err := agent.capabilities()
 	assert.NoError(t, err)
 
-	assert.Equal(t, len(expectedCapabilities), len(capabilities))
 	for _, expected := range expectedCapabilities {
-		assert.Contains(t, capabilities, &ecs.Attribute{
+		assert.Contains(t, capabilities, types.Attribute{
 			Name:  expected.Name,
 			Value: expected.Value,
 		})
 	}
 }
 
-func TestAppendGMSACapabilities(t *testing.T) {
-	var inputCapabilities []*ecs.Attribute
-	var expectedCapabilities []*ecs.Attribute
-
-	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{
-			{
-				Name: aws.String(attributePrefix + capabilityGMSA),
-			},
-		}...)
-
-	agent := &ecsAgent{
-		cfg: &config.Config{
-			GMSACapable: true,
-		},
-	}
-
-	capabilities := agent.appendGMSACapabilities(inputCapabilities)
-
-	assert.Equal(t, len(expectedCapabilities), len(capabilities))
-	for i, expected := range expectedCapabilities {
-		assert.Equal(t, aws.StringValue(expected.Name), aws.StringValue(capabilities[i].Name))
-		assert.Equal(t, aws.StringValue(expected.Value), aws.StringValue(capabilities[i].Value))
-	}
-}
-
 func TestAppendGMSACapabilitiesFalse(t *testing.T) {
-	var inputCapabilities []*ecs.Attribute
-	var expectedCapabilities []*ecs.Attribute
+	var inputCapabilities []types.Attribute
+	var expectedCapabilities []types.Attribute
 
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{}...)
+		[]types.Attribute{}...)
 
 	agent := &ecsAgent{
 		cfg: &config.Config{
-			GMSACapable: false,
+			GMSACapable: config.BooleanDefaultFalse{Value: config.ExplicitlyDisabled},
 		},
 	}
 
@@ -267,11 +243,11 @@ func TestAppendGMSACapabilitiesFalse(t *testing.T) {
 }
 
 func TestAppendFSxWindowsFileServerCapabilities(t *testing.T) {
-	var inputCapabilities []*ecs.Attribute
-	var expectedCapabilities []*ecs.Attribute
+	var inputCapabilities []types.Attribute
+	var expectedCapabilities []types.Attribute
 
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{
+		[]types.Attribute{
 			{
 				Name: aws.String(attributePrefix + capabilityFSxWindowsFileServer),
 			},
@@ -279,7 +255,7 @@ func TestAppendFSxWindowsFileServerCapabilities(t *testing.T) {
 
 	agent := &ecsAgent{
 		cfg: &config.Config{
-			FSxWindowsFileServerCapable: true,
+			FSxWindowsFileServerCapable: config.BooleanDefaultTrue{Value: config.ExplicitlyEnabled},
 		},
 	}
 
@@ -287,21 +263,21 @@ func TestAppendFSxWindowsFileServerCapabilities(t *testing.T) {
 
 	assert.Equal(t, len(expectedCapabilities), len(capabilities))
 	for i, expected := range expectedCapabilities {
-		assert.Equal(t, aws.StringValue(expected.Name), aws.StringValue(capabilities[i].Name))
-		assert.Equal(t, aws.StringValue(expected.Value), aws.StringValue(capabilities[i].Value))
+		assert.Equal(t, aws.ToString(expected.Name), aws.ToString(capabilities[i].Name))
+		assert.Equal(t, aws.ToString(expected.Value), aws.ToString(capabilities[i].Value))
 	}
 }
 
 func TestAppendFSxWindowsFileServerCapabilitiesFalse(t *testing.T) {
-	var inputCapabilities []*ecs.Attribute
-	var expectedCapabilities []*ecs.Attribute
+	var inputCapabilities []types.Attribute
+	var expectedCapabilities []types.Attribute
 
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{}...)
+		[]types.Attribute{}...)
 
 	agent := &ecsAgent{
 		cfg: &config.Config{
-			FSxWindowsFileServerCapable: false,
+			FSxWindowsFileServerCapable: config.BooleanDefaultTrue{Value: config.ExplicitlyDisabled},
 		},
 	}
 
@@ -311,14 +287,14 @@ func TestAppendFSxWindowsFileServerCapabilitiesFalse(t *testing.T) {
 }
 
 func TestAppendExecCapabilities(t *testing.T) {
-	var inputCapabilities []*ecs.Attribute
-	var expectedCapabilities []*ecs.Attribute
-	execCapability := ecs.Attribute{
+	var inputCapabilities []types.Attribute
+	var expectedCapabilities []types.Attribute
+	execCapability := types.Attribute{
 		Name: aws.String(attributePrefix + capabilityExec),
 	}
 
 	expectedCapabilities = append(expectedCapabilities,
-		[]*ecs.Attribute{}...)
+		[]types.Attribute{}...)
 	testCases := []struct {
 		name                     string
 		pathExists               func(string, bool) (bool, error)
@@ -362,10 +338,24 @@ func TestAppendExecCapabilities(t *testing.T) {
 			assert.NoError(t, err)
 
 			if tc.shouldHaveExecCapability {
-				assert.Contains(t, capabilities, &execCapability)
+				assert.Contains(t, capabilities, execCapability)
 			} else {
-				assert.NotContains(t, capabilities, &execCapability)
+				assert.NotContains(t, capabilities, execCapability)
 			}
 		})
 	}
+}
+
+func TestAppendIPv6OnlyCapability(t *testing.T) {
+	capabilities := []types.Attribute{
+		types.Attribute{Name: aws.String("cap1")},
+		types.Attribute{Name: aws.String("cap2")},
+	}
+	capabilities = appendIPv6OnlyCapability(capabilities)
+	assert.Equal(t,
+		[]types.Attribute{
+			types.Attribute{Name: aws.String("cap1")},
+			types.Attribute{Name: aws.String("cap2")},
+		},
+		capabilities)
 }

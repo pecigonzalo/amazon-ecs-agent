@@ -22,8 +22,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
@@ -33,19 +33,27 @@ type GPUManager interface {
 	Initialize() error
 	SetGPUIDs([]string)
 	GetGPUIDsUnsafe() []string
+	GetGPUMemoryMiBUnsafe() map[string]uint64
 	SetDevices()
-	GetDevices() []*ecs.PlatformDevice
+	GetDevices() []types.PlatformDevice
 	SetDriverVersion(string)
 	GetDriverVersion() string
+	GetMpsControlBinaryPresent() bool
+	GetMpsServiceEnabled() bool
+	GetHasVGPU() bool
 }
 
 // NvidiaGPUManager is used as a wrapper for NVML APIs and implements GPUManager
 // interface
 type NvidiaGPUManager struct {
-	DriverVersion string                `json:"DriverVersion"`
-	GPUIDs        []string              `json:"GPUIDs"`
-	GPUDevices    []*ecs.PlatformDevice `json:"-"`
-	lock          sync.RWMutex
+	DriverVersion           string                 `json:"DriverVersion"`
+	GPUIDs                  []string               `json:"GPUIDs"`
+	GPUDevices              []types.PlatformDevice `json:"-"`
+	GPUMemoryMiB            map[string]uint64      `json:"GPUMemoryMiB,omitempty"`
+	MpsControlBinaryPresent bool                   `json:"MpsControlBinaryPresent"`
+	MpsServiceEnabled       bool                   `json:"MpsServiceEnabled"`
+	HasVGPU                 bool                   `json:"HasVGPU"`
+	lock                    sync.RWMutex
 }
 
 const (
@@ -76,9 +84,14 @@ func (n *NvidiaGPUManager) Initialize() error {
 		n.SetDriverVersion(nvidiaGPUInfo.GetDriverVersion())
 		nvidiaGPUInfo.lock.RLock()
 		gpuIDs := nvidiaGPUInfo.GetGPUIDsUnsafe()
+		gpuMemoryMiB := nvidiaGPUInfo.GetGPUMemoryMiBUnsafe()
 		nvidiaGPUInfo.lock.RUnlock()
 		n.SetGPUIDs(gpuIDs)
+		n.SetGPUMemoryMiB(gpuMemoryMiB)
 		n.SetDevices()
+		n.MpsControlBinaryPresent = nvidiaGPUInfo.GetMpsControlBinaryPresent()
+		n.MpsServiceEnabled = nvidiaGPUInfo.GetMpsServiceEnabled()
+		n.HasVGPU = nvidiaGPUInfo.GetHasVGPU()
 	} else {
 		seelog.Error("Config for GPU support is enabled, but GPU information is not found; continuing without it")
 	}
@@ -120,6 +133,18 @@ func (n *NvidiaGPUManager) GetGPUIDsUnsafe() []string {
 	return n.GPUIDs
 }
 
+// SetGPUMemoryMiB sets the per-GPU usable memory map
+func (n *NvidiaGPUManager) SetGPUMemoryMiB(gpuMemoryMiB map[string]uint64) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+	n.GPUMemoryMiB = gpuMemoryMiB
+}
+
+// GetGPUMemoryMiBUnsafe returns the per-GPU usable memory map
+func (n *NvidiaGPUManager) GetGPUMemoryMiBUnsafe() map[string]uint64 {
+	return n.GPUMemoryMiB
+}
+
 // SetDriverVersion is a setter for nvidia driver version
 func (n *NvidiaGPUManager) SetDriverVersion(version string) {
 	n.lock.Lock()
@@ -138,19 +163,46 @@ func (n *NvidiaGPUManager) SetDevices() {
 	n.lock.Lock()
 	defer n.lock.Unlock()
 	gpuIDs := n.GetGPUIDsUnsafe()
-	devices := make([]*ecs.PlatformDevice, 0)
+	devices := make([]types.PlatformDevice, 0)
 	for _, gpuID := range gpuIDs {
-		devices = append(devices, &ecs.PlatformDevice{
+		device := types.PlatformDevice{
 			Id:   aws.String(gpuID),
-			Type: aws.String(ecs.PlatformDeviceTypeGpu),
-		})
+			Type: types.PlatformDeviceTypeGpu,
+		}
+		if memMiB, ok := n.GPUMemoryMiB[gpuID]; ok {
+			device.GpuInfo = &types.GpuPlatformDeviceInfo{
+				MemoryInMiB: aws.Int32(int32(memMiB)),
+			}
+		}
+		devices = append(devices, device)
 	}
 	n.GPUDevices = devices
 }
 
 // GetDevices returns the GPU devices as PlatformDevices
-func (n *NvidiaGPUManager) GetDevices() []*ecs.PlatformDevice {
+func (n *NvidiaGPUManager) GetDevices() []types.PlatformDevice {
 	n.lock.RLock()
 	defer n.lock.RUnlock()
 	return n.GPUDevices
+}
+
+// GetMpsControlBinaryPresent reports whether ecs-init found the MPS control binary on the host.
+func (n *NvidiaGPUManager) GetMpsControlBinaryPresent() bool {
+	n.lock.RLock()
+	defer n.lock.RUnlock()
+	return n.MpsControlBinaryPresent
+}
+
+// GetMpsServiceEnabled reports whether ecs-init found nvidia-mps.service enabled on the host.
+func (n *NvidiaGPUManager) GetMpsServiceEnabled() bool {
+	n.lock.RLock()
+	defer n.lock.RUnlock()
+	return n.MpsServiceEnabled
+}
+
+// GetHasVGPU reports whether any device on the instance is an NVIDIA vGPU slice.
+func (n *NvidiaGPUManager) GetHasVGPU() bool {
+	n.lock.RLock()
+	defer n.lock.RUnlock()
+	return n.HasVGPU
 }

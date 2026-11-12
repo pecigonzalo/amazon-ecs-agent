@@ -24,19 +24,27 @@ const (
 	ContainerInstanceARNKey = "container-instance-arn"
 	EC2InstanceIDKey        = "ec2-instance-id"
 	TaskManifestSeqNumKey   = "task-manifest-seq-num"
+
+	// IMDSIAMRolesKey tracks whether this instance had previously enabled support
+	// for IMDS-based task credential retrieval.
+	//
+	// This helps distinguish a restart from an in-place agent upgrade where
+	// running tasks were launched without IMDS IAM roles support,
+	// ensuring in-place agent upgrade doesn't disrupt credential delivery.
+	IMDSIAMRolesKey = "imds-iam-roles"
 )
 
 func (c *client) SaveMetadata(key, val string) error {
-	return c.db.Batch(func(tx *bolt.Tx) error {
+	return c.DB.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(metadataBucketName))
-		return putObject(b, key, val)
+		return c.Accessor.PutObject(b, key, val)
 	})
 }
 
 func (c *client) GetMetadata(key string) (string, error) {
 	var val string
-	err := c.db.View(func(tx *bolt.Tx) error {
-		return getObject(tx, metadataBucketName, key, &val)
+	err := c.DB.View(func(tx *bolt.Tx) error {
+		return c.Accessor.GetObject(tx, metadataBucketName, key, &val)
 	})
 	return val, err
 }
